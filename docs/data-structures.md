@@ -743,19 +743,17 @@ emu_state_t (頂層)
   ├── 0x1F700000          initrd 起始 (403 MB)
   └── 0x1FF00000          設備樹 (511 MB)
 
-0x0C000000 - 0x0FFFFFFF            ACLINT (MTIMER/MSWI/SSWI)
-  ├── 0x0C000000          MSWI 基地址
-  ├── 0x0D000000          MTIMER 基地址
-  └── 0x0E000000          SSWI 基地址
-
 0xF0000000 - 0xFFFFFFFF            MMIO 區域
-  ├── 0xF0000000          PLIC
-  ├── 0xF4000000          UART (8250)
-  ├── 0xF4100000          VirtIO-Net
-  ├── 0xF4200000          VirtIO-Blk
-  ├── 0xF4600000          VirtIO-RNG
-  ├── 0xF4700000          VirtIO-Snd
-  └── 0xF4800000          VirtIO-FS
+  ├── 0xF0000000          PLIC (64 MB)
+  ├── 0xF4000000          UART (8250, 1 MB)
+  ├── 0xF4100000          VirtIO-Net (1 MB)
+  ├── 0xF4200000          VirtIO-Blk (1 MB)
+  ├── 0xF4300000          ACLINT MTIMER (1 MB) - case 0x43 in main.c
+  ├── 0xF4400000          ACLINT MSWI (1 MB)   - case 0x44 in main.c
+  ├── 0xF4500000          ACLINT SSWI (1 MB)   - case 0x45 in main.c
+  ├── 0xF4600000          VirtIO-RNG (1 MB)
+  ├── 0xF4700000          VirtIO-Snd (1 MB)
+  └── 0xF4800000          VirtIO-FS (1 MB)
 ```
 
 ### 中斷流程

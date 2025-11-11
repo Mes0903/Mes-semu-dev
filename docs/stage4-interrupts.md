@@ -283,34 +283,62 @@ typedef struct {
 
 **記憶體映射**：
 ```
-基地址：0x0D000000
+基地址：0xF4300000 (main.c case 0x43)
 
-0x0000: mtime（低 32 位）
-0x0004: mtime（高 32 位）
-0x4000: mtimecmp[0]（低 32 位）
-0x4004: mtimecmp[0]（高 32 位）
-0x4008: mtimecmp[1]（低 32 位）
-0x400C: mtimecmp[1]（高 32 位）
-...
+相對偏移（傳遞給 aclint_mtimer_read）：
+0x0000 - 0x7FF7: mtimecmp[0..4095]（每個 8 字節）
+  0x0000: mtimecmp[0] 低 32 位
+  0x0004: mtimecmp[0] 高 32 位
+  0x0008: mtimecmp[1] 低 32 位
+  0x000C: mtimecmp[1] 高 32 位
+  ...
+
+0x7FF8 - 0x7FFF: mtime（8 字節）
+  0x7FF8: mtime 低 32 位
+  0x7FFC: mtime 高 32 位
 ```
 
-**工作原理**：
+**實際代碼** (aclint.c:31-43):
+```c
+/* mtimecmp (0x4300000 ~ 0x4307FF8) */  // 註釋中是相對 SOC 基址
+if (addr < 0x7FF8) {
+    *value = (uint32_t) (mtimer->mtimecmp[addr >> 3] >> (addr & 0x4 ? 32 : 0));
+    return true;
+}
+
+/* mtime (0x4307FF8 ~ 0x4308000) */
+if (addr < 0x8000) {
+    *value = (uint32_t) (semu_timer_get(&mtimer->mtime) >> (addr & 0x4 ? 32 : 0));
+    return true;
+}
+```
+
+**工作原理** (aclint.c:7-16):
 
 ```c
-// 檢查計時器中斷（主循環）
 void aclint_mtimer_update_interrupts(hart_t *hart, mtimer_state_t *mtimer)
 {
-    uint64_t mtime = get_current_time();
-    uint64_t mtimecmp = mtimer->mtimecmp[hart->mhartid];
-
-    if (mtime >= mtimecmp) {
-        // 觸發計時器中斷
-        hart->sip |= RV_INT_STI_BIT;
+    if (semu_timer_get(&mtimer->mtime) >= mtimer->mtimecmp[hart->mhartid]) {
+        hart->sip |= RV_INT_STI_BIT; /* Set Supervisor Timer Interrupt */
+        /* Clear WFI flag when interrupt is injected - wakes the hart */
+        hart->in_wfi = false;
     } else {
-        // 清除計時器中斷
-        hart->sip &= ~RV_INT_STI_BIT;
+        hart->sip &= ~RV_INT_STI_BIT; /* Clear Supervisor Timer Interrupt */
     }
 }
+```
+
+**地址訪問示例**：
+```
+Linux 寫入 mtimecmp[0] = 0x123456789ABCDEF0
+
+1. 寫入低 32 位到 0xF4300000:
+   mem_store(0xF4300000) → case 0x43 → aclint_mtimer_write(offset=0x0000)
+   → mtimer->mtimecmp[0] = (舊值 & 0xFFFFFFFF00000000) | 0x9ABCDEF0
+
+2. 寫入高 32 位到 0xF4300004:
+   mem_store(0xF4300004) → case 0x43 → aclint_mtimer_write(offset=0x0004)
+   → mtimer->mtimecmp[0] = (舊值 & 0xFFFFFFFF) | (0x12345678 << 32)
 ```
 
 **Linux 使用**：
@@ -343,22 +371,38 @@ typedef struct {
 
 **記憶體映射**：
 ```
-基地址：0x0C000000
+基地址：0xF4400000 (main.c case 0x44)
 
-0x0000: msip[0]
-0x0004: msip[1]
-0x0008: msip[2]
-...
+相對偏移：
+0x0000 - 0x3FFC: msip[0..4095]（每個 4 字節）
+  0x0000: msip[0]
+  0x0004: msip[1]
+  0x0008: msip[2]
+  ...
 ```
 
-**工作原理**：
+**實際代碼** (aclint.c:110-119, 130-135):
 ```c
 void aclint_mswi_update_interrupts(hart_t *hart, mswi_state_t *mswi)
 {
     if (mswi->msip[hart->mhartid]) {
-        // 設置軟體中斷（通過 SSWI 映射到 S-mode）
-        hart->sip |= RV_INT_SSI_BIT;
+        hart->sip |= RV_INT_SSI_BIT; /* Set Machine Software Interrupt */
+        /* Clear WFI flag when interrupt is injected */
+        hart->in_wfi = false;
+    } else {
+        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Machine Software Interrupt */
     }
+}
+
+// 讀取暫存器
+static bool aclint_mswi_reg_read(mswi_state_t *mswi, uint32_t addr, uint32_t *value)
+{
+    /* Address range for msip: 0x4400000 ~ 0x4404000 */
+    if (addr < 0x4000) {
+        *value = mswi->msip[addr >> 2];  // addr / 4 = 索引
+        return true;
+    }
+    return false;
 }
 ```
 
@@ -374,12 +418,39 @@ typedef struct {
 
 **記憶體映射**：
 ```
-基地址：0x0E000000
+基地址：0xF4500000 (main.c case 0x45)
 
-0x0000: ssip[0]
-0x0004: ssip[1]
-0x0008: ssip[2]
-...
+相對偏移：
+0x0000 - 0x3FFC: ssip[0..4095]（每個 4 字節）
+  0x0000: ssip[0]
+  0x0004: ssip[1]
+  0x0008: ssip[2]
+  ...
+```
+
+**實際代碼** (aclint.c:172-181, 187-192):
+```c
+void aclint_sswi_update_interrupts(hart_t *hart, sswi_state_t *sswi)
+{
+    if (sswi->ssip[hart->mhartid]) {
+        hart->sip |= RV_INT_SSI_BIT; /* Set Supervisor Software Interrupt */
+        /* Clear WFI flag when interrupt is injected */
+        hart->in_wfi = false;
+    } else {
+        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Supervisor Software Interrupt */
+    }
+}
+
+// 讀取暫存器（總是返回 0）
+static bool aclint_sswi_reg_read(sswi_state_t *sswi, uint32_t addr, uint32_t *value)
+{
+    /* Address range for ssip: 0x4500000 ~ 0x4504000 */
+    if (addr < 0x4000) {
+        *value = 0; /* Upper 31 bits are zero, and LSB reads as 0 */
+        return true;
+    }
+    return false;
+}
 ```
 
 **SSWI vs MSWI**：

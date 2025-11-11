@@ -87,8 +87,8 @@
 - [階段 1 詳細文檔](./stage1-overview.md)
 
 #### 代碼
-- [main.c](../main.c):1-200 - `main()` 和 `semu_init()`
-- [main.c](../main.c):600-800 - 記憶體映射 `semu_mem_load/store`
+- [main.c](../main.c):1-200 - `main()` 和初始化
+- [main.c](../main.c):204-335 - 記憶體映射 `mem_load/mem_store` (static 函數)
 - [main.c](../main.c):1100-1200 - 主循環 `hart_exec_loop()`
 - [device.h](../device.h):428-461 - `emu_state_t` 結構
 - [riscv.h](../riscv.h):78-170 - `hart_t` 結構
@@ -365,21 +365,24 @@ hart_trap()
 
 #### ACLINT 組件
 ```
-MTIMER (0x0D000000)
+MTIMER (0xF4300000 - main.c case 0x43)
   ├─ mtime (64-bit) → 當前時間
   └─ mtimecmp[hartid] → 比較值
       if (mtime >= mtimecmp[i])
           hart[i]->sip |= STI_BIT
+  (詳見 aclint.c:7-16, aclint.c:18-45)
 
-MSWI (0x0C000000)
+MSWI (0xF4400000 - main.c case 0x44)
   └─ msip[hartid]
       if (msip[i] == 1)
           hart[i]->sip |= SSI_BIT (M-mode)
+  (詳見 aclint.c:110-119, aclint.c:121-147)
 
-SSWI (0x0E000000)
+SSWI (0xF4500000 - main.c case 0x45)
   └─ ssip[hartid]
       if (ssip[i] == 1)
           hart[i]->sip |= SSI_BIT (S-mode)
+  (詳見 aclint.c:172-181, aclint.c:183-205)
 ```
 
 ### 實踐練習
