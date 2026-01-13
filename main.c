@@ -903,7 +903,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOGPU)
     emu->vgpu.ram = emu->ram;
     virtio_gpu_init(&(emu->vgpu));
-    virtio_gpu_add_scanout(&(emu->vgpu), 1024, 768);
+    virtio_gpu_add_scanout(&(emu->vgpu), SCREEN_WIDTH, SCREEN_HEIGHT);
 
     g_window.window_init();
 #endif

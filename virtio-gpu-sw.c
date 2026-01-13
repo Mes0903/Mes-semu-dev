@@ -38,26 +38,12 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
 
     switch (request->format) {
     case VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM:
-        bits_per_pixel = 32;
-        break;
     case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
         bits_per_pixel = 32;
         break;
@@ -69,8 +55,6 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    uint32_t bytes_per_pixel = bits_per_pixel / 8;
-
     /* Set 2D resource */
     res_2d->width = request->width;
     res_2d->height = request->height;
@@ -78,6 +62,24 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     res_2d->bits_per_pixel = bits_per_pixel;
     res_2d->stride = request->width * (bits_per_pixel / 8);
     res_2d->image = malloc(res_2d->stride * request->height);
+
+    /* DEBUG: Resource creation info - print ALL fields from request */
+    fprintf(stderr, "\n=== [DEBUG] Resource Create 2D ===\n");
+    fprintf(stderr,
+            "  [FROM GUEST] hdr.type=%u, hdr.flags=%u, hdr.fence_id=%lu\n",
+            request->hdr.type, request->hdr.flags, request->hdr.fence_id);
+    fprintf(stderr, "  [FROM GUEST] hdr.ctx_id=%u, hdr.ring_idx=%u\n",
+            request->hdr.ctx_id, request->hdr.ring_idx);
+    fprintf(stderr, "  [FROM GUEST] resource_id=%u\n", request->resource_id);
+    fprintf(stderr, "  [FROM GUEST] format=%u\n", request->format);
+    fprintf(stderr, "  [FROM GUEST] width=%u\n", request->width);
+    fprintf(stderr, "  [FROM GUEST] height=%u\n", request->height);
+    fprintf(stderr, "  [HOST CALCULATED] bpp=%u\n", bits_per_pixel);
+    fprintf(stderr, "  [HOST CALCULATED] stride=%u (width * bpp/8)\n",
+            res_2d->stride);
+    fprintf(stderr, "  [HOST ALLOCATED] image buffer=%u bytes\n",
+            res_2d->stride * request->height);
+    fprintf(stderr, "========================================\n\n");
 
     /* Failed to create image buffer */
     if (!res_2d->image) {
@@ -189,6 +191,19 @@ static void virtio_gpu_copy_image_from_pages(struct vgpu_trans_to_host_2d *req,
         (req->r.height < res_2d->height) ? req->r.height : res_2d->height;
     void *img_data = (void *) res_2d->image;
 
+    /* DEBUG: Copy operation details */
+    if (req->offset != 0) {
+        fprintf(stderr, "\n=== [DEBUG] Copy Image From Pages ===\n");
+        fprintf(stderr, "  [FROM GUEST] Starting offset: %lu (0x%lx)\n",
+                req->offset, req->offset);
+        fprintf(stderr,
+                "  [HOST CALCULATED] stride for offset stored: %u bytes\n",
+                stride);
+        fprintf(stderr, "  [OPERATION] Copying %u rows of %u pixels each\n",
+                height, width);
+        fprintf(stderr, "  [OPERATION] Bytes per row: %u\n", width * bpp);
+    }
+
     /* Copy image by row */
     for (uint32_t h = 0; h < height; h++) {
         /* Note that source offset is in the image coordinate. The address to
@@ -199,7 +214,23 @@ static void virtio_gpu_copy_image_from_pages(struct vgpu_trans_to_host_2d *req,
         void *dest = (void *) ((uintptr_t) img_data + dest_offset);
         size_t total = width * bpp;
 
+        /* DEBUG: First and last row details */
+        if (req->offset != 0) {
+            if (h == 0 || h == height - 1) {
+                fprintf(stderr,
+                        "  [OPERATION] Row %u: src_offset=%zu (guest_offset + "
+                        "%u*stride), dest_offset=%zu, bytes=%zu\n",
+                        h, src_offset, h, dest_offset, total);
+            }
+        }
+
         iov_to_buf(res_2d->iovec, res_2d->page_cnt, src_offset, dest, total);
+    }
+
+    if (req->offset != 0) {
+        fprintf(stderr, "  [OPERATION] Total bytes copied: %u\n",
+                height * width * bpp);
+        fprintf(stderr, "======================================\n\n");
     }
 }
 
@@ -227,6 +258,45 @@ static void virtio_gpu_cmd_transfer_to_host_2d_handler(
         *plen = virtio_gpu_write_response(
             vgpu, vq_desc[1].addr, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
         return;
+    }
+
+    /* DEBUG: Print ALL fields from request */
+    if (req->offset != 0) {
+        uint32_t bpp = res_2d->bits_per_pixel / 8;
+        uint64_t expected_offset = req->r.y * res_2d->width * bpp;
+
+        fprintf(stderr, "\n=== [DEBUG] Transfer to Host 2D ===\n");
+        fprintf(stderr,
+                "  [FROM GUEST] hdr.type=%u, hdr.flags=%u, hdr.fence_id=%lu\n",
+                req->hdr.type, req->hdr.flags, req->hdr.fence_id);
+        fprintf(stderr, "  [FROM GUEST] hdr.ctx_id=%u, hdr.ring_idx=%u\n",
+                req->hdr.ctx_id, req->hdr.ring_idx);
+        fprintf(stderr,
+                "  [FROM GUEST] r.x=%u, r.y=%u, r.width=%u, r.height=%u\n",
+                req->r.x, req->r.y, req->r.width, req->r.height);
+        fprintf(stderr, "  [FROM GUEST] offset=%lu (0x%lx)\n", req->offset,
+                req->offset);
+        fprintf(stderr, "  [FROM GUEST] resource_id=%u\n", req->resource_id);
+        fprintf(stderr, "  [FROM GUEST] padding=%u\n", req->padding);
+        fprintf(stderr, "  [HOST STORED] Resource: %u x %u, BPP: %u\n",
+                res_2d->width, res_2d->height, bpp);
+        fprintf(stderr, "  [HOST CALCULATED] stride: %u (width * bpp)\n",
+                res_2d->stride);
+        fprintf(stderr,
+                "  [HOST EXPECTS] offset if tightly packed (y*w*bpp): %lu "
+                "(0x%lx)\n",
+                expected_offset, expected_offset);
+        fprintf(stderr, "  [COMPARISON] Guest offset - expected: %ld bytes\n",
+                (int64_t) req->offset - (int64_t) expected_offset);
+        fprintf(stderr, "  [RESULT] Matches tightly packed? %s\n",
+                (req->offset == expected_offset) ? "YES" : "NO");
+        if (req->r.y == 0) {
+            fprintf(
+                stderr,
+                "  [NOTE] y=0, cannot distinguish stride (all formulas give "
+                "offset=0)\n");
+        }
+        fprintf(stderr, "================================================\n\n");
     }
 
     /* Check image boundary */
@@ -281,6 +351,46 @@ static void virtio_gpu_cmd_resource_attach_backing_handler(
         return;
     }
 
+    /* DEBUG: Calculate total buffer size from guest */
+    size_t total_buffer_size = 0;
+    struct vgpu_mem_entry *mem_entries = (struct vgpu_mem_entry *) pages;
+    for (size_t i = 0; i < backing_info->nr_entries; i++) {
+        total_buffer_size += mem_entries[i].length;
+    }
+
+    size_t expected_tightly_packed =
+        res_2d->width * res_2d->height * (res_2d->bits_per_pixel / 8);
+    size_t expected_with_host_stride = res_2d->stride * res_2d->height;
+
+    fprintf(stderr, "\n=== [DEBUG] Attach Backing (Resource ID=%u) ===\n",
+            backing_info->resource_id);
+    fprintf(stderr, "  [HOST STORED] Resource: %u x %u, BPP: %u\n",
+            res_2d->width, res_2d->height, res_2d->bits_per_pixel);
+    fprintf(stderr, "  [HOST CALCULATED] stride: %u\n", res_2d->stride);
+    fprintf(stderr, "  [FROM GUEST] nr_entries: %u\n",
+            backing_info->nr_entries);
+    fprintf(stderr,
+            "  [FROM GUEST] Total buffer size (sum of all pages): %zu bytes\n",
+            total_buffer_size);
+    fprintf(stderr, "  [HOST EXPECTS] Tightly packed (w*h*bpp): %zu bytes\n",
+            expected_tightly_packed);
+    fprintf(stderr, "  [HOST EXPECTS] With host stride (stride*h): %zu bytes\n",
+            expected_with_host_stride);
+    fprintf(stderr, "  [COMPARISON] Difference: %zd bytes\n",
+            (ssize_t) total_buffer_size - (ssize_t) expected_tightly_packed);
+    fprintf(stderr, "  [RESULT] Guest buffer matches tightly packed? %s\n",
+            (total_buffer_size == expected_tightly_packed) ? "YES" : "NO");
+
+    /* Print individual page info if there are multiple pages */
+    if (backing_info->nr_entries > 1) {
+        fprintf(stderr, "  [FROM GUEST] Page details:\n");
+        for (size_t i = 0; i < backing_info->nr_entries; i++) {
+            fprintf(stderr, "    [%zu] addr=0x%lx, len=%u\n", i,
+                    mem_entries[i].addr, mem_entries[i].length);
+        }
+    }
+    fprintf(stderr, "============================================\n\n");
+
     /* Dispatch page memories to the 2D resource */
     res_2d->page_cnt = backing_info->nr_entries;
     res_2d->iovec = malloc(sizeof(struct iovec) * backing_info->nr_entries);
@@ -290,7 +400,6 @@ static void virtio_gpu_cmd_resource_attach_backing_handler(
         return;
     }
 
-    struct vgpu_mem_entry *mem_entries = (struct vgpu_mem_entry *) pages;
     for (size_t i = 0; i < backing_info->nr_entries; i++) {
         /* Attach address and length of i-th page to the 2D resource */
         res_2d->iovec[i].iov_base =
