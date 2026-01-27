@@ -138,6 +138,10 @@ int vgpu_destroy_resource_2d(uint32_t resource_id)
 
 void *vgpu_mem_guest_to_host(virtio_gpu_state_t *vgpu, uint32_t addr)
 {
+    if (addr >= RAM_SIZE) {
+        fprintf(stderr, "virtio-gpu: guest address 0x%x out of bounds\n", addr);
+        return NULL;
+    }
     return (void *) ((uintptr_t) vgpu->ram + addr);
 }
 
@@ -146,6 +150,8 @@ uint32_t virtio_gpu_write_response(virtio_gpu_state_t *vgpu,
                                    uint32_t type)
 {
     struct vgpu_ctrl_hdr *response = vgpu_mem_guest_to_host(vgpu, addr);
+    if (!response)
+        return 0;
 
     memset(response, 0, sizeof(*response));
     response->type = type;

@@ -184,7 +184,7 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
     /* Handle if the available index has overflowed and returned to the
      * beginning */
     if (new_avail < queue->last_avail)
-        flattened_avail_idx += UINT16_MAX;
+        flattened_avail_idx += (1U << 16);
 
     /* Check if need to wait until the driver supplies new buffers */
     if (flattened_avail_idx < end)
@@ -219,6 +219,12 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
         /* Check buffer is large enough */
         if (vq_desc.len < sizeof(struct virtio_input_event)) {
             fprintf(stderr, "virtio-input: descriptor buffer too small\n");
+            return false;
+        }
+
+        /* Check buffer address is within RAM bounds */
+        if (vq_desc.addr + sizeof(struct virtio_input_event) > RAM_SIZE) {
+            fprintf(stderr, "virtio-input: descriptor address out of bounds\n");
             return false;
         }
 

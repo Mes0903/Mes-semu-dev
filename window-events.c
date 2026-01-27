@@ -59,6 +59,7 @@ struct key_map_entry key_map[] = {
     DEF_KEY_MAP(SDLK_k, KEY_K),
     DEF_KEY_MAP(SDLK_l, KEY_L),
     DEF_KEY_MAP(SDLK_SEMICOLON, KEY_SEMICOLON),
+    DEF_KEY_MAP(SDLK_QUOTE, KEY_APOSTROPHE),
     DEF_KEY_MAP(SDLK_BACKQUOTE, KEY_GRAVE),
     DEF_KEY_MAP(SDLK_LSHIFT, KEY_LEFTSHIFT),
     DEF_KEY_MAP(SDLK_BACKSLASH, KEY_BACKSLASH),
@@ -86,10 +87,12 @@ struct key_map_entry key_map[] = {
     DEF_KEY_MAP(SDLK_F8, KEY_F8),
     DEF_KEY_MAP(SDLK_F9, KEY_F9),
     DEF_KEY_MAP(SDLK_F10, KEY_F10),
+    DEF_KEY_MAP(SDLK_NUMLOCKCLEAR, KEY_NUMLOCK),
     DEF_KEY_MAP(SDLK_SCROLLLOCK, KEY_SCROLLLOCK),
     DEF_KEY_MAP(SDLK_KP_7, KEY_KP7),
     DEF_KEY_MAP(SDLK_KP_8, KEY_KP8),
     DEF_KEY_MAP(SDLK_KP_9, KEY_KP9),
+    DEF_KEY_MAP(SDLK_KP_MULTIPLY, KEY_KPASTERISK),
     DEF_KEY_MAP(SDLK_KP_MINUS, KEY_KPMINUS),
     DEF_KEY_MAP(SDLK_KP_4, KEY_KP4),
     DEF_KEY_MAP(SDLK_KP_5, KEY_KP5),
@@ -103,6 +106,7 @@ struct key_map_entry key_map[] = {
     DEF_KEY_MAP(SDLK_F11, KEY_F11),
     DEF_KEY_MAP(SDLK_F12, KEY_F12),
     DEF_KEY_MAP(SDLK_KP_ENTER, KEY_KPENTER),
+    DEF_KEY_MAP(SDLK_KP_DIVIDE, KEY_KPSLASH),
     DEF_KEY_MAP(SDLK_RCTRL, KEY_RIGHTCTRL),
     DEF_KEY_MAP(SDLK_RALT, KEY_RIGHTALT),
     DEF_KEY_MAP(SDLK_HOME, KEY_HOME),
@@ -143,19 +147,23 @@ int window_events_thread(void *data)
             exit(0);
         case SDL_KEYDOWN:
             linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-            virtio_input_update_key(linux_key, 1);
+            if (linux_key >= 0)
+                virtio_input_update_key(linux_key, 1);
             break;
         case SDL_KEYUP:
             linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-            virtio_input_update_key(linux_key, 0);
+            if (linux_key >= 0)
+                virtio_input_update_key(linux_key, 0);
             break;
         case SDL_MOUSEBUTTONDOWN:
             linux_key = sdl_key_to_linux_key(e.button.button);
-            virtio_input_update_mouse_button_state(linux_key, true);
+            if (linux_key >= 0)
+                virtio_input_update_mouse_button_state(linux_key, true);
             break;
         case SDL_MOUSEBUTTONUP:
             linux_key = sdl_key_to_linux_key(e.button.button);
-            virtio_input_update_mouse_button_state(linux_key, false);
+            if (linux_key >= 0)
+                virtio_input_update_mouse_button_state(linux_key, false);
             break;
         case SDL_MOUSEMOTION:
             virtio_input_update_cursor(e.motion.x, e.motion.y);
