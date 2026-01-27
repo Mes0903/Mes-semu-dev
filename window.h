@@ -15,7 +15,7 @@ struct window_backend {
     void (*window_clear)(int scanout_id);
     void (*window_flush)(int scanout_id, int res_id);
     void (*cursor_clear)(int scanout_id);
-    int (*cursor_update)(int scanout_id, int res_id, int x, int y);
+    void (*cursor_update)(int scanout_id, int res_id, int x, int y);
     void (*cursor_move)(int scanout_id, int x, int y);
 };
 

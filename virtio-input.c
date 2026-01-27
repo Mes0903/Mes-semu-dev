@@ -35,6 +35,8 @@
 #define VINPUT_QUEUE_NUM_MAX 1024
 #define VINPUT_QUEUE (vinput->queues[vinput->QueueSel])
 
+#define PRIV(x) ((struct virio_input_data *) (x)->priv)
+
 enum {
     VINPUT_KEYBOARD_ID = 0,
     VINPUT_MOUSE_ID = 1,
@@ -99,6 +101,7 @@ PACKED(struct virtio_input_event {
 struct virio_input_data {
     virtio_input_state_t *vinput;
     struct virtio_input_config cfg;
+    int type; /* VINPUT_KEYBOARD_ID or VINPUT_MOUSE_ID */
 };
 
 static pthread_mutex_t virtio_input_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -153,12 +156,10 @@ static void virtio_input_update_status(virtio_input_state_t *vinput,
 
     /* Reset */
     uint32_t *ram = vinput->ram;
-    // void *priv = vinput->priv; /* TODO */
-    int id = vinput->id; /* TODO: Store in vinput->priv */
+    void *priv = vinput->priv;
     memset(vinput, 0, sizeof(*vinput));
     vinput->ram = ram;
-    vinput->id = id;
-    // vinput->priv = priv;
+    vinput->priv = priv;
 }
 
 /* Returns true if any events were written to used ring, false otherwise */
@@ -266,7 +267,7 @@ static void virtio_queue_event_update(int dev_id,
     if (!((vinput->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))
         goto fail;
 
-    /* Check for new buffers - use avail.idx instead of ev_notify gate */
+    /* Check for new buffers */
     uint16_t new_avail = ram[queue->QueueAvail] >> 16;
     if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum) {
         fprintf(stderr, "%s(): size check failed\n", __func__);
@@ -498,9 +499,9 @@ static bool virtio_input_reg_read(virtio_input_state_t *vinput,
         *value = 0;
         return true;
     case VIRTIO_INPUT_REG_SIZE:
-        if (!virtio_input_cfg_read(vinput->id))
+        if (!virtio_input_cfg_read(PRIV(vinput)->type))
             return false;
-        *value = vinput_dev[vinput->id].cfg.size;
+        *value = PRIV(vinput)->cfg.size;
         return true;
     default:
         /* Invalid address which exceeded the range */
@@ -509,8 +510,7 @@ static bool virtio_input_reg_read(virtio_input_state_t *vinput,
 
         /* Read virtio-input specific registers */
         off_t offset = addr - VIRTIO_INPUT_REG_SELECT;
-        uint8_t *reg =
-            (uint8_t *) ((uintptr_t) &vinput_dev[vinput->id].cfg + offset);
+        uint8_t *reg = (uint8_t *) ((uintptr_t) &PRIV(vinput)->cfg + offset);
 
         /* Clear value first to avoid returning dirty high bits on partial reads
          */
@@ -595,10 +595,10 @@ static bool virtio_input_reg_write(virtio_input_state_t *vinput,
     case _(SHMSel):
         return true;
     case VIRTIO_INPUT_REG_SELECT:
-        vinput_dev[vinput->id].cfg.select = value;
+        PRIV(vinput)->cfg.select = value;
         return true;
     case VIRTIO_INPUT_REG_SUBSEL:
-        vinput_dev[vinput->id].cfg.subsel = value;
+        PRIV(vinput)->cfg.subsel = value;
         return true;
     default:
         /* No other writable registers */
@@ -716,8 +716,15 @@ out:
 
 void virtio_input_init(virtio_input_state_t *vinput)
 {
-    vinput->id = vinput_dev_cnt;
-    vinput_dev_cnt++;
+    if (vinput_dev_cnt >= VINPUT_DEV_CNT) {
+        fprintf(stderr,
+                "Exceeded the number of virtio-input devices that can be "
+                "allocated.\n");
+        exit(2);
+    }
 
-    vinput_dev[vinput->id].vinput = vinput;
+    vinput->priv = &vinput_dev[vinput_dev_cnt];
+    PRIV(vinput)->type = vinput_dev_cnt;
+    PRIV(vinput)->vinput = vinput;
+    vinput_dev_cnt++;
 }

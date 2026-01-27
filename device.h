@@ -312,7 +312,6 @@ typedef struct {
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
-    int id;  // FIXME
     void *priv;
 } virtio_input_state_t;
 

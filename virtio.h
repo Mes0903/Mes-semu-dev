@@ -71,11 +71,6 @@
 #define FUSE_CACHE_SYMLINKS (1 << 23)
 #define FUSE_NO_OPENDIR_SUPPORT (1 << 24)
 
-/* virtio-gpu */
-#define VIRTIO_GPU_FLAG_FENCE (1 << 0)
-
-#define VIRTIO_GPU_MAX_SCANOUTS 16
-
 /* VirtIO MMIO registers */
 #define VIRTIO_REG_LIST                  \
     _(MagicValue, 0x000)        /* R */  \

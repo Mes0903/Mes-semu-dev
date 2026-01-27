@@ -50,6 +50,7 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     default:
         fprintf(stderr, "%s(): unsupported format %d\n", __func__,
                 request->format);
+        vgpu_destroy_resource_2d(request->resource_id);
         *plen = virtio_gpu_write_response(
             vgpu, vq_desc[1].addr, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
         return;
@@ -67,6 +68,7 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     /* Failed to create image buffer */
     if (!res_2d->image) {
         fprintf(stderr, "%s(): Failed to allocate image buffer\n", __func__);
+        vgpu_destroy_resource_2d(request->resource_id);
         virtio_gpu_set_fail(vgpu);
         return;
     }
@@ -211,6 +213,15 @@ static void virtio_gpu_cmd_transfer_to_host_2d_handler(
                 req->resource_id);
         *plen = virtio_gpu_write_response(
             vgpu, vq_desc[1].addr, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Check if backing has been attached */
+    if (!res_2d->iovec) {
+        fprintf(stderr, "%s(): backing not attached for resource %d\n",
+                __func__, req->resource_id);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[1].addr,
+                                          VIRTIO_GPU_RESP_ERR_UNSPEC);
         return;
     }
 

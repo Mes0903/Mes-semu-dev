@@ -240,12 +240,12 @@ static void cursor_clear_sw(int scanout_id)
     window_unlock_mutex(scanout_id);
 }
 
-static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
+static void cursor_update_sw(int scanout_id, int res_id, int x, int y)
 {
     struct vgpu_resource_2d *resource = vgpu_get_resource_2d(res_id);
     if (!resource) {
         fprintf(stderr, "%s(): invalid resource id %d\n", __func__, res_id);
-        return -1;
+        return;
     }
 
     /* Convert virtio-gpu resource format to SDL format */
@@ -254,7 +254,7 @@ static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
 
     if (!legal_format) {
         fprintf(stderr, "%s(): invalid resource format\n", __func__);
-        return -1;
+        return;
     }
 
     /* Start of the critical section */
@@ -276,8 +276,9 @@ static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
     if (!display->cursor_img) {
         fprintf(stderr, "%s(): failed to allocate cursor image\n", __func__);
         window_unlock_mutex(scanout_id);
-        return -1;
+        return;
     }
+
     display->cursor.image = display->cursor_img;
     memcpy(display->cursor_img, resource->image, pixels_size);
 
@@ -287,8 +288,6 @@ static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
 
     /* End of the critical section */
     window_unlock_mutex(scanout_id);
-
-    return 0;
 }
 
 static void cursor_move_sw(int scanout_id, int x, int y)
@@ -331,7 +330,7 @@ static void window_flush_sw(int scanout_id, int res_id)
     struct vgpu_resource_2d *resource = vgpu_get_resource_2d(res_id);
     if (!resource) {
         fprintf(stderr, "%s(): invalid resource id %d\n", __func__, res_id);
-        return -1;
+        return;
     }
 
     /* Convert virtio-gpu resource format to SDL format */

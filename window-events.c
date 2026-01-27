@@ -135,36 +135,31 @@ int window_events_thread(void *data)
 
     while (1) {
         SDL_Event e;
-        if (SDL_PollEvent(&e)) {
-            switch (e.type) {
-            case SDL_QUIT: {
-                exit(0);
-            }
-            case SDL_KEYDOWN: {
-                linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-                virtio_input_update_key(linux_key, 1);
-                break;
-            }
-            case SDL_KEYUP: {
-                linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-                virtio_input_update_key(linux_key, 0);
-                break;
-            }
-            case SDL_MOUSEBUTTONDOWN: {
-                linux_key = sdl_key_to_linux_key(e.button.button);
-                virtio_input_update_mouse_button_state(linux_key, true);
-                break;
-            }
-            case SDL_MOUSEBUTTONUP: {
-                linux_key = sdl_key_to_linux_key(e.button.button);
-                virtio_input_update_mouse_button_state(linux_key, false);
-                break;
-            }
-            case SDL_MOUSEMOTION: {
-                virtio_input_update_cursor(e.motion.x, e.motion.y);
-                break;
-            }
-            }
+        if (!SDL_WaitEvent(&e))
+            continue;
+
+        switch (e.type) {
+        case SDL_QUIT:
+            exit(0);
+        case SDL_KEYDOWN:
+            linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
+            virtio_input_update_key(linux_key, 1);
+            break;
+        case SDL_KEYUP:
+            linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
+            virtio_input_update_key(linux_key, 0);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            linux_key = sdl_key_to_linux_key(e.button.button);
+            virtio_input_update_mouse_button_state(linux_key, true);
+            break;
+        case SDL_MOUSEBUTTONUP:
+            linux_key = sdl_key_to_linux_key(e.button.button);
+            virtio_input_update_mouse_button_state(linux_key, false);
+            break;
+        case SDL_MOUSEMOTION:
+            virtio_input_update_cursor(e.motion.x, e.motion.y);
+            break;
         }
     }
 }
