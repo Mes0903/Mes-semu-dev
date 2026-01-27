@@ -243,6 +243,10 @@ static void cursor_clear_sw(int scanout_id)
 static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
 {
     struct vgpu_resource_2d *resource = vgpu_get_resource_2d(res_id);
+    if (!resource) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__, res_id);
+        return -1;
+    }
 
     /* Convert virtio-gpu resource format to SDL format */
     uint32_t sdl_format;
@@ -269,6 +273,11 @@ static int cursor_update_sw(int scanout_id, int res_id, int x, int y)
     size_t pixels_size = sizeof(uint32_t) * resource->width * resource->height;
     free(display->cursor_img);
     display->cursor_img = malloc(pixels_size);
+    if (!display->cursor_img) {
+        fprintf(stderr, "%s(): failed to allocate cursor image\n", __func__);
+        window_unlock_mutex(scanout_id);
+        return -1;
+    }
     display->cursor.image = display->cursor_img;
     memcpy(display->cursor_img, resource->image, pixels_size);
 
@@ -320,6 +329,10 @@ static void window_flush_sw(int scanout_id, int res_id)
 {
     struct display_info *display = &displays[scanout_id];
     struct vgpu_resource_2d *resource = vgpu_get_resource_2d(res_id);
+    if (!resource) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__, res_id);
+        return -1;
+    }
 
     /* Convert virtio-gpu resource format to SDL format */
     uint32_t sdl_format;

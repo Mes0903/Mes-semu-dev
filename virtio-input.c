@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,23 @@ static void virtio_input_set_fail(virtio_input_state_t *vinput)
     vinput->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
     if (vinput->Status & VIRTIO_STATUS__DRIVER_OK)
         vinput->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+}
+
+static inline bool vinput_is_config_access(uint32_t addr, size_t access_size)
+{
+    const uint32_t base = VIRTIO_Config << 2;
+    const uint32_t end = base + (uint32_t) sizeof(struct virtio_input_config);
+
+    /* [base, end) */
+    if (access_size == 0)
+        return false;
+    if (addr < base)
+        return false;
+    if (addr >= end)
+        return false;
+    if (addr + access_size > end)
+        return false;
+    return true;
 }
 
 static inline uint32_t vinput_preprocess(virtio_input_state_t *vinput,
@@ -595,34 +613,51 @@ void virtio_input_read(hart_t *vm,
                        uint8_t width,
                        uint32_t *value)
 {
+    size_t access_size = 0;
+    bool is_cfg = false;
+
     pthread_mutex_lock(&virtio_input_mutex);
 
-    /* XXX: 4-byte alignment (i.e., addr >> 2) is removed due to the per
-    byte accessing */
     switch (width) {
     case RV_MEM_LW:
-        if (!virtio_input_reg_read(vinput, addr, value, 4))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        access_size = 4;
         break;
     case RV_MEM_LBU:
     case RV_MEM_LB:
-        /* virtio-input driver needs to access device config register per byte
-         */
-        if (!virtio_input_reg_read(vinput, addr, value, 1))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        access_size = 1;
         break;
     case RV_MEM_LHU:
     case RV_MEM_LH:
-        /* virtio-input driver needs to access device config register per
-         * halfword */
-        if (!virtio_input_reg_read(vinput, addr, value, 2))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        access_size = 2;
         break;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
-        break;
+        goto out;
     }
 
+    is_cfg = vinput_is_config_access(addr, access_size);
+
+    /*
+     * Common registers (before Config): only allow aligned 32-bit LW.
+     * Device-specific config (Config and after): allow 8/16/32-bit with
+     * natural alignment.
+     */
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+            goto out;
+        }
+    } else {
+        if (addr & (access_size - 1)) {
+            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+            goto out;
+        }
+    }
+
+    if (!virtio_input_reg_read(vinput, addr, value, access_size))
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+
+out:
     pthread_mutex_unlock(&virtio_input_mutex);
 }
 
@@ -632,32 +667,50 @@ void virtio_input_write(hart_t *vm,
                         uint8_t width,
                         uint32_t value)
 {
+    size_t access_size = 0;
+    bool is_cfg = false;
+
     pthread_mutex_lock(&virtio_input_mutex);
 
-    /* XXX: 4-byte alignment (i.e., addr >> 2) is removed due to the per
-    byte accessing */
     switch (width) {
     case RV_MEM_SW:
-        if (!virtio_input_reg_write(vinput, addr, value))
-            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        access_size = 4;
         break;
     case RV_MEM_SB:
+        access_size = 1;
+        break;
     case RV_MEM_SH:
-        /* FIXME: virtio-input driver need to access device config register per
-         * byte. the following code that derived from other virtio devices'
-         * implementation will cause kernel panic */
-        // vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
-#if 1
-        // printf("read addr: 0x%x, width: %d\n", addr, width);
-        if (!virtio_input_reg_write(vinput, addr, value))
-            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
-#endif
+        access_size = 2;
         break;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
-        break;
+        goto out;
     }
 
+    is_cfg = vinput_is_config_access(addr, access_size);
+
+    /*
+     * Common registers (before Config): only allow aligned 32-bit SW.
+     * Device-specific config (Config and after): allow 8/16/32-bit with
+     * natural alignment. Note: only select/subsel are writable; others
+     * will return false and be reported as STORE_FAULT below.
+     */
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            goto out;
+        }
+    } else {
+        if (addr & (access_size - 1)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            goto out;
+        }
+    }
+
+    if (!virtio_input_reg_write(vinput, addr, value))
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+
+out:
     pthread_mutex_unlock(&virtio_input_mutex);
 }
 
