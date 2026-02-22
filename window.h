@@ -26,4 +26,8 @@ struct window_backend {
     void (*window_shutdown)(void);
 };
 
+#if SEMU_HAS(VIRTIOINPUT)
+bool handle_window_events(void);
+#endif
+
 #endif

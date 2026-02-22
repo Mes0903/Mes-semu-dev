@@ -56,6 +56,12 @@ static void window_main_loop_sw(void)
 
     while (!should_exit) {
         /* Handle SDL events */
+#if SEMU_HAS(VIRTIOINPUT)
+        if (handle_window_events()) {
+            should_exit = true;
+            exit(0);
+        }
+#else
         {
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
@@ -65,6 +71,7 @@ static void window_main_loop_sw(void)
                 }
             }
         }
+#endif
 
         /* Check each display for pending render requests */
         for (int i = 0; i < display_cnt; i++) {
