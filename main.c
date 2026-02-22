@@ -4,6 +4,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,11 +28,14 @@
 #include "mini-gdbstub/include/gdbstub.h"
 #include "riscv.h"
 #include "riscv_private.h"
+#include "window.h"
+
 #define PRIV(x) ((emu_state_t *) x->priv)
 
 /* Forward declarations for coroutine support */
 static void wfi_handler(hart_t *hart);
 static void hart_exec_loop(void *arg);
+extern const struct window_backend g_window;
 
 /* Define fetch separately since it is simpler (fixed width, already checked
  * alignment, only main RAM is executable).
@@ -99,6 +103,18 @@ static void emu_update_vrng_interrupts(vm_t *vm)
         data->plic.active |= IRQ_VRNG_BIT;
     else
         data->plic.active &= ~IRQ_VRNG_BIT;
+    plic_update_interrupts(vm, &data->plic);
+}
+#endif
+
+#if SEMU_HAS(VIRTIOGPU)
+static void emu_update_vgpu_interrupts(vm_t *vm)
+{
+    emu_state_t *data = PRIV(vm->hart[0]);
+    if (data->vgpu.InterruptStatus)
+        data->plic.active |= IRQ_VGPU_BIT;
+    else
+        data->plic.active &= ~IRQ_VGPU_BIT;
     plic_update_interrupts(vm, &data->plic);
 }
 #endif
@@ -198,6 +214,10 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
         if (emu->vfs.InterruptStatus)
             emu_update_vfs_interrupts(vm);
 #endif
+#if SEMU_HAS(VIRTIOGPU)
+        if (emu->vgpu.InterruptStatus)
+            emu_update_vgpu_interrupts(vm);
+#endif
     }
 }
 
@@ -249,16 +269,20 @@ static void mem_load(hart_t *hart,
             virtio_rng_read(hart, &data->vrng, addr & 0xFFFFF, width, value);
             return;
 #endif
-
 #if SEMU_HAS(VIRTIOSND)
         case 0x47: /* virtio-snd */
             virtio_snd_read(hart, &data->vsnd, addr & 0xFFFFF, width, value);
             return;
 #endif
-
 #if SEMU_HAS(VIRTIOFS)
         case 0x48: /* virtio-fs */
             virtio_fs_read(hart, &data->vfs, addr & 0xFFFFF, width, value);
+            return;
+#endif
+#if SEMU_HAS(VIRTIOGPU)
+        case 0x49: /* virtio-gpu */
+            virtio_gpu_read(hart, &data->vgpu, addr & 0xFFFFF, width, value);
+            emu_update_vgpu_interrupts(hart->vm);
             return;
 #endif
         }
@@ -315,25 +339,28 @@ static void mem_store(hart_t *hart,
             aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width, value);
             aclint_sswi_update_interrupts(hart, &data->sswi);
             return;
-
 #if SEMU_HAS(VIRTIORNG)
         case 0x46: /* virtio-rng */
             virtio_rng_write(hart, &data->vrng, addr & 0xFFFFF, width, value);
             emu_update_vrng_interrupts(hart->vm);
             return;
 #endif
-
 #if SEMU_HAS(VIRTIOSND)
         case 0x47: /* virtio-snd */
             virtio_snd_write(hart, &data->vsnd, addr & 0xFFFFF, width, value);
             emu_update_vsnd_interrupts(hart->vm);
             return;
 #endif
-
 #if SEMU_HAS(VIRTIOFS)
         case 0x48: /* virtio-fs */
             virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF, width, value);
             emu_update_vfs_interrupts(hart->vm);
+            return;
+#endif
+#if SEMU_HAS(VIRTIOGPU)
+        case 0x49: /* virtio-gpu */
+            virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF, width, value);
+            emu_update_vgpu_interrupts(hart->vm);
             return;
 #endif
         }
@@ -822,7 +849,13 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     if (!virtio_fs_init(&(emu->vfs), "myfs", shared_dir))
         fprintf(stderr, "No virtio-fs functioned\n");
 #endif
+#if SEMU_HAS(VIRTIOGPU)
+    emu->vgpu.ram = emu->ram;
+    virtio_gpu_init(&(emu->vgpu));
+    virtio_gpu_add_scanout(&(emu->vgpu), SCREEN_WIDTH, SCREEN_HEIGHT);
 
+    g_window.window_init();
+#endif
     emu->peripheral_update_ctr = 0;
     emu->debug = debug;
 
@@ -1539,6 +1572,24 @@ static int semu_run_debug(emu_state_t *emu)
     return 0;
 }
 
+/* Thread wrapper for running emulator in background thread */
+static void *emu_thread_func(void *arg)
+{
+    emu_state_t *emu = (emu_state_t *) arg;
+    int ret;
+
+    if (emu->debug)
+        ret = semu_run_debug(emu);
+    else
+        ret = semu_run(emu);
+
+    /* Unblock window_main_loop() on the main thread so it can return */
+    if (g_window.window_shutdown)
+        g_window.window_shutdown();
+
+    return (void *) (intptr_t) ret;
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -1552,10 +1603,33 @@ int main(int argc, char **argv)
     signal(SIGTERM, signal_handler_stats);
 #endif
 
-    if (emu.debug)
-        ret = semu_run_debug(&emu);
-    else
-        ret = semu_run(&emu);
+#if SEMU_HAS(VIRTIOGPU)
+    /* If window backend has a main loop function, run emulator in background
+     * thread and use main thread for window events (required for macOS SDL2).
+     */
+    if (g_window.window_main_loop) {
+        pthread_t emu_thread;
+        void *thread_ret;
+
+        if (pthread_create(&emu_thread, NULL, emu_thread_func, &emu) != 0) {
+            fprintf(stderr, "Failed to create emulator thread\n");
+            return 1;
+        }
+
+        /* Main thread runs window event loop (required for macOS) */
+        g_window.window_main_loop();
+
+        /* Wait for emulator thread to finish */
+        pthread_join(emu_thread, &thread_ret);
+        ret = (int) (intptr_t) thread_ret;
+    } else
+#endif
+    {
+        if (emu.debug)
+            ret = semu_run_debug(&emu);
+        else
+            ret = semu_run(&emu);
+    }
 
 #ifdef MMU_CACHE_STATS
     print_mmu_cache_stats(&emu.vm);
