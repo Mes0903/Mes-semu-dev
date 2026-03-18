@@ -15,6 +15,10 @@ esac
 cleanup
 trap cleanup EXIT
 
+# Force fresh download of Image and rootfs.cpio to avoid stale cache
+rm -f Image rootfs.cpio
+make Image rootfs.cpio
+
 # Feature toggles are passed through environment variables, which do not
 # participate in make's normal dependency tracking. Force a rebuild here so
 # one-feature-at-a-time test runs never reuse a stale semu binary.
