@@ -216,6 +216,7 @@ static void virtio_input_update_status(virtio_input_state_t *vinput,
     /* Reset */
     uint32_t *ram = vinput->ram;
     void *priv = vinput->priv;
+    vinput_reset_host_events();
     memset(vinput, 0, sizeof(*vinput));
     vinput->ram = ram;
     vinput->priv = priv;
@@ -365,7 +366,7 @@ out:
     pthread_mutex_unlock(&vinput_mutex);
 }
 
-void virtio_input_update_key(uint32_t key, uint32_t ev_value)
+static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "key code=%u value=%u\n", key,
@@ -381,7 +382,8 @@ void virtio_input_update_key(uint32_t key, uint32_t ev_value)
     virtio_input_update_eventq(VINPUT_KEYBOARD_ID, input_ev, ev_cnt);
 }
 
-void virtio_input_update_mouse_button_state(uint32_t button, bool pressed)
+static void virtio_input_update_mouse_button_state(uint32_t button,
+                                                   bool pressed)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "button code=%u pressed=%u\n", button,
@@ -396,7 +398,7 @@ void virtio_input_update_mouse_button_state(uint32_t button, bool pressed)
     virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
 }
 
-void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
+static void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "motion dx=%d dy=%d\n", dx, dy);
@@ -419,7 +421,7 @@ void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
     virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
 }
 
-void virtio_input_update_scroll(int32_t dx, int32_t dy)
+static void virtio_input_update_scroll(int32_t dx, int32_t dy)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "scroll dx=%d dy=%d\n", dx, dy);
@@ -447,6 +449,40 @@ void virtio_input_update_scroll(int32_t dx, int32_t dy)
         .type = SEMU_EV_SYN, .code = SEMU_SYN_REPORT, .value = 0};
 
     virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
+}
+
+void virtio_input_drain_host_events(void)
+{
+    for (;;) {
+        struct vinput_cmd event;
+
+        /* Drain all host-side window events on the emulator thread so SDL
+         * never touches guest-visible virtio-input state directly.
+         */
+        while (vinput_pop_cmd(&event)) {
+            switch (event.type) {
+            case VINPUT_CMD_KEYBOARD_KEY:
+                virtio_input_update_key(event.u.keyboard_key.key,
+                                        event.u.keyboard_key.value);
+                break;
+            case VINPUT_CMD_MOUSE_BUTTON:
+                virtio_input_update_mouse_button_state(
+                    event.u.mouse_button.button, event.u.mouse_button.pressed);
+                break;
+            case VINPUT_CMD_MOUSE_MOTION:
+                virtio_input_update_mouse_motion(event.u.mouse_motion.dx,
+                                                 event.u.mouse_motion.dy);
+                break;
+            case VINPUT_CMD_MOUSE_WHEEL:
+                virtio_input_update_scroll(event.u.mouse_wheel.dx,
+                                           event.u.mouse_wheel.dy);
+                break;
+            }
+        }
+
+        if (vinput_rearm_cmd_wake())
+            break;
+    }
 }
 
 static void virtio_input_properties(int dev_id)
@@ -868,10 +904,11 @@ out:
 
 bool virtio_input_irq_pending(virtio_input_state_t *vinput)
 {
-    pthread_mutex_lock(&vinput_mutex);
-    bool pending = vinput->InterruptStatus != 0;
-    pthread_mutex_unlock(&vinput_mutex);
-    return pending;
+    /* The emulator thread drains queued window events before polling
+     * InterruptStatus here, so this hot-path check can stay as a plain flag
+     * read instead of taking vinput_mutex.
+     */
+    return vinput->InterruptStatus != 0;
 }
 
 void virtio_input_init(virtio_input_state_t *vinput)

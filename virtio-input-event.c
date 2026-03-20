@@ -6,7 +6,11 @@
 #include "virtio-input-event.h"
 #include "window.h"
 
+#define VINPUT_CMD_QUEUE_SIZE 1024U
+#define VINPUT_CMD_QUEUE_MASK (VINPUT_CMD_QUEUE_SIZE - 1U)
+
 #define VINPUT_SDL_EVENT_WAIT_TIMEOUT_MS 1 /* ms */
+#define VINPUT_SDL_EVENT_BURST_LIMIT 64U
 
 #define DEF_KEY_MAP(_sdl_scancode, _linux_key) \
     {.sdl_scancode = _sdl_scancode, .linux_key = _linux_key}
@@ -15,6 +19,14 @@ struct vinput_key_map_entry {
     int sdl_scancode;
     int linux_key;
 };
+
+/* Queue storage plus producer/consumer cursors. The queue stays entirely on
+ * the host side so SDL never touches guest-facing virtio-input state directly.
+ */
+static struct vinput_cmd vinput_cmd_queue[VINPUT_CMD_QUEUE_SIZE];
+static uint32_t vinput_cmd_head;
+static uint32_t vinput_cmd_tail;
+static bool vinput_cmd_wake_pending;
 
 static struct vinput_key_map_entry vinput_key_map[] = {
     /* Keyboard */
@@ -119,6 +131,41 @@ static struct vinput_key_map_entry vinput_key_map[] = {
     DEF_KEY_MAP(SDL_SCANCODE_DELETE, SEMU_KEY_DELETE),
 };
 
+static bool vinput_push_cmd(const struct vinput_cmd *event)
+{
+    uint32_t head = __atomic_load_n(&vinput_cmd_head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&vinput_cmd_tail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1U) & VINPUT_CMD_QUEUE_MASK;
+
+    /* Keep the producer non-blocking. If the queue is full, the newest event
+     * is dropped. This remains intentionally lossy even for key/button events,
+     * which means a sustained overflow can lose a release edge. We keep that
+     * tradeoff explicit here rather than synthesizing corrective events.
+     */
+    if (next == tail)
+        return false;
+
+    vinput_cmd_queue[head] = *event;
+    __atomic_store_n(&vinput_cmd_head, next, __ATOMIC_RELEASE);
+
+    /* Coalesce wakeups across a whole drain batch. The producer only writes to
+     * the wake pipe when transitioning wake_pending false -> true and the
+     * consumer clears it after draining queued events and rechecks for races.
+     */
+    if (!__atomic_exchange_n(&vinput_cmd_wake_pending, true, __ATOMIC_ACQ_REL))
+        g_window.window_wake_backend();
+
+    return true;
+}
+
+static bool vinput_is_cmd_queue_empty(void)
+{
+    uint32_t tail = __atomic_load_n(&vinput_cmd_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&vinput_cmd_head, __ATOMIC_ACQUIRE);
+
+    return tail == head;
+}
+
 /* Mouse button mapping uses SDL button IDs, not scancodes */
 static int vinput_sdl_button_to_linux_key(int sdl_button)
 {
@@ -148,17 +195,70 @@ static int vinput_sdl_scancode_to_linux_key(int sdl_scancode)
     return -1;
 }
 
+bool vinput_pop_cmd(struct vinput_cmd *event)
+{
+    /* Consumer-side dequeue. Called from the emulator thread after poll()
+     * wakes, and also from the periodic peripheral tick while work remains.
+     */
+    uint32_t tail = __atomic_load_n(&vinput_cmd_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&vinput_cmd_head, __ATOMIC_ACQUIRE);
+
+    if (tail == head)
+        return false;
+
+    *event = vinput_cmd_queue[tail];
+    tail = (tail + 1U) & VINPUT_CMD_QUEUE_MASK;
+    __atomic_store_n(&vinput_cmd_tail, tail, __ATOMIC_RELEASE);
+
+    return true;
+}
+
+bool vinput_rearm_cmd_wake(void)
+{
+    /* Clear wake_pending only after the current batch has been drained. If the
+     * producer published while wake_pending was still true, the queue will be
+     * non-empty here and the consumer must keep draining instead of returning
+     * to poll().
+     */
+    __atomic_store_n(&vinput_cmd_wake_pending, false, __ATOMIC_RELEASE);
+    return vinput_is_cmd_queue_empty();
+}
+
+bool vinput_may_have_pending_cmds(void)
+{
+    return __atomic_load_n(&vinput_cmd_wake_pending, __ATOMIC_RELAXED);
+}
+
+void vinput_reset_host_events(void)
+{
+    struct vinput_cmd event;
+
+    for (;;) {
+        while (vinput_pop_cmd(&event))
+            ;
+
+        if (vinput_rearm_cmd_wake())
+            break;
+    }
+}
+
 bool vinput_handle_events(void)
 {
     SDL_Event e;
+    uint32_t processed = 0;
     int linux_key;
-    bool quit = false;
 
-    while (SDL_WaitEventTimeout(&e, VINPUT_SDL_EVENT_WAIT_TIMEOUT_MS)) {
+    /* SDL stays on the main thread. Wait for one event, then drain a bounded
+     * burst so the window loop can still return to GPU display work under
+     * continuous input traffic.
+     */
+    if (!SDL_WaitEventTimeout(&e, VINPUT_SDL_EVENT_WAIT_TIMEOUT_MS))
+        return false;
+
+    do {
         switch (e.type) {
         case SDL_QUIT:
-            quit = true;
-            break;
+            return true;
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
                 g_window.window_set_mouse_grab(false);
@@ -177,31 +277,57 @@ bool vinput_handle_events(void)
             if (e.key.repeat)
                 break;
             linux_key = vinput_sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0)
-                virtio_input_update_key(linux_key, 1);
+            if (linux_key >= 0) {
+                struct vinput_cmd event = {
+                    .type = VINPUT_CMD_KEYBOARD_KEY,
+                    .u.keyboard_key = {.key = (uint32_t) linux_key, .value = 1},
+                };
+                vinput_push_cmd(&event);
+            }
             break;
         case SDL_KEYUP:
             linux_key = vinput_sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0)
-                virtio_input_update_key(linux_key, 0);
+            if (linux_key >= 0) {
+                struct vinput_cmd event = {
+                    .type = VINPUT_CMD_KEYBOARD_KEY,
+                    .u.keyboard_key = {.key = (uint32_t) linux_key, .value = 0},
+                };
+                vinput_push_cmd(&event);
+            }
             break;
         case SDL_MOUSEBUTTONDOWN:
             g_window.window_set_mouse_grab(true);
             linux_key = vinput_sdl_button_to_linux_key(e.button.button);
-            if (linux_key >= 0)
-                virtio_input_update_mouse_button_state(linux_key, true);
+            if (linux_key >= 0) {
+                struct vinput_cmd event = {
+                    .type = VINPUT_CMD_MOUSE_BUTTON,
+                    .u.mouse_button = {.button = (uint32_t) linux_key,
+                                       .pressed = true},
+                };
+                vinput_push_cmd(&event);
+            }
             break;
         case SDL_MOUSEBUTTONUP:
             linux_key = vinput_sdl_button_to_linux_key(e.button.button);
-            if (linux_key >= 0)
-                virtio_input_update_mouse_button_state(linux_key, false);
+            if (linux_key >= 0) {
+                struct vinput_cmd event = {
+                    .type = VINPUT_CMD_MOUSE_BUTTON,
+                    .u.mouse_button = {.button = (uint32_t) linux_key,
+                                       .pressed = false},
+                };
+                vinput_push_cmd(&event);
+            }
             break;
-        case SDL_MOUSEMOTION:
+        case SDL_MOUSEMOTION: {
             if (!g_window.window_is_mouse_grabbed() ||
                 (e.motion.xrel == 0 && e.motion.yrel == 0))
                 break;
-            virtio_input_update_mouse_motion(e.motion.xrel, e.motion.yrel);
-            break;
+            struct vinput_cmd event = {
+                .type = VINPUT_CMD_MOUSE_MOTION,
+                .u.mouse_motion = {.dx = e.motion.xrel, .dy = e.motion.yrel},
+            };
+            vinput_push_cmd(&event);
+        } break;
         case SDL_MOUSEWHEEL: {
             int dx = e.wheel.x;
             int dy = e.wheel.y;
@@ -212,13 +338,18 @@ bool vinput_handle_events(void)
                 dx = -dx;
                 dy = -dy;
             }
-            virtio_input_update_scroll(dx, dy);
+            struct vinput_cmd event = {
+                .type = VINPUT_CMD_MOUSE_WHEEL,
+                .u.mouse_wheel = {.dx = dx, .dy = dy},
+            };
+            vinput_push_cmd(&event);
             break;
         }
         }
-    }
+        processed++;
+    } while (processed < VINPUT_SDL_EVENT_BURST_LIMIT && SDL_PollEvent(&e));
 
-    return quit;
+    return false;
 }
 
 int virtio_input_fill_ev_key_bitmap(uint8_t *bitmap, size_t bitmap_size)
