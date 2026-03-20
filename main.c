@@ -226,10 +226,18 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
             emu_update_vfs_interrupts(vm);
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
+        /* The empty path is common during CI and boot workloads, so only
+         * drain the host-side queue after the window thread has published
+         * pending work for the emulator thread.
+         */
+        if (window_events_maybe_pending())
+            virtio_input_drain_window_events();
+
         if (virtio_input_irq_pending(&emu->vkeyboard))
             emu_update_vinput_keyboard_interrupts(vm);
         if (virtio_input_irq_pending(&emu->vmouse))
             emu_update_vinput_mouse_interrupts(vm);
+        /* A closed window is treated like a frontend shutdown request. */
         if (window_is_closed())
             emu->stopped = true;
 #endif
@@ -1372,8 +1380,8 @@ static int semu_run(emu_state_t *emu)
             }
 
 #if SEMU_HAS(VIRTIOINPUT)
-            /* Always watch the wake pipe so that closing the SDL window
-             * unblocks poll(-1) immediately.
+            /* Always watch the wake pipe so that backend work such as input
+             * events or SDL window close unblocks poll(-1) immediately.
              */
             int wake_pfd_index = -1;
             if (emu->wake_fd[0] >= 0 && pfd_count < poll_capacity) {
@@ -1438,8 +1446,8 @@ static int semu_run(emu_state_t *emu)
             }
 
 #if SEMU_HAS(VIRTIOINPUT)
-            /* Drain the wake pipe if it fired, emu_tick_peripherals will
-             * then call window_is_closed() and set emu->stopped.
+            /* Drain the wake pipe if it fired. emu_tick_peripherals will
+             * then drain queued window events and check window_is_closed().
              */
             if (wake_pfd_index >= 0 &&
                 (pfds[wake_pfd_index].revents & POLLIN)) {

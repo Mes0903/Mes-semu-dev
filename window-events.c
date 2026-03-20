@@ -7,6 +7,20 @@
 
 #define SDL_EVENT_WAIT_TIMEOUT_MS 1 /* ms */
 
+/* Power-of-two SPSC ring: SDL/main thread produces backend events and the
+ * emulator thread consumes them from emu_tick_peripherals().
+ */
+#define WINDOW_EVENT_QUEUE_SIZE 1024U
+#define WINDOW_EVENT_QUEUE_MASK (WINDOW_EVENT_QUEUE_SIZE - 1U)
+
+/* Queue storage plus producer/consumer cursors. The queue stays entirely on
+ * the host side so SDL never touches guest-facing virtio-input state directly.
+ */
+static window_event_t window_event_queue[WINDOW_EVENT_QUEUE_SIZE];
+static uint32_t window_event_head;
+static uint32_t window_event_tail;
+static bool window_event_wake_pending;
+
 #define DEF_KEY_MAP(_sdl_scancode, _linux_key)                 \
     {                                                          \
         .sdl_scancode = _sdl_scancode, .linux_key = _linux_key \
@@ -120,6 +134,43 @@ static struct key_map_entry key_map[] = {
     DEF_KEY_MAP(SDL_SCANCODE_DELETE, SEMU_KEY_DELETE),
 };
 
+static bool window_push_event(const window_event_t *event)
+{
+    uint32_t head = __atomic_load_n(&window_event_head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&window_event_tail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1U) & WINDOW_EVENT_QUEUE_MASK;
+
+    /* Keep the producer non-blocking. If the queue is full, the newest event
+     * is dropped. This remains intentionally lossy even for key/button
+     * events, which means a sustained overflow can lose a release edge. We
+     * keep that tradeoff explicit here rather than synthesizing corrective
+     * events.
+     */
+    if (next == tail)
+        return false;
+
+    window_event_queue[head] = *event;
+    __atomic_store_n(&window_event_head, next, __ATOMIC_RELEASE);
+
+    /* Coalesce wakeups across a whole drain batch. The producer only writes to
+     * the wake pipe when transitioning wake_pending false -> true and the
+     * consumer clears it after draining queued events and rechecks for races.
+     */
+    if (!__atomic_exchange_n(&window_event_wake_pending, true,
+                             __ATOMIC_ACQ_REL))
+        window_wake_backend();
+
+    return true;
+}
+
+static bool window_event_queue_empty(void)
+{
+    uint32_t tail = __atomic_load_n(&window_event_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&window_event_head, __ATOMIC_ACQUIRE);
+
+    return tail == head;
+}
+
 /* Mouse button mapping uses SDL button IDs, not scancodes */
 static int sdl_button_to_linux_key(int sdl_button)
 {
@@ -148,6 +199,40 @@ static int sdl_scancode_to_linux_key(int sdl_scancode)
     return -1;
 }
 
+bool window_pop_event(window_event_t *event)
+{
+    /* Consumer-side dequeue. Called from the emulator thread after poll()
+     * wakes, and also from the periodic peripheral tick while work remains.
+     */
+    uint32_t tail = __atomic_load_n(&window_event_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&window_event_head, __ATOMIC_ACQUIRE);
+
+    if (tail == head)
+        return false;
+
+    *event = window_event_queue[tail];
+    tail = (tail + 1U) & WINDOW_EVENT_QUEUE_MASK;
+    __atomic_store_n(&window_event_tail, tail, __ATOMIC_RELEASE);
+
+    return true;
+}
+
+bool window_rearm_wake(void)
+{
+    /* Clear wake_pending only after the current batch has been drained. If the
+     * producer published while wake_pending was still true, the queue will be
+     * non-empty here and the consumer must keep draining instead of returning
+     * to poll().
+     */
+    __atomic_store_n(&window_event_wake_pending, false, __ATOMIC_RELEASE);
+    return window_event_queue_empty();
+}
+
+bool window_events_maybe_pending(void)
+{
+    return __atomic_load_n(&window_event_wake_pending, __ATOMIC_RELAXED);
+}
+
 int window_fill_ev_key_bitmap(uint8_t *bitmap, size_t bitmap_size)
 {
     unsigned long key_cnt = sizeof(key_map) / sizeof(struct key_map_entry);
@@ -170,6 +255,10 @@ bool handle_window_events(void)
     int linux_key;
     bool quit = false;
 
+    /* SDL stays on the main thread. This loop only translates host events into
+     * queue entries. The emulator thread turns them into virtio-input ring
+     * updates.
+     */
     while (SDL_WaitEventTimeout(&e, SDL_EVENT_WAIT_TIMEOUT_MS)) {
         switch (e.type) {
         case SDL_QUIT:
@@ -182,27 +271,54 @@ bool handle_window_events(void)
             if (e.key.repeat)
                 break;
             linux_key = sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0)
-                virtio_input_update_key(linux_key, 1);
+            if (linux_key >= 0) {
+                window_event_t event = {
+                    .type = WINDOW_EVENT_KEYBOARD_KEY,
+                    .u.key = {.key = (uint32_t) linux_key, .value = 1},
+                };
+                window_push_event(&event);
+            }
             break;
         case SDL_KEYUP:
             linux_key = sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0)
-                virtio_input_update_key(linux_key, 0);
+            if (linux_key >= 0) {
+                window_event_t event = {
+                    .type = WINDOW_EVENT_KEYBOARD_KEY,
+                    .u.key = {.key = (uint32_t) linux_key, .value = 0},
+                };
+                window_push_event(&event);
+            }
             break;
         case SDL_MOUSEBUTTONDOWN:
             linux_key = sdl_button_to_linux_key(e.button.button);
-            if (linux_key >= 0)
-                virtio_input_update_mouse_button_state(linux_key, true);
+            if (linux_key >= 0) {
+                window_event_t event = {
+                    .type = WINDOW_EVENT_MOUSE_BUTTON,
+                    .u.button = {.button = (uint32_t) linux_key,
+                                 .pressed = true},
+                };
+                window_push_event(&event);
+            }
             break;
         case SDL_MOUSEBUTTONUP:
             linux_key = sdl_button_to_linux_key(e.button.button);
-            if (linux_key >= 0)
-                virtio_input_update_mouse_button_state(linux_key, false);
+            if (linux_key >= 0) {
+                window_event_t event = {
+                    .type = WINDOW_EVENT_MOUSE_BUTTON,
+                    .u.button = {.button = (uint32_t) linux_key,
+                                 .pressed = false},
+                };
+                window_push_event(&event);
+            }
             break;
-        case SDL_MOUSEMOTION:
-            virtio_input_update_cursor(e.motion.x, e.motion.y);
-            break;
+        case SDL_MOUSEMOTION: {
+            window_event_t event = {
+                .type = WINDOW_EVENT_MOUSE_MOTION,
+                .u.motion = {.x = (uint32_t) e.motion.x,
+                             .y = (uint32_t) e.motion.y},
+            };
+            window_push_event(&event);
+        } break;
         case SDL_MOUSEWHEEL: {
             int dx = e.wheel.x;
             int dy = e.wheel.y;
@@ -213,7 +329,11 @@ bool handle_window_events(void)
                 dx = -dx;
                 dy = -dy;
             }
-            virtio_input_update_scroll(dx, dy);
+            window_event_t event = {
+                .type = WINDOW_EVENT_MOUSE_WHEEL,
+                .u.wheel = {.dx = dx, .dy = dy},
+            };
+            window_push_event(&event);
             break;
         }
         }

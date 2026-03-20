@@ -411,6 +411,37 @@ void virtio_input_update_scroll(int32_t dx, int32_t dy)
     virtio_queue_event_update(VINPUT_MOUSE_ID, input_ev, ev_cnt);
 }
 
+void virtio_input_drain_window_events(void)
+{
+    for (;;) {
+        window_event_t event;
+
+        /* Drain all host-side window events on the emulator thread so SDL
+         * never touches guest-visible virtio-input state directly.
+         */
+        while (window_pop_event(&event)) {
+            switch (event.type) {
+            case WINDOW_EVENT_KEYBOARD_KEY:
+                virtio_input_update_key(event.u.key.key, event.u.key.value);
+                break;
+            case WINDOW_EVENT_MOUSE_BUTTON:
+                virtio_input_update_mouse_button_state(event.u.button.button,
+                                                       event.u.button.pressed);
+                break;
+            case WINDOW_EVENT_MOUSE_MOTION:
+                virtio_input_update_cursor(event.u.motion.x, event.u.motion.y);
+                break;
+            case WINDOW_EVENT_MOUSE_WHEEL:
+                virtio_input_update_scroll(event.u.wheel.dx, event.u.wheel.dy);
+                break;
+            }
+        }
+
+        if (window_rearm_wake())
+            break;
+    }
+}
+
 static void virtio_input_properties(int dev_id)
 {
     struct virtio_input_config *cfg = &vinput_dev[dev_id].cfg;
@@ -858,10 +889,11 @@ out:
 
 bool virtio_input_irq_pending(virtio_input_state_t *vinput)
 {
-    pthread_mutex_lock(&virtio_input_mutex);
-    bool pending = vinput->InterruptStatus != 0;
-    pthread_mutex_unlock(&virtio_input_mutex);
-    return pending;
+    /* The emulator thread drains queued window events before polling
+     * InterruptStatus here, so this hot-path check can stay as a plain flag
+     * read instead of taking virtio_input_mutex.
+     */
+    return vinput->InterruptStatus != 0;
 }
 
 void virtio_input_init(virtio_input_state_t *vinput)
