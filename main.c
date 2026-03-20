@@ -4,6 +4,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,10 @@
 #include "coro.h"
 #include "device.h"
 #include "mini-gdbstub/include/gdbstub.h"
+#if SEMU_HAS(VIRTIOINPUT)
+#include "window.h"
+extern const struct window_backend g_window;
+#endif
 #include "riscv.h"
 #include "riscv_private.h"
 #define PRIV(x) ((emu_state_t *) x->priv)
@@ -99,6 +104,28 @@ static void emu_update_vrng_interrupts(vm_t *vm)
         data->plic.active |= IRQ_VRNG_BIT;
     else
         data->plic.active &= ~IRQ_VRNG_BIT;
+    plic_update_interrupts(vm, &data->plic);
+}
+#endif
+
+#if SEMU_HAS(VIRTIOINPUT)
+static void emu_update_vinput_keyboard_interrupts(vm_t *vm)
+{
+    emu_state_t *data = PRIV(vm->hart[0]);
+    if (virtio_input_irq_pending(&data->vkeyboard))
+        data->plic.active |= IRQ_VINPUT_KEYBOARD_BIT;
+    else
+        data->plic.active &= ~IRQ_VINPUT_KEYBOARD_BIT;
+    plic_update_interrupts(vm, &data->plic);
+}
+
+static void emu_update_vinput_mouse_interrupts(vm_t *vm)
+{
+    emu_state_t *data = PRIV(vm->hart[0]);
+    if (virtio_input_irq_pending(&data->vmouse))
+        data->plic.active |= IRQ_VINPUT_MOUSE_BIT;
+    else
+        data->plic.active &= ~IRQ_VINPUT_MOUSE_BIT;
     plic_update_interrupts(vm, &data->plic);
 }
 #endif
@@ -198,6 +225,14 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
         if (emu->vfs.InterruptStatus)
             emu_update_vfs_interrupts(vm);
 #endif
+#if SEMU_HAS(VIRTIOINPUT)
+        if (virtio_input_irq_pending(&emu->vkeyboard))
+            emu_update_vinput_keyboard_interrupts(vm);
+        if (virtio_input_irq_pending(&emu->vmouse))
+            emu_update_vinput_mouse_interrupts(vm);
+        if (window_is_closed())
+            emu->stopped = true;
+#endif
     }
 }
 
@@ -259,6 +294,18 @@ static void mem_load(hart_t *hart,
 #if SEMU_HAS(VIRTIOFS)
         case 0x48: /* virtio-fs */
             virtio_fs_read(hart, &data->vfs, addr & 0xFFFFF, width, value);
+            return;
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+        case 0x49: /* virtio-input keyboard */
+            virtio_input_read(hart, &data->vkeyboard, addr & 0xFFFFF, width,
+                              value);
+            emu_update_vinput_keyboard_interrupts(hart->vm);
+            return;
+        case 0x50: /* virtio-input mouse */
+            virtio_input_read(hart, &data->vmouse, addr & 0xFFFFF, width,
+                              value);
+            emu_update_vinput_mouse_interrupts(hart->vm);
             return;
 #endif
         }
@@ -334,6 +381,18 @@ static void mem_store(hart_t *hart,
         case 0x48: /* virtio-fs */
             virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF, width, value);
             emu_update_vfs_interrupts(hart->vm);
+            return;
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+        case 0x49: /* virtio-input keyboard */
+            virtio_input_write(hart, &data->vkeyboard, addr & 0xFFFFF, width,
+                               value);
+            emu_update_vinput_keyboard_interrupts(hart->vm);
+            return;
+        case 0x50: /* virtio-input mouse */
+            virtio_input_write(hart, &data->vmouse, addr & 0xFFFFF, width,
+                               value);
+            emu_update_vinput_mouse_interrupts(hart->vm);
             return;
 #endif
         }
@@ -823,6 +882,29 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         fprintf(stderr, "No virtio-fs functioned\n");
 #endif
 
+#if SEMU_HAS(VIRTIOINPUT)
+    g_window.window_init();
+
+    emu->vkeyboard.ram = emu->ram;
+    virtio_input_init(&(emu->vkeyboard));
+
+    emu->vmouse.ram = emu->ram;
+    virtio_input_init(&(emu->vmouse));
+
+    emu->wake_fd[0] = emu->wake_fd[1] = -1;
+    if (vm->n_hart > 1 && g_window.window_main_loop) {
+        if (pipe(emu->wake_fd) < 0) {
+            perror("pipe");
+            return 2;
+        }
+        /* Make the write end non-blocking so window_shutdown_sw() never
+         * stalls. Single-hart mode never blocks in poll(-1), so it does not
+         * need the wake pipe at all.
+         */
+        fcntl(emu->wake_fd[1], F_SETFL, O_NONBLOCK);
+    }
+#endif
+
     emu->peripheral_update_ctr = 0;
     emu->debug = debug;
 
@@ -1185,8 +1267,14 @@ static int semu_run(emu_state_t *emu)
             if (signal_received)
                 break;
 #endif
-            /* Only need fds for timer and UART (no coroutine I/O) */
+            /* Only need fds for timer and UART (no coroutine I/O),
+             * plus an optional wake pipe when VIRTIOINPUT is enabled.
+             */
             size_t needed = 2;
+#if SEMU_HAS(VIRTIOINPUT)
+            if (emu->wake_fd[0] >= 0)
+                needed++;
+#endif
 
             /* Grow buffer if needed (amortized realloc) */
             if (needed > poll_capacity) {
@@ -1283,6 +1371,18 @@ static int semu_run(emu_state_t *emu)
                 pfd_count++;
             }
 
+#if SEMU_HAS(VIRTIOINPUT)
+            /* Always watch the wake pipe so that closing the SDL window
+             * unblocks poll(-1) immediately.
+             */
+            int wake_pfd_index = -1;
+            if (emu->wake_fd[0] >= 0 && pfd_count < poll_capacity) {
+                pfds[pfd_count] = (struct pollfd){emu->wake_fd[0], POLLIN, 0};
+                wake_pfd_index = (int) pfd_count;
+                pfd_count++;
+            }
+#endif
+
             /* Set poll timeout based on current idle state (adaptive timeout).
              * Three-tier strategy:
              * 1. Blocking (-1): All harts idle + have fds → wait for events
@@ -1337,6 +1437,18 @@ static int semu_run(emu_state_t *emu)
                 perror("poll");
             }
 
+#if SEMU_HAS(VIRTIOINPUT)
+            /* Drain the wake pipe if it fired, emu_tick_peripherals will
+             * then call window_is_closed() and set emu->stopped.
+             */
+            if (wake_pfd_index >= 0 &&
+                (pfds[wake_pfd_index].revents & POLLIN)) {
+                char buf[16];
+                ssize_t bytes_drained = read(emu->wake_fd[0], buf, sizeof(buf));
+                (void) bytes_drained;
+            }
+#endif
+
             /* Resume all hart coroutines (round-robin scheduling).
              * Each hart executes a batch of instructions, then yields back.
              * Harts in WFI will have their in_wfi flag cleared by interrupt
@@ -1363,8 +1475,19 @@ static int semu_run(emu_state_t *emu)
 #else
         close(wfi_timer_fd);
 #endif
+#if SEMU_HAS(VIRTIOINPUT)
+        if (emu->wake_fd[0] >= 0)
+            close(emu->wake_fd[0]);
+        if (emu->wake_fd[1] >= 0)
+            close(emu->wake_fd[1]);
+#endif
 
+            /* window_is_closed() is a normal user action, not an error */
+#if SEMU_HAS(VIRTIOINPUT)
+        if (emu->stopped && !window_is_closed())
+#else
         if (emu->stopped)
+#endif
             return 1;
 
         return 0;
@@ -1455,7 +1578,11 @@ static int semu_read_mem(void *args, size_t addr, size_t len, void *val)
 static gdb_action_t semu_cont(void *args)
 {
     emu_state_t *emu = (emu_state_t *) args;
+#if SEMU_HAS(VIRTIOINPUT)
+    while (!semu_is_interrupt(emu) && !window_is_closed()) {
+#else
     while (!semu_is_interrupt(emu)) {
+#endif
 #ifdef MMU_CACHE_STATS
         /* Check if signal received (SIGINT/SIGTERM).
          * Break to return control to gdbstub, stats printed at end of main().
@@ -1469,6 +1596,11 @@ static gdb_action_t semu_cont(void *args)
     /* Clear the interrupt if it's pending */
     __atomic_store_n(&emu->is_interrupted, false, __ATOMIC_RELAXED);
 
+#if SEMU_HAS(VIRTIOINPUT)
+    /* Tell gdbstub_run() to exit cleanly when the window is closed. */
+    if (window_is_closed())
+        return ACT_SHUTDOWN;
+#endif
     return ACT_RESUME;
 }
 
@@ -1530,14 +1662,35 @@ static int semu_run_debug(emu_state_t *emu)
         return 1;
     }
 
-    emu->is_interrupted = false;
-    if (!gdbstub_run(&gdbstub, (void *) emu))
-        return 1;
+    __atomic_store_n(&emu->is_interrupted, false, __ATOMIC_RELAXED);
+    bool ok = gdbstub_run(&gdbstub, (void *) emu);
 
     gdbstub_close(&gdbstub);
 
-    return 0;
+    if (ok)
+        return 0;
+    return 1;
 }
+
+#if SEMU_HAS(VIRTIOINPUT)
+/* Thread wrapper for running emulator in background thread */
+static void *emu_thread_func(void *arg)
+{
+    emu_state_t *emu = (emu_state_t *) arg;
+    int ret;
+
+    if (emu->debug)
+        ret = semu_run_debug(emu);
+    else
+        ret = semu_run(emu);
+
+    /* Unblock window_main_loop() on the main thread so it can return */
+    if (g_window.window_shutdown)
+        g_window.window_shutdown();
+
+    return (void *) (intptr_t) ret;
+}
+#endif
 
 int main(int argc, char **argv)
 {
@@ -1552,10 +1705,42 @@ int main(int argc, char **argv)
     signal(SIGTERM, signal_handler_stats);
 #endif
 
-    if (emu.debug)
-        ret = semu_run_debug(&emu);
-    else
-        ret = semu_run(&emu);
+#if SEMU_HAS(VIRTIOINPUT)
+    /* If window backend has a main loop function, run emulator in background
+     * thread and use main thread for window events (required for macOS SDL2).
+     */
+    if (g_window.window_main_loop) {
+        pthread_t emu_thread;
+        void *thread_ret;
+
+        if (emu.wake_fd[1] >= 0)
+            window_set_wake_fd(emu.wake_fd[1]);
+
+        if (pthread_create(&emu_thread, NULL, emu_thread_func, &emu) != 0) {
+            fprintf(stderr, "Failed to create emulator thread\n");
+            return 1;
+        }
+
+        /* Main thread runs window event loop (required for macOS) */
+        g_window.window_main_loop();
+
+        /* window_main_loop() returns either because the user closed the window
+         * (SDL_QUIT) or because the emulator called window_shutdown().
+         * emu_tick_peripherals() picks up window_is_closed() and sets
+         * emu->stopped, so no direct write to emu.stopped is needed here.
+         */
+
+        /* Wait for emulator thread to finish */
+        pthread_join(emu_thread, &thread_ret);
+        ret = (int) (intptr_t) thread_ret;
+    } else
+#endif
+    {
+        if (emu.debug)
+            ret = semu_run_debug(&emu);
+        else
+            ret = semu_run(&emu);
+    }
 
 #ifdef MMU_CACHE_STATS
     print_mmu_cache_stats(&emu.vm);
