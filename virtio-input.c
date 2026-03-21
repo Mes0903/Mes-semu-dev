@@ -566,42 +566,42 @@ static void virtio_input_abs_range(int dev_id, uint8_t code)
     }
 }
 
-static bool virtio_input_cfg_read(int dev_id)
+static void virtio_input_cfg_read(int dev_id)
 {
     struct virtio_input_config *cfg = &vinput_dev[dev_id].cfg;
 
+    memset(&cfg->u, 0, sizeof(cfg->u));
+    cfg->size = 0;
+
     switch (cfg->select) {
     case VIRTIO_INPUT_CFG_UNSET:
-        cfg->size = 0;
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_ID_NAME:
         strcpy(cfg->u.string, vinput_dev_name[dev_id]);
         cfg->size = strlen(vinput_dev_name[dev_id]);
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_ID_SERIAL:
         strcpy(cfg->u.string, VIRTIO_INPUT_SERIAL);
         cfg->size = strlen(VIRTIO_INPUT_SERIAL);
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_ID_DEVIDS:
         cfg->u.ids.bustype = BUS_VIRTUAL;
         cfg->u.ids.vendor = 0;
         cfg->u.ids.product = 0;
         cfg->u.ids.version = 1;
         cfg->size = sizeof(struct virtio_input_devids);
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_PROP_BITS:
         virtio_input_properties(dev_id);
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_EV_BITS:
         virtio_input_support_events(dev_id, cfg->subsel);
-        return true;
+        return;
     case VIRTIO_INPUT_CFG_ABS_INFO:
         virtio_input_abs_range(dev_id, cfg->subsel);
-        return true;
+        return;
     default:
-        fprintf(stderr,
-                "virtio-input: Unknown value written to select register.\n");
-        return false;
+        return;
     }
 }
 
@@ -645,8 +645,7 @@ static bool virtio_input_reg_read(virtio_input_state_t *vinput,
         *value = 0;
         return true;
     case VIRTIO_INPUT_REG_SIZE:
-        if (!virtio_input_cfg_read(PRIV(vinput)->type))
-            return false;
+        virtio_input_cfg_read(PRIV(vinput)->type);
         *value = PRIV(vinput)->cfg.size;
         return true;
     default:
