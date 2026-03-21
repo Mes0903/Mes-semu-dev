@@ -1,5 +1,6 @@
 #include <SDL.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #include "device.h"
 #include "virtio-input-codes.h"
@@ -134,6 +135,34 @@ static struct key_map_entry key_map[] = {
     DEF_KEY_MAP(SDL_SCANCODE_DELETE, SEMU_KEY_DELETE),
 };
 
+#if SEMU_INPUT_DEBUG
+static void window_debug_log_queue_drop(const window_event_t *event)
+{
+    if (!event)
+        return;
+
+    switch (event->type) {
+    case WINDOW_EVENT_KEYBOARD_KEY:
+        fprintf(stderr, "input-debug: drop key code=%u value=%u (queue full)\n",
+                event->u.key.key, event->u.key.value);
+        break;
+    case WINDOW_EVENT_MOUSE_BUTTON:
+        fprintf(stderr,
+                "input-debug: drop button code=%u pressed=%u (queue full)\n",
+                event->u.button.button, event->u.button.pressed);
+        break;
+    case WINDOW_EVENT_MOUSE_MOTION:
+        fprintf(stderr, "input-debug: drop motion x=%u y=%u (queue full)\n",
+                event->u.motion.x, event->u.motion.y);
+        break;
+    case WINDOW_EVENT_MOUSE_WHEEL:
+        fprintf(stderr, "input-debug: drop wheel dx=%d dy=%d (queue full)\n",
+                event->u.wheel.dx, event->u.wheel.dy);
+        break;
+    }
+}
+#endif
+
 static bool window_push_event(const window_event_t *event)
 {
     uint32_t head = __atomic_load_n(&window_event_head, __ATOMIC_RELAXED);
@@ -146,8 +175,12 @@ static bool window_push_event(const window_event_t *event)
      * keep that tradeoff explicit here rather than synthesizing corrective
      * events.
      */
-    if (next == tail)
+    if (next == tail) {
+#if SEMU_INPUT_DEBUG
+        window_debug_log_queue_drop(event);
+#endif
         return false;
+    }
 
     window_event_queue[head] = *event;
     __atomic_store_n(&window_event_head, next, __ATOMIC_RELEASE);
@@ -272,6 +305,11 @@ bool handle_window_events(void)
                 break;
             linux_key = sdl_scancode_to_linux_key(e.key.keysym.scancode);
             if (linux_key >= 0) {
+#if SEMU_INPUT_DEBUG
+                fprintf(stderr, "input-debug: key down host=%s code=%u\n",
+                        SDL_GetScancodeName(e.key.keysym.scancode),
+                        (uint32_t) linux_key);
+#endif
                 window_event_t event = {
                     .type = WINDOW_EVENT_KEYBOARD_KEY,
                     .u.key = {.key = (uint32_t) linux_key, .value = 1},
@@ -282,6 +320,11 @@ bool handle_window_events(void)
         case SDL_KEYUP:
             linux_key = sdl_scancode_to_linux_key(e.key.keysym.scancode);
             if (linux_key >= 0) {
+#if SEMU_INPUT_DEBUG
+                fprintf(stderr, "input-debug: key up host=%s code=%u\n",
+                        SDL_GetScancodeName(e.key.keysym.scancode),
+                        (uint32_t) linux_key);
+#endif
                 window_event_t event = {
                     .type = WINDOW_EVENT_KEYBOARD_KEY,
                     .u.key = {.key = (uint32_t) linux_key, .value = 0},
@@ -292,6 +335,10 @@ bool handle_window_events(void)
         case SDL_MOUSEBUTTONDOWN:
             linux_key = sdl_button_to_linux_key(e.button.button);
             if (linux_key >= 0) {
+#if SEMU_INPUT_DEBUG
+                fprintf(stderr, "input-debug: button down host=%u code=%u\n",
+                        e.button.button, (uint32_t) linux_key);
+#endif
                 window_event_t event = {
                     .type = WINDOW_EVENT_MOUSE_BUTTON,
                     .u.button = {.button = (uint32_t) linux_key,
@@ -303,6 +350,10 @@ bool handle_window_events(void)
         case SDL_MOUSEBUTTONUP:
             linux_key = sdl_button_to_linux_key(e.button.button);
             if (linux_key >= 0) {
+#if SEMU_INPUT_DEBUG
+                fprintf(stderr, "input-debug: button up host=%u code=%u\n",
+                        e.button.button, (uint32_t) linux_key);
+#endif
                 window_event_t event = {
                     .type = WINDOW_EVENT_MOUSE_BUTTON,
                     .u.button = {.button = (uint32_t) linux_key,
@@ -312,6 +363,10 @@ bool handle_window_events(void)
             }
             break;
         case SDL_MOUSEMOTION: {
+#if SEMU_INPUT_DEBUG
+            fprintf(stderr, "input-debug: motion x=%d y=%d\n", e.motion.x,
+                    e.motion.y);
+#endif
             window_event_t event = {
                 .type = WINDOW_EVENT_MOUSE_MOTION,
                 .u.motion = {.x = (uint32_t) e.motion.x,
@@ -329,6 +384,9 @@ bool handle_window_events(void)
                 dx = -dx;
                 dy = -dy;
             }
+#if SEMU_INPUT_DEBUG
+            fprintf(stderr, "input-debug: wheel dx=%d dy=%d\n", dx, dy);
+#endif
             window_event_t event = {
                 .type = WINDOW_EVENT_MOUSE_WHEEL,
                 .u.wheel = {.dx = dx, .dy = dy},
