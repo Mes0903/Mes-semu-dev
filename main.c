@@ -492,17 +492,20 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
 static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
 {
     emu_state_t *data = PRIV(hart);
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     switch (fid) {
     case SBI_IPI__SEND_IPI:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint64_t) hart->x_regs[RV_R_A1];
-        if (hart_mask_base == 0xFFFFFFFFFFFFFFFF) {
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
+        if (hart_mask_base == (uint32_t) -1) {
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
                 data->sswi.ssip[i] = 1;
         } else {
-            for (int i = hart_mask_base; hart_mask; hart_mask >>= 1, i++)
-                data->sswi.ssip[i] = hart_mask & 1;
+            for (uint32_t i = hart_mask_base;
+                 hart_mask && i < hart->vm->n_hart; hart_mask >>= 1, i++) {
+                if (hart_mask & 1)
+                    data->sswi.ssip[i] = 1;
+            }
         }
 
         return (sbi_ret_t){SBI_SUCCESS, 0};
@@ -520,7 +523,7 @@ static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
      * multi-threaded system emulation, RFENCE extension has to be implemented
      * completely.
      */
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     uint32_t start_addr, size;
     switch (fid) {
     case SBI_RFENCE__I:
@@ -529,24 +532,25 @@ static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
     case SBI_RFENCE__VMA:
     case SBI_RFENCE__VMA_ASID:
         /* RFENCE.VMA and RFENCE.VMA.ASID both use the same parameters:
-         * a0: hart_mask (low bits)
-         * a1: hart_mask_base (high bits)
+         * a0: hart_mask
+         * a1: hart_mask_base
          * a2: start_addr
          * a3: size
          * For VMA_ASID, a4 contains asid (currently ignored)
          */
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint64_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
         start_addr = hart->x_regs[RV_R_A2];
         size = hart->x_regs[RV_R_A3];
 
-        if (hart_mask_base == 0xFFFFFFFFFFFFFFFF) {
+        if (hart_mask_base == (uint32_t) -1) {
             /* Flush all harts */
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
                 mmu_invalidate_range(hart->vm->hart[i], start_addr, size);
         } else {
             /* Flush specified harts based on mask */
-            for (int i = hart_mask_base; hart_mask; hart_mask >>= 1, i++) {
+            for (uint32_t i = hart_mask_base;
+                 hart_mask && i < hart->vm->n_hart; hart_mask >>= 1, i++) {
                 if (hart_mask & 1)
                     mmu_invalidate_range(hart->vm->hart[i], start_addr, size);
             }

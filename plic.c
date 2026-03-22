@@ -32,29 +32,41 @@ static bool plic_reg_read(plic_state_t *plic, uint32_t addr, uint32_t *value)
         return true;
     }
 
-    int addr_mask = MASK(ilog2(addr)) ^ (1 & addr);
-    int context = (addr_mask & addr);
-    context >>= __builtin_ffs(context) - (__builtin_ffs(context) & 1);
-    switch (addr & ~addr_mask) {
-    case 0x800:
-        *value = plic->ie[context];
+    /* Enable registers: word 0x800 + context * 0x20 (byte 0x2000, stride
+     * 0x80). Only the first word per context is meaningful for <= 32 sources.
+     */
+    if (addr >= 0x800 && addr < 0xC00) {
+        int context = (addr - 0x800) / 0x20;
+        if ((addr - 0x800) % 0x20 == 0)
+            *value = plic->ie[context];
         return true;
-    case 0x80000:
-        *value = 0;
-        /* no priority support: target priority threshold hardwired to 0 */
-        return true;
-    case 0x80001:
-        /* claim */
-        *value = 0;
-        uint32_t candidates = plic->ip & plic->ie[context];
-        if (candidates) {
-            *value = ilog2(candidates);
-            plic->ip &= ~(1 << (*value));
+    }
+
+    /* Context registers: word 0x80000 + context * 0x400 (byte 0x200000,
+     * stride 0x1000).  Offset 0 = threshold, offset 1 = claim/complete.
+     */
+    if (addr >= 0x80000 && addr < 0x88000) {
+        int context = (addr - 0x80000) / 0x400;
+        int offset = (addr - 0x80000) % 0x400;
+        if (offset == 0) {
+            /* no priority support: target priority threshold hardwired to 0 */
+            *value = 0;
+            return true;
+        }
+        if (offset == 1) {
+            /* claim */
+            *value = 0;
+            uint32_t candidates = plic->ip & plic->ie[context];
+            if (candidates) {
+                *value = ilog2(candidates);
+                plic->ip &= ~(1 << (*value));
+            }
+            return true;
         }
         return true;
-    default:
-        return false;
     }
+
+    return false;
 }
 
 static bool plic_reg_write(plic_state_t *plic, uint32_t addr, uint32_t value)
@@ -63,25 +75,34 @@ static bool plic_reg_write(plic_state_t *plic, uint32_t addr, uint32_t value)
     if (1 <= addr && addr <= 31)
         return true;
 
-    int addr_mask = MASK(ilog2(addr)) ^ (1 & addr);
-    int context = (addr_mask & addr);
-    context >>= __builtin_ffs(context) - (__builtin_ffs(context) & 1);
-    switch (addr & ~addr_mask) {
-    case 0x800:
-        value &= ~1;
-        plic->ie[context] = value;
+    /* Enable registers */
+    if (addr >= 0x800 && addr < 0xC00) {
+        int context = (addr - 0x800) / 0x20;
+        if ((addr - 0x800) % 0x20 == 0) {
+            value &= ~1;
+            plic->ie[context] = value;
+        }
         return true;
-    case 0x80000:
-        /* no priority support: target priority threshold hardwired to 0 */
-        return true;
-    case 0x80001:
-        /* completion */
-        if (plic->ie[context] & (1 << value))
-            plic->masked &= ~(1 << value);
-        return true;
-    default:
-        return false;
     }
+
+    /* Context registers */
+    if (addr >= 0x80000 && addr < 0x88000) {
+        int context = (addr - 0x80000) / 0x400;
+        int offset = (addr - 0x80000) % 0x400;
+        if (offset == 0) {
+            /* no priority support: target priority threshold hardwired to 0 */
+            return true;
+        }
+        if (offset == 1) {
+            /* completion */
+            if (plic->ie[context] & (1 << value))
+                plic->masked &= ~(1 << value);
+            return true;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 void plic_read(hart_t *vm,
