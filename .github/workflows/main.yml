@@ -107,11 +107,11 @@ jobs:
     - name: default build
       run: make
       shell: bash
-      timeout-minutes: 20
+      timeout-minutes: 120
     - name: automated test
       run: .ci/autorun.sh
       shell: bash
-      timeout-minutes: 20
+      timeout-minutes: 120
     - name: netdev test
       # NOTE: vmnet requires sudo privileges which may not be available in GitHub Actions
       # This test is conditional and will be skipped if sudo is not available
@@ -124,16 +124,16 @@ jobs:
               echo "vmnet.framework requires root privileges or com.apple.vm.networking entitlement"
             fi
       shell: bash
-      timeout-minutes: 20
+      timeout-minutes: 120
       if: ${{ success() }}
     - name: sound test
       run: .ci/test-sound.sh
       shell: bash
-      timeout-minutes: 20
+      timeout-minutes: 120
     - name: virtio-input test
       run: .ci/test-vinput.sh
       shell: bash
-      timeout-minutes: 20
+      timeout-minutes: 120
 
   coding_style:
     runs-on: ubuntu-24.04

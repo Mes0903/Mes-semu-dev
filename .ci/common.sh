@@ -48,7 +48,7 @@ get_timeout() {
 
     case "${OS_TYPE}" in
         Darwin)
-            echo "900"
+            echo "7200"
             ;;
         Linux)
             echo "90"

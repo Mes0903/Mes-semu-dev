@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Override timeout for macOS - emulation is significantly slower
 case "${OS_TYPE}" in
     Darwin)
-        TIMEOUT=1200
+        TIMEOUT=7200
         ;;
 esac
 

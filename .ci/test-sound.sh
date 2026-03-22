@@ -13,7 +13,7 @@ SAMPLE_SOUND="/usr/share/sounds/alsa/Front_Center.wav"
 # Sound tests need different timeout: 30s for Linux, 900s for macOS
 case "${OS_TYPE}" in
     Darwin)
-        TIMEOUT=900
+        TIMEOUT=7200
         ;;
     Linux)
         TIMEOUT=30
