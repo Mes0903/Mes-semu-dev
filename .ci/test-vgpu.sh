@@ -25,6 +25,10 @@ trap cleanup EXIT
 # one-feature-at-a-time test runs never reuse a stale semu binary or DTB.
 make -B semu minimal.dtb
 
+# Force fresh guest artifacts so CI cannot reuse stale cached images.
+rm -f Image rootfs.cpio ext4.img
+make Image rootfs.cpio ext4.img
+
 # NOTE: We want to capture the expect exit code and map
 # it to our MESSAGES array for meaningful error output.
 # Temporarily disable errexit for the expect call.
@@ -141,9 +145,6 @@ MESSAGES=(
   "FAIL: virtio-gpu basic checks failed (/dev/dri/card0 or virtio_gpu binding)"
   "FAIL: DirectFB2 check failed (run.sh/df_drivertest missing or no DRMKMS init messages)"
 )
-
-# Clean up ext4.img so other tests can use their own disk image.
-rm -f ext4.img
 
 if [[ "${ret}" -eq 0 ]]; then
   print_success "${MESSAGES[0]}"
