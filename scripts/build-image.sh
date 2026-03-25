@@ -81,6 +81,25 @@ function repack_rootfs_cpio
         '
 }
 
+function copy_buildroot_config
+{
+    local buildroot_config="configs/buildroot.config"
+    local x11_config="configs/x11.config"
+    local output_config="buildroot/.config"
+    local merge_tool="buildroot/support/kconfig/merge_config.sh"
+
+    echo "Preparing Buildroot config..."
+
+    # Check X11 option
+    if [[ $BUILD_X11 -eq 1 ]]; then
+        # Compile Buildroot with X11
+        "$merge_tool" -m -r -O buildroot "$buildroot_config" "$x11_config"
+    else
+        # Compile Buildroot without X11
+        cp -f "$buildroot_config" "$output_config"
+    fi
+}
+
 function do_buildroot
 {
     local buildroot_cpio="buildroot/output/images/rootfs.cpio"
@@ -93,7 +112,7 @@ function do_buildroot
         echo "buildroot/ already exists, skipping clone"
     fi
 
-    safe_copy configs/buildroot.config buildroot/.config
+    copy_buildroot_config
     safe_copy configs/busybox.config buildroot/busybox.config
     cp -f target/init buildroot/fs/cpio/init
 
@@ -160,10 +179,11 @@ function do_linux
 
 function show_help {
     cat << EOF
-Usage: $0 [--buildroot] [--linux] [--directfb-test] [--merge-extra-packages] [--all] [--external-root] [--clean-build] [--help]
+Usage: $0 [--buildroot] [--x11] [--linux] [--directfb-test] [--merge-extra-packages] [--all] [--external-root] [--clean-build] [--help]
 
 Options:
   --buildroot         Build Buildroot rootfs
+  --x11               Build Buildroot with X11
   --directfb-test     Build and stage the DirectFB test payload under extra_packages/
   --merge-extra-packages
                       Merge staged extra packages into the final rootfs
@@ -177,6 +197,7 @@ EOF
 }
 
 BUILD_BUILDROOT=0
+BUILD_X11=0
 BUILD_DIRECTFB_TEST=0
 MERGE_EXTRA_PACKAGES=0
 BUILD_LINUX=0
@@ -187,6 +208,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --buildroot)
             BUILD_BUILDROOT=1
+            ;;
+        --x11)
+            BUILD_X11=1
             ;;
         --directfb-test)
             BUILD_DIRECTFB_TEST=1
@@ -287,6 +311,11 @@ fi
 
 if [[ $MERGE_EXTRA_PACKAGES -eq 1 && $BUILD_BUILDROOT -eq 0 ]]; then
     echo "Error: --merge-extra-packages requires --buildroot to be specified."
+    show_help
+fi
+
+if [[ $BUILD_X11 -eq 1 && $BUILD_BUILDROOT -eq 0 ]]; then
+    echo "Error: --x11 requires --buildroot to be specified."
     show_help
 fi
 
