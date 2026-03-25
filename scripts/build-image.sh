@@ -31,8 +31,61 @@ function safe_copy {
     fi
 }
 
+function has_extra_packages
+{
+    [ -d extra_packages ] && [ -n "$(ls -A extra_packages 2>/dev/null)" ]
+}
+
+function stage_rootfs_tree
+{
+    local input_cpio="$1"
+    local output_dir="$2"
+    local input_cpio_path="$PWD/$input_cpio"
+    local output_dir_path="$PWD/$output_dir"
+    local extra_packages_dir="$PWD/extra_packages"
+
+    echo "Preparing staged rootfs tree at $output_dir..."
+    ASSERT env ROOTFS_STAGE_DIR="$output_dir_path" \
+        ROOTFS_INPUT_CPIO="$input_cpio_path" \
+        EXTRA_PACKAGES_DIR="$extra_packages_dir" \
+        /bin/bash -lc '
+            set -euo pipefail
+            rm -rf "$ROOTFS_STAGE_DIR"
+            mkdir -p "$ROOTFS_STAGE_DIR"
+            cd "$ROOTFS_STAGE_DIR"
+            cpio -idmv < "$ROOTFS_INPUT_CPIO"
+            if [ -d "$EXTRA_PACKAGES_DIR" ] &&
+               [ -n "$(ls -A "$EXTRA_PACKAGES_DIR" 2>/dev/null)" ]; then
+                echo "[*] Merging extra packages into staged rootfs..."
+                cp -r "$EXTRA_PACKAGES_DIR"/. "$ROOTFS_STAGE_DIR"/
+            else
+                echo "[*] No extra packages to merge into staged rootfs."
+            fi
+        '
+}
+
+function repack_rootfs_cpio
+{
+    local source_dir="$1"
+    local output_cpio="$2"
+    local source_dir_path="$PWD/$source_dir"
+    local output_cpio_path="$PWD/$output_cpio"
+
+    echo "Packing staged rootfs into $output_cpio..."
+    ASSERT env ROOTFS_STAGE_DIR="$source_dir_path" \
+        ROOTFS_OUTPUT_CPIO="$output_cpio_path" \
+        /bin/bash -lc '
+            set -euo pipefail
+            cd "$ROOTFS_STAGE_DIR"
+            find . -print0 | cpio --null -o -H newc > "$ROOTFS_OUTPUT_CPIO"
+        '
+}
+
 function do_buildroot
 {
+    local buildroot_cpio="buildroot/output/images/rootfs.cpio"
+    local staged_rootfs_dir="rootfs.staging"
+
     if [ ! -d buildroot ]; then
         echo "Cloning Buildroot..."
         ASSERT git clone https://github.com/buildroot/buildroot -b 2025.02.x --depth=1
@@ -53,17 +106,34 @@ function do_buildroot
     ASSERT make $PARALLEL
     popd
 
-    if [[ $BUILD_EXTRA_PACKAGES -eq 1 ]]; then
-        do_extra_packages
+    if [[ $BUILD_DIRECTFB_TEST -eq 1 ]]; then
+        do_directfb_test_payload
+    fi
+
+    if [[ $MERGE_EXTRA_PACKAGES -eq 1 ]] && ! has_extra_packages; then
+        echo "Error: --merge-extra-packages requested, but extra_packages/ is empty."
+        echo "       Run with --directfb-test first or stage other packages into extra_packages/."
+        exit 1
     fi
 
     if [[ $EXTERNAL_ROOT -eq 1 ]]; then
-        echo "Copying rootfs.cpio to rootfs_full.cpio (external root mode)"
-        cp -f buildroot/output/images/rootfs.cpio ./rootfs_full.cpio
+        if [[ $MERGE_EXTRA_PACKAGES -eq 1 ]]; then
+            stage_rootfs_tree "$buildroot_cpio" "$staged_rootfs_dir"
+            repack_rootfs_cpio "$staged_rootfs_dir" rootfs_full.cpio
+        else
+            echo "Copying rootfs.cpio to rootfs_full.cpio (external root mode)"
+            cp -f "$buildroot_cpio" ./rootfs_full.cpio
+        fi
+
         ASSERT ./scripts/rootfs_ext4.sh
     else
-        echo "Copying rootfs.cpio to rootfs.cpio (initramfs mode)"
-        cp -f buildroot/output/images/rootfs.cpio ./rootfs.cpio
+        if [[ $MERGE_EXTRA_PACKAGES -eq 1 ]]; then
+            stage_rootfs_tree "$buildroot_cpio" "$staged_rootfs_dir"
+            repack_rootfs_cpio "$staged_rootfs_dir" rootfs.cpio
+        else
+            echo "Copying rootfs.cpio to rootfs.cpio (initramfs mode)"
+            cp -f "$buildroot_cpio" ./rootfs.cpio
+        fi
     fi
 }
 
@@ -90,11 +160,13 @@ function do_linux
 
 function show_help {
     cat << EOF
-Usage: $0 [--buildroot] [--linux] [--extra-packages] [--all] [--external-root] [--clean-build] [--help]
+Usage: $0 [--buildroot] [--linux] [--directfb-test] [--merge-extra-packages] [--all] [--external-root] [--clean-build] [--help]
 
 Options:
   --buildroot         Build Buildroot rootfs
-  --extra-packages    Build extra packages along with Buildroot
+  --directfb-test     Build and stage the DirectFB test payload under extra_packages/
+  --merge-extra-packages
+                      Merge staged extra packages into the final rootfs
   --linux             Build Linux kernel
   --all               Build both Buildroot and Linux kernel
   --external-root     Use external rootfs instead of initramfs
@@ -105,7 +177,8 @@ EOF
 }
 
 BUILD_BUILDROOT=0
-BUILD_EXTRA_PACKAGES=0
+BUILD_DIRECTFB_TEST=0
+MERGE_EXTRA_PACKAGES=0
 BUILD_LINUX=0
 EXTERNAL_ROOT=0
 CLEAN_BUILD=0
@@ -115,8 +188,11 @@ while [[ $# -gt 0 ]]; do
         --buildroot)
             BUILD_BUILDROOT=1
             ;;
-        --extra-packages)
-            BUILD_EXTRA_PACKAGES=1
+        --directfb-test)
+            BUILD_DIRECTFB_TEST=1
+            ;;
+        --merge-extra-packages)
+            MERGE_EXTRA_PACKAGES=1
             ;;
         --linux)
             BUILD_LINUX=1
@@ -179,7 +255,7 @@ function do_directfb
     popd
 }
 
-function do_extra_packages
+function do_directfb_test_payload
 {
     export PATH="$PWD/buildroot/output/host/bin:$PATH"
     export CROSS_COMPILE=riscv32-buildroot-linux-gnu-
@@ -204,8 +280,13 @@ if [[ $BUILD_BUILDROOT -eq 0 && $BUILD_LINUX -eq 0 ]]; then
     show_help
 fi
 
-if [[ $BUILD_EXTRA_PACKAGES -eq 1 && $BUILD_BUILDROOT -eq 0 ]]; then
-    echo "Error: --extra-packages requires --buildroot to be specified."
+if [[ $BUILD_DIRECTFB_TEST -eq 1 && $BUILD_BUILDROOT -eq 0 ]]; then
+    echo "Error: --directfb-test requires --buildroot to be specified."
+    show_help
+fi
+
+if [[ $MERGE_EXTRA_PACKAGES -eq 1 && $BUILD_BUILDROOT -eq 0 ]]; then
+    echo "Error: --merge-extra-packages requires --buildroot to be specified."
     show_help
 fi
 

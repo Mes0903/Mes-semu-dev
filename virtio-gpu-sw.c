@@ -1,0 +1,954 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "device.h"
+#include "utils.h"
+#include "vgpu-display.h"
+#include "virtio-gpu.h"
+#include "virtio.h"
+
+#define PRIV(x) ((virtio_gpu_data_t *) x->priv)
+
+/* Host-side 2D resource owned by the software backend. It keeps the copied
+ * image plus any attached guest backing metadata needed by transfers.
+ */
+struct vgpu_sw_resource_2d {
+    uint32_t resource_id;
+    uint32_t format;
+    uint32_t width, height;
+    uint32_t stride;
+    uint32_t bits_per_pixel;
+    uint32_t *image;
+    size_t page_cnt;
+    struct iovec *iovec;
+    struct list_head list;
+};
+
+static LIST_HEAD(g_vgpu_sw_res_2d_list);
+
+static void vgpu_sw_copy_image_from_pages(
+    struct virtio_gpu_trans_to_host_2d *req,
+    struct vgpu_sw_resource_2d *res_2d)
+{
+    uint32_t stride = res_2d->stride;
+    uint32_t bpp = res_2d->bits_per_pixel / 8; /* Bytes per pixel */
+    uint32_t width =
+        (req->r.width < res_2d->width) ? req->r.width : res_2d->width;
+    uint32_t height =
+        (req->r.height < res_2d->height) ? req->r.height : res_2d->height;
+
+    /* When the transfer spans full-width rows with no padding, both source
+     * (iovec at req->offset) and destination (image at r.y) are contiguous,
+     * so the entire rectangle can be copied in a single helper call.
+     * This covers all cursor transfers, full-frame updates, and full-width
+     * dirty bands.
+     */
+    if (req->r.x == 0 && (size_t) width * bpp == stride) {
+        void *dest =
+            (void *) ((uintptr_t) res_2d->image + (size_t) req->r.y * stride);
+        virtio_gpu_iov_to_buf(res_2d->iovec, res_2d->page_cnt, req->offset,
+                              dest, (size_t) stride * height);
+        return;
+    }
+
+    /* Partial-width sub-rect: copy row by row */
+    for (uint32_t h = 0; h < height; h++) {
+        /* Source offset is in the image coordinate. The address to copy from
+         * is the page base address plus the offset.
+         */
+        size_t src_offset = req->offset + (size_t) stride * h;
+        size_t dest_offset =
+            ((size_t) req->r.y + h) * stride + (size_t) req->r.x * bpp;
+        void *dest = (void *) ((uintptr_t) res_2d->image + dest_offset);
+        size_t total = (size_t) width * bpp;
+
+        virtio_gpu_iov_to_buf(res_2d->iovec, res_2d->page_cnt, src_offset, dest,
+                              total);
+    }
+}
+
+static void vgpu_sw_destroy_resource_2d(struct vgpu_sw_resource_2d *res_2d)
+{
+    list_del(&res_2d->list);
+    free(res_2d->image);
+    free(res_2d->iovec);
+    free(res_2d);
+}
+
+static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(uint32_t resource_id)
+{
+    struct vgpu_sw_resource_2d *res_2d;
+    list_for_each_entry (res_2d, &g_vgpu_sw_res_2d_list, list) {
+        if (res_2d->resource_id == resource_id)
+            return res_2d;
+    }
+
+    return NULL;
+}
+
+static struct vgpu_display_payload *vgpu_sw_create_window_payload(
+    const struct vgpu_sw_resource_2d *res_2d,
+    const struct virtio_gpu_scanout_info *scanout,
+    const char *plane_name)
+{
+    if (!res_2d || !res_2d->image) {
+        fprintf(stderr, "%s(): missing %s image\n", __func__, plane_name);
+        return NULL;
+    }
+
+    uint32_t width = res_2d->width;
+    uint32_t height = res_2d->height;
+    const uint32_t *image = res_2d->image;
+    if (scanout) {
+        /* Primary scanouts can expose only a sub-rectangle of the resource.
+         * Rebase width/height/image onto that crop before snapshotting it.
+         */
+        width = scanout->src_w;
+        height = scanout->src_h;
+        image = res_2d->image +
+                (size_t) scanout->src_y *
+                    (res_2d->stride / (res_2d->bits_per_pixel / 8)) +
+                scanout->src_x;
+    }
+
+    if (width == 0 || height == 0) {
+        fprintf(stderr, "%s(): invalid %s size %ux%u\n", __func__, plane_name,
+                width, height);
+        return NULL;
+    }
+
+    if (res_2d->bits_per_pixel == 0 || (res_2d->bits_per_pixel % 8) != 0) {
+        fprintf(stderr, "%s(): invalid %s bpp %u\n", __func__, plane_name,
+                res_2d->bits_per_pixel);
+        return NULL;
+    }
+
+    size_t bytes_per_pixel = res_2d->bits_per_pixel / 8;
+    size_t row_bytes = (size_t) width * bytes_per_pixel;
+    if (width != 0 && row_bytes / width != bytes_per_pixel) {
+        fprintf(stderr, "%s(): %s row size overflow\n", __func__, plane_name);
+        return NULL;
+    }
+    if (row_bytes > UINT32_MAX) {
+        fprintf(stderr, "%s(): %s row size exceeds uint32_t\n", __func__,
+                plane_name);
+        return NULL;
+    }
+    if (res_2d->stride < row_bytes) {
+        fprintf(stderr, "%s(): invalid %s stride %u for row size %zu\n",
+                __func__, plane_name, res_2d->stride, row_bytes);
+        return NULL;
+    }
+
+    size_t pixels_size = row_bytes * height;
+    if (height != 0 && pixels_size / height != row_bytes) {
+        fprintf(stderr, "%s(): %s image size overflow\n", __func__, plane_name);
+        return NULL;
+    }
+
+    size_t alloc_size = sizeof(struct vgpu_display_payload) + pixels_size;
+    if (alloc_size < pixels_size) {
+        fprintf(stderr, "%s(): %s allocation overflow\n", __func__, plane_name);
+        return NULL;
+    }
+
+    struct vgpu_display_payload *payload = malloc(alloc_size);
+    if (!payload) {
+        fprintf(stderr, "%s(): failed to allocate %s snapshot\n", __func__,
+                plane_name);
+        return NULL;
+    }
+
+    payload->cpu.format = res_2d->format;
+    payload->cpu.width = width;
+    payload->cpu.height = height;
+    payload->cpu.stride = (uint32_t) row_bytes;
+    payload->cpu.bits_per_pixel = res_2d->bits_per_pixel;
+    payload->cpu.pixels = (uint8_t *) (payload + 1);
+
+    /* The cropped view is contiguous only when the source stride matches this
+     * snapshot's row size. Otherwise each source row still carries padding or
+     * untouched pixels outside the requested view, so the snapshot must be
+     * packed row by row.
+     */
+    const uint8_t *src_pixels = (const uint8_t *) image;
+    if (res_2d->stride == row_bytes) {
+        memcpy(payload->cpu.pixels, src_pixels, pixels_size);
+    } else {
+        for (uint32_t y = 0; y < height; y++) {
+            memcpy(payload->cpu.pixels + (size_t) y * row_bytes,
+                   src_pixels + (size_t) y * res_2d->stride, row_bytes);
+        }
+    }
+
+    return payload;
+}
+
+/* Backend Implementation */
+static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
+{
+    for (uint32_t i = 0; i < PRIV(vgpu)->num_scanouts; i++) {
+        PRIV(vgpu)->scanouts[i].primary_resource_id = 0;
+        PRIV(vgpu)->scanouts[i].src_x = 0;
+        PRIV(vgpu)->scanouts[i].src_y = 0;
+        PRIV(vgpu)->scanouts[i].src_w = 0;
+        PRIV(vgpu)->scanouts[i].src_h = 0;
+        vgpu_display_publish_primary_clear(i);
+        vgpu_display_publish_cursor_clear(i);
+    }
+
+    struct list_head *curr, *next;
+    list_for_each_safe (curr, next, &g_vgpu_sw_res_2d_list) {
+        struct vgpu_sw_resource_2d *res_2d =
+            list_entry(curr, struct vgpu_sw_resource_2d, list);
+
+        vgpu_sw_destroy_resource_2d(res_2d);
+    }
+}
+
+static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_res_create_2d)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_res_create_2d *request = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_res_create_2d));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Keep resource_id 0 unavailable for real resources. The virtio spec
+     * explicitly documents resource_id = 0 as the SET_SCANOUT disable sentinel.
+     * The Linux virtio-gpu driver also allocates guest-generated resource IDs
+     * as handle + 1, so they are always greater than 0. See virtgpu_object.c
+     * for details.
+     */
+    if (request->resource_id == 0) {
+        fprintf(stderr, "%s(): resource id should not be 0\n", __func__);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Create 2D resource */
+    struct vgpu_sw_resource_2d *res_2d = calloc(1, sizeof(*res_2d));
+    if (!res_2d) {
+        fprintf(stderr, "%s(): failed to allocate new resource\n", __func__);
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+    res_2d->resource_id = request->resource_id;
+    list_push(&res_2d->list, &g_vgpu_sw_res_2d_list);
+
+    /* Select image formats */
+    uint32_t bits_per_pixel;
+    switch (request->format) {
+    case VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM:
+    case VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM:
+    case VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM:
+    case VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM:
+    case VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM:
+    case VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM:
+    case VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM:
+    case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
+        bits_per_pixel = 32;
+        break;
+    default:
+        fprintf(stderr, "%s(): unsupported format %d\n", __func__,
+                request->format);
+        vgpu_sw_destroy_resource_2d(res_2d);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        return;
+    }
+
+    /* Set 2D resource */
+    res_2d->width = request->width;
+    res_2d->height = request->height;
+    res_2d->format = request->format;
+    res_2d->bits_per_pixel = bits_per_pixel;
+
+    /* Compute the row stride in a wider type first, then narrow it only after
+     * checking the final byte count still fits in uint32_t. Otherwise a large
+     * guest width could wrap during the intermediate multiplication and leave
+     * a truncated stride in the resource.
+     */
+    size_t stride =
+        (((size_t) res_2d->width * res_2d->bits_per_pixel + 0x1f) >> 5) *
+        sizeof(uint32_t);
+    if (stride > UINT32_MAX) {
+        fprintf(stderr, "%s(): stride overflow (%u x %u bpp)\n", __func__,
+                res_2d->width, res_2d->bits_per_pixel);
+        vgpu_sw_destroy_resource_2d(res_2d);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                          vq_desc[resp_idx].len,
+                                          VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
+        return;
+    }
+    res_2d->stride = (uint32_t) stride;
+
+    /* Guard against integer overflow in image buffer allocation.
+     * Both stride and height are guest-controlled uint32_t values whose
+     * product can silently wrap around in 32-bit arithmetic, resulting in
+     * an undersized malloc while later transfers write to the full extent.
+     */
+    size_t image_size = (size_t) res_2d->stride * res_2d->height;
+    if (res_2d->height && image_size / res_2d->height != res_2d->stride) {
+        fprintf(stderr, "%s(): image size overflow (%u x %u)\n", __func__,
+                res_2d->width, res_2d->height);
+        vgpu_sw_destroy_resource_2d(res_2d);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                          vq_desc[resp_idx].len,
+                                          VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
+        return;
+    }
+    res_2d->image = malloc(image_size);
+
+    /* Failed to create image buffer */
+    if (!res_2d->image) {
+        fprintf(stderr, "%s(): Failed to allocate image buffer\n", __func__);
+        vgpu_sw_destroy_resource_2d(res_2d);
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Write response */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &request->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_res_unref)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_res_unref *request = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_res_unref));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Clear any visible scanout using this resource before it is freed. */
+    for (uint32_t i = 0; i < PRIV(vgpu)->num_scanouts; i++) {
+        struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[i];
+
+        if (!scanout->enabled ||
+            scanout->primary_resource_id != request->resource_id)
+            continue;
+
+        scanout->primary_resource_id = 0;
+        scanout->src_x = scanout->src_y = 0;
+        scanout->src_w = scanout->src_h = 0;
+        vgpu_display_publish_primary_clear(i);
+    }
+
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(request->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): failed to destroy resource %d\n", __func__,
+                request->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+    vgpu_sw_destroy_resource_2d(res_2d);
+
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &request->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
+                                            struct virtq_desc *vq_desc,
+                                            uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_set_scanout)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_set_scanout *request = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_set_scanout));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Validate scanout ID */
+    if (request->scanout_id >= PRIV(vgpu)->num_scanouts ||
+        !PRIV(vgpu)->scanouts[request->scanout_id].enabled) {
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
+        return;
+    }
+
+    struct virtio_gpu_scanout_info *scanout =
+        &PRIV(vgpu)->scanouts[request->scanout_id];
+
+    /* Keep resource_id 0 unavailable for real resources. The virtio spec
+     * explicitly documents resource_id = 0 as the SET_SCANOUT disable sentinel.
+     * The Linux virtio-gpu driver also allocates guest-generated resource IDs
+     * as handle + 1, so they are always greater than 0. See virtgpu_object.c
+     * for details.
+     */
+    if (request->resource_id == 0) {
+        scanout->primary_resource_id = 0;
+        scanout->src_x = scanout->src_y = 0;
+        scanout->src_w = scanout->src_h = 0;
+        vgpu_display_publish_primary_clear(request->scanout_id);
+        goto leave;
+    }
+
+    /* Retrieve 2D resource */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(request->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                request->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Validate that the source rectangle fits within the resource without
+     * relying on wrapping 32-bit additions.
+     */
+    if (request->r.x > res_2d->width || request->r.y > res_2d->height ||
+        request->r.width > res_2d->width - request->r.x ||
+        request->r.height > res_2d->height - request->r.y) {
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        return;
+    }
+
+    /* Bind scanout with resource and record the source rectangle */
+    scanout->primary_resource_id = res_2d->resource_id;
+    scanout->src_x = request->r.x;
+    scanout->src_y = request->r.y;
+    scanout->src_w = request->r.width;
+    scanout->src_h = request->r.height;
+
+leave:
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &request->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_res_flush)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_res_flush *request = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_res_flush));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Retrieve 2D resource */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(request->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                request->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Flush the resource to every scanout currently bound to it, using the
+     * source rectangle recorded by SET_SCANOUT to display only the requested
+     * sub-region of the resource.
+     */
+    for (uint32_t i = 0; i < PRIV(vgpu)->num_scanouts; i++) {
+        struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[i];
+
+        if (!scanout->enabled ||
+            scanout->primary_resource_id != request->resource_id)
+            continue;
+
+        /* Keep the producer non-blocking: if the display queue is full or
+         * snapshot allocation fails below, this flush frame for scanout i is
+         * dropped and the frontend keeps showing its previous published frame.
+         */
+        if (!vgpu_display_can_publish())
+            continue;
+
+        struct vgpu_display_payload *payload =
+            vgpu_sw_create_window_payload(res_2d, scanout, "primary");
+        if (!payload)
+            continue;
+
+        /* The publish path snapshots the whole SET_SCANOUT view for this
+         * scanout. request->r is not used here to further trim the payload for
+         * now.
+         */
+        vgpu_display_publish_primary_set(i, payload);
+    }
+
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &request->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
+                                                    struct virtq_desc *vq_desc,
+                                                    uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_trans_to_host_2d)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_trans_to_host_2d *req = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_trans_to_host_2d));
+    if (!req) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Retrieve 2D resource */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(req->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                req->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Check if backing has been attached */
+    if (!res_2d->iovec) {
+        fprintf(stderr, "%s(): backing not attached for resource %d\n",
+                __func__, req->resource_id);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                          vq_desc[resp_idx].len,
+                                          VIRTIO_GPU_RESP_ERR_UNSPEC);
+        return;
+    }
+
+    /* Check image boundary */
+    if (req->r.x > res_2d->width || req->r.y > res_2d->height ||
+        req->r.width > res_2d->width || req->r.height > res_2d->height ||
+        req->r.x + req->r.width > res_2d->width ||
+        req->r.y + req->r.height > res_2d->height) {
+        fprintf(stderr, "%s(): invalid image size\n", __func__);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        return;
+    }
+
+    /* Transfer frame data from guest to host */
+    vgpu_sw_copy_image_from_pages(req, res_2d);
+
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &req->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_resource_attach_backing_handler(
+    virtio_gpu_state_t *vgpu,
+    struct virtq_desc *vq_desc,
+    uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_res_attach_backing)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_res_attach_backing *backing_info =
+        virtio_gpu_mem_guest_to_host(
+            vgpu, vq_desc[0].addr,
+            sizeof(struct virtio_gpu_res_attach_backing));
+    if (!backing_info) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    if (vq_desc[1].len <
+        sizeof(struct virtio_gpu_mem_entry) * backing_info->nr_entries) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_mem_entry *pages = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[1].addr,
+        sizeof(struct virtio_gpu_mem_entry) * backing_info->nr_entries);
+    if (!pages) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Retrieve 2D resource */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(backing_info->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                backing_info->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Check if backing is already attached */
+    if (res_2d->iovec) {
+        fprintf(stderr, "%s(): backing already attached for resource %d\n",
+                __func__, backing_info->resource_id);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                          vq_desc[resp_idx].len,
+                                          VIRTIO_GPU_RESP_ERR_UNSPEC);
+        return;
+    }
+
+    /* Dispatch page memories to the 2D resource */
+    res_2d->page_cnt = backing_info->nr_entries;
+    res_2d->iovec = malloc(sizeof(struct iovec) * backing_info->nr_entries);
+    if (!res_2d->iovec) {
+        fprintf(stderr, "%s(): failed to allocate io vector\n", __func__);
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Convert each guest-provided backing entry into one host-side iovec. */
+    for (size_t i = 0; i < backing_info->nr_entries; i++) {
+        /* Attach address and length of i-th page to the 2D resource */
+        res_2d->iovec[i].iov_base =
+            virtio_gpu_mem_guest_to_host(vgpu, pages[i].addr, pages[i].length);
+        res_2d->iovec[i].iov_len = pages[i].length;
+
+        /* Corrupted page address */
+        if (!res_2d->iovec[i].iov_base) {
+            fprintf(stderr, "%s(): invalid page address\n", __func__);
+            free(res_2d->iovec);
+            res_2d->iovec = NULL;
+            res_2d->page_cnt = 0;
+            *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                              vq_desc[resp_idx].len,
+                                              VIRTIO_GPU_RESP_ERR_UNSPEC);
+            return;
+        }
+    }
+
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &backing_info->hdr,
+                                    vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_resource_detach_backing_handler(
+    virtio_gpu_state_t *vgpu,
+    struct virtq_desc *vq_desc,
+    uint32_t *plen)
+{
+    /* Check if there's a writable response descriptor */
+    int resp_idx = virtio_gpu_find_response_desc(vq_desc, 3);
+    if (resp_idx < 0) {
+        *plen = 0;
+        return;
+    }
+
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_res_detach_backing)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_res_detach_backing *request =
+        virtio_gpu_mem_guest_to_host(
+            vgpu, vq_desc[0].addr,
+            sizeof(struct virtio_gpu_res_detach_backing));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    /* Retrieve 2D resource */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(request->resource_id);
+
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                request->resource_id);
+        *plen = virtio_gpu_write_response(
+            vgpu, vq_desc[resp_idx].addr, vq_desc[resp_idx].len,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        return;
+    }
+
+    /* Check if backing exists */
+    if (!res_2d->iovec) {
+        fprintf(stderr, "%s(): no backing for resource %d\n", __func__,
+                request->resource_id);
+        *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                          vq_desc[resp_idx].len,
+                                          VIRTIO_GPU_RESP_ERR_UNSPEC);
+        return;
+    }
+
+    /* Detach backing, free iovec array */
+    free(res_2d->iovec);
+    res_2d->iovec = NULL;
+    res_2d->page_cnt = 0;
+
+    /* Response OK */
+    *plen = virtio_gpu_write_response(vgpu, vq_desc[resp_idx].addr,
+                                      vq_desc[resp_idx].len,
+                                      VIRTIO_GPU_RESP_OK_NODATA);
+
+    /* Handle fencing flag */
+    virtio_gpu_set_response_fencing(vgpu, &request->hdr, vq_desc[resp_idx].addr,
+                                    vq_desc[resp_idx].len);
+}
+
+static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
+                                              struct virtq_desc *vq_desc,
+                                              uint32_t *plen)
+{
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_update_cursor)) {
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_update_cursor *cursor = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_update_cursor));
+    if (!cursor) {
+        *plen = 0;
+        return;
+    }
+
+    /* Validate scanout ID */
+    if (cursor->pos.scanout_id >= PRIV(vgpu)->num_scanouts) {
+        *plen = 0;
+        return;
+    }
+
+    /* Keep resource_id 0 unavailable for real resources. The virtio spec
+     * explicitly documents resource_id = 0 as the SET_SCANOUT disable sentinel.
+     * The Linux virtio-gpu driver also allocates guest-generated resource IDs
+     * as handle + 1, so they are always greater than 0. See virtgpu_object.c
+     * for details.
+     */
+    if (cursor->resource_id == 0) {
+        vgpu_display_publish_cursor_clear(cursor->pos.scanout_id);
+        *plen = 0;
+        return;
+    }
+
+    /* Update cursor image */
+    struct vgpu_sw_resource_2d *res_2d =
+        vgpu_sw_get_resource_2d(cursor->resource_id);
+    if (!res_2d) {
+        fprintf(stderr, "%s(): invalid resource id %d\n", __func__,
+                cursor->resource_id);
+        *plen = 0;
+        return;
+    }
+
+    if (!vgpu_display_can_publish()) {
+        *plen = 0;
+        return;
+    }
+
+    struct vgpu_display_payload *payload =
+        vgpu_sw_create_window_payload(res_2d, NULL, "cursor");
+    if (!payload) {
+        *plen = 0;
+        return;
+    }
+    vgpu_display_publish_cursor_set(cursor->pos.scanout_id, payload,
+                                    cursor->pos.x, cursor->pos.y, cursor->hot_x,
+                                    cursor->hot_y);
+
+    /* Cursor commands use only 1 descriptor and do NOT have a response
+     * descriptor. The device should return with len=0.
+     */
+    *plen = 0;
+}
+
+static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
+                                            struct virtq_desc *vq_desc,
+                                            uint32_t *plen)
+{
+    /* Read request */
+    if (vq_desc[0].len < sizeof(struct virtio_gpu_update_cursor)) {
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_update_cursor *cursor = virtio_gpu_mem_guest_to_host(
+        vgpu, vq_desc[0].addr, sizeof(struct virtio_gpu_update_cursor));
+    if (!cursor) {
+        *plen = 0;
+        return;
+    }
+
+    /* Validate scanout ID */
+    if (cursor->pos.scanout_id >= PRIV(vgpu)->num_scanouts) {
+        *plen = 0;
+        return;
+    }
+
+    /* Move cursor to new position */
+    vgpu_display_publish_cursor_move(cursor->pos.scanout_id, cursor->pos.x,
+                                     cursor->pos.y);
+
+    /* Cursor commands use only 1 descriptor and do NOT have a response
+     * descriptor. The device should return with len=0.
+     */
+    *plen = 0;
+}
+
+const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
+    .reset = vgpu_sw_reset,
+    .get_display_info = virtio_gpu_get_display_info_handler,
+    .resource_create_2d = vgpu_sw_resource_create_2d_handler,
+    .resource_unref = vgpu_sw_cmd_resource_unref_handler,
+    .set_scanout = vgpu_sw_cmd_set_scanout_handler,
+    .resource_flush = vgpu_sw_cmd_resource_flush_handler,
+    .transfer_to_host_2d = vgpu_sw_cmd_transfer_to_host_2d_handler,
+    .resource_attach_backing = vgpu_sw_cmd_resource_attach_backing_handler,
+    .resource_detach_backing = vgpu_sw_cmd_resource_detach_backing_handler,
+    .get_capset_info = VIRTIO_GPU_CMD_UNDEF,
+    .get_capset = VIRTIO_GPU_CMD_UNDEF,
+    .get_edid = virtio_gpu_get_edid_handler,
+    .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
+    .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
+    .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
+    .ctx_create = VIRTIO_GPU_CMD_UNDEF,
+    .ctx_destroy = VIRTIO_GPU_CMD_UNDEF,
+    .ctx_attach_resource = VIRTIO_GPU_CMD_UNDEF,
+    .ctx_detach_resource = VIRTIO_GPU_CMD_UNDEF,
+    .resource_create_3d = VIRTIO_GPU_CMD_UNDEF,
+    .transfer_to_host_3d = VIRTIO_GPU_CMD_UNDEF,
+    .transfer_from_host_3d = VIRTIO_GPU_CMD_UNDEF,
+    .submit_3d = VIRTIO_GPU_CMD_UNDEF,
+    .resource_map_blob = VIRTIO_GPU_CMD_UNDEF,
+    .resource_unmap_blob = VIRTIO_GPU_CMD_UNDEF,
+    .update_cursor = vgpu_sw_cmd_update_cursor_handler,
+    .move_cursor = vgpu_sw_cmd_move_cursor_handler,
+};
