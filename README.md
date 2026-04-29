@@ -108,10 +108,9 @@ unpacking a large cpio, and matches how real systems deploy. The
 `ext4.img` is built from `rootfs.cpio` via `scripts/rootfs_ext4.sh`,
 which requires `fakeroot` and `mkfs.ext4`.
 
-The rolling `prebuilt` release provides an optional `test-tools.img.bz2`,
-an ext4-formatted disk image for larger test/user tools that should not
-inflate `rootfs.cpio` or the default `ext4.img`. Use `make test-tools.img`
-to download it.
+The rolling `prebuilt` release provides an optional `test-tools.img.bz2` for
+larger test/user tools that should not inflate `rootfs.cpio` or the default
+`ext4.img`. Use `make test-tools.img` to download it.
 
 If `fakeroot` is missing, the build falls back to the legacy initramfs
 path (`-i rootfs.cpio`) automatically and prints a one-line warning. To
@@ -213,12 +212,13 @@ Build Buildroot for the legacy initramfs-only path (no ext4):
 $ scripts/build-image.sh --buildroot --no-ext4
 ```
 
-Build Buildroot and a test tools disk with the DirectFB2 test payload. The published
-`rootfs.cpio` and default `ext4.img` stay small; the payload is injected only
-into `test-tools.img`:
+Build Buildroot and a test tools disk with the DirectFB2 test payload. Add `--x11`
+when the test tools disk should use an X11-enabled rootfs. The published
+`rootfs.cpio` and default `ext4.img` stay small; larger payloads are injected
+only into `test-tools.img`:
 
 ```
-$ scripts/build-image.sh --directfb2-test
+$ scripts/build-image.sh --x11 --directfb2-test
 ```
 
 After booting with that `test-tools.img`, source the guest-side environment
@@ -240,8 +240,8 @@ $ make semu minimal.dtb Image test-tools.img
 $ ./semu -k Image -c 1 -b minimal.dtb -d test-tools.img
 ```
 
-Log in as `root`, source the test-tools environment, and run one of the
-DirectFB2 examples:
+Log in as `root`, source the test-tools image environment, and run one of
+the DirectFB2 examples:
 
 ```
 # . /root/local-env.sh
