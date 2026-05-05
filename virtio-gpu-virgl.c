@@ -19,6 +19,11 @@ struct vgpu_virgl_resource {
     struct vgpu_virgl_resource *next;
 };
 
+struct vgpu_virgl_box {
+    uint32_t x, y, z;
+    uint32_t w, h, d;
+};
+
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
 
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
@@ -110,10 +115,10 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
     *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
 }
 
-static struct virgl_box vgpu_virgl_box_from_virtio(
+static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
     const struct virtio_gpu_box *box)
 {
-    return (struct virgl_box) {
+    return (struct vgpu_virgl_box) {
         .x = box->x,
         .y = box->y,
         .z = box->z,
@@ -123,10 +128,10 @@ static struct virgl_box vgpu_virgl_box_from_virtio(
     };
 }
 
-static struct virgl_box vgpu_virgl_box_from_rect(
+static struct vgpu_virgl_box vgpu_virgl_box_from_rect(
     const struct virtio_gpu_rect *rect)
 {
-    return (struct virgl_box) {
+    return (struct vgpu_virgl_box) {
         .x = rect->x,
         .y = rect->y,
         .z = 0,
@@ -548,9 +553,10 @@ static void vgpu_virgl_cmd_transfer_to_host_2d_handler(
     if (!response_desc)
         return;
 
-    struct virgl_box box = vgpu_virgl_box_from_rect(&request->r);
-    int ret = virgl_renderer_transfer_write_iov(
-        request->resource_id, 0, 0, 0, 0, &box, request->offset, NULL, 0);
+    struct vgpu_virgl_box box = vgpu_virgl_box_from_rect(&request->r);
+    int ret = virgl_renderer_transfer_write_iov(request->resource_id, 0, 0, 0,
+                                                0, (struct virgl_box *) &box,
+                                                request->offset, NULL, 0);
     vgpu_virgl_write_response(
         vgpu, &request->hdr, response_desc,
         ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
@@ -587,10 +593,11 @@ static void vgpu_virgl_cmd_transfer_to_host_3d_handler(
         return;
     }
 
-    struct virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
+    struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
     int ret = virgl_renderer_transfer_write_iov(
         request->resource_id, request->hdr.ctx_id, (int) request->level,
-        request->stride, request->layer_stride, &box, request->offset, NULL, 0);
+        request->stride, request->layer_stride, (struct virgl_box *) &box,
+        request->offset, NULL, 0);
     vgpu_virgl_write_response(
         vgpu, &request->hdr, response_desc,
         ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
@@ -621,10 +628,11 @@ static void vgpu_virgl_cmd_transfer_from_host_3d_handler(
         return;
     }
 
-    struct virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
+    struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
     int ret = virgl_renderer_transfer_read_iov(
         request->resource_id, request->hdr.ctx_id, request->level,
-        request->stride, request->layer_stride, &box, request->offset, NULL, 0);
+        request->stride, request->layer_stride, (struct virgl_box *) &box,
+        request->offset, NULL, 0);
     vgpu_virgl_write_response(
         vgpu, &request->hdr, response_desc,
         ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
