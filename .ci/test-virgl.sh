@@ -101,7 +101,21 @@ expect "# " {
 } timeout { exit 8 }
 expect {
   -exact "__VIRGL_RENDERER_OK__" {}
-  -exact "__VIRGL_RENDERER_FAIL__" { exit 8 }
+  -exact "__VIRGL_RENDERER_FAIL__" {
+    expect "# " {
+      send "echo '--- kernel virtio-gpu diagnostic ---'; dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|cap sets|features:|virgl' | tail -n 120 || true\r"
+    } timeout { exit 8 }
+    expect "# " {
+      send "echo '--- drm debugfs diagnostic ---'; mount -t debugfs none /sys/kernel/debug 2>/dev/null || true; for f in /sys/kernel/debug/dri/*/virtio-gpu-features; do test -f \$f && { echo ---\$f---; cat \$f; }; done\r"
+    } timeout { exit 8 }
+    expect "# " {
+      send "echo '--- drm sysfs diagnostic ---'; for n in /sys/class/drm/card0 /sys/class/drm/renderD128; do echo ---\$n---; ls -l \$n/device/driver 2>/dev/null || true; cat \$n/device/uevent 2>/dev/null || true; done\r"
+    } timeout { exit 8 }
+    expect "# " {
+      send "echo '--- xorg dri diagnostic ---'; grep -Ei 'dri|glamor|modeset|virtio|swrast|render' /var/log/Xorg.0.log /tmp/xorg.log 2>/dev/null | tail -n 160 || true\r"
+    } timeout { exit 8 }
+    exit 8
+  }
   timeout { exit 8 }
 }
 

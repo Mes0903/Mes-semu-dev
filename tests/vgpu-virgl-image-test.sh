@@ -69,6 +69,9 @@ require_literal './semu -k Image -c 1 -b minimal.dtb -d test-tools.img' \
 require_literal '/etc/semu-test-tools-virgl' .ci/test-virgl.sh
 require_literal '/usr/lib/dri/virtio_gpu_dri.so' .ci/test-virgl.sh
 require_literal 'MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu' .ci/test-virgl.sh
+require_literal 'virtio-gpu-features' .ci/test-virgl.sh
+require_literal 'kernel virtio-gpu diagnostic' .ci/test-virgl.sh
+require_literal 'xorg dri diagnostic' .ci/test-virgl.sh
 require_literal 'Xorg :0 -noreset -nolisten tcp' .ci/test-virgl.sh
 require_literal '__VIRGL_XORG_READY__' .ci/test-virgl.sh
 require_literal 'glxinfo -B' .ci/test-virgl.sh
