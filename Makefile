@@ -210,6 +210,7 @@ endif
 ENABLE_VIRTIOGPU ?= 1
 $(call set-feature, VIRTIOGPU)
 ifeq ($(call has, VIRTIOGPU), 1)
+    OBJS_EXTRA += virtio-gpu-desc.o
     OBJS_EXTRA += virtio-gpu.o
     OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += vgpu-display.o
@@ -274,6 +275,11 @@ $(BIN): $(OBJS)
 %.o: %.c .build-config.stamp
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -o $@ $(CFLAGS) -c -MMD -MF .$@.d $<
+
+test_deps := tests/.virtio-gpu-desc-test.o.d
+tests/%.o: tests/%.c .build-config.stamp
+	$(VECHO) "  CC\t$@\n"
+	$(Q)$(CC) -o $@ $(CFLAGS) -c -MMD -MF tests/.$*.o.d $<
 
 DTC ?= dtc
 
@@ -360,12 +366,22 @@ check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_
 	@$(call notice, Ready to launch Linux kernel. Please be patient.)
 	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -H $(INITRD_OPT) $(if $(NETDEV),-n $(NETDEV)) $(OPTS)
 
+VGPU_DESC_TEST := tests/virtio-gpu-desc-test
+.PHONY: test-vgpu-desc
+test-vgpu-desc: $(VGPU_DESC_TEST)
+	$(Q)./$<
+
+$(VGPU_DESC_TEST): tests/virtio-gpu-desc-test.o virtio-gpu-desc.o
+	$(VECHO) "  LD\t$@\n"
+	$(Q)$(CC) -o $@ $^
+
 BUILD_IMAGE_ARGS ?= --all
 build-image:
 	scripts/build-image.sh $(BUILD_IMAGE_ARGS)
 
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
+	$(Q)$(RM) $(VGPU_DESC_TEST) tests/virtio-gpu-desc-test.o $(test_deps)
 	$(Q)$(MAKE) -C mini-gdbstub clean
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \
@@ -379,4 +395,4 @@ distclean: clean
 	$(Q)$(RM) Image rootfs.cpio prebuilt.sha1
 	$(Q)$(RM) ext4.img test-tools.img
 
--include $(deps)
+-include $(deps) $(test_deps)

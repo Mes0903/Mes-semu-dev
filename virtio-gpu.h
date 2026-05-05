@@ -4,6 +4,7 @@
 #error Only valid when Virtio-GPU is enabled.
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,6 +15,22 @@
 #define VIRTIO_GPU_LOG_PREFIX "[SEMU VGPU] "
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
+
+/* Feature masks exposed in DeviceFeaturesSel 0. Linux UAPI names these as bit
+ * numbers; semu stores the selected 32-bit feature word, so keep masks here.
+ */
+#define VIRTIO_GPU_F_VIRGL (1U << 0)
+#define VIRTIO_GPU_F_EDID (1U << 1)
+#define VIRTIO_GPU_F_RESOURCE_UUID (1U << 2)
+#define VIRTIO_GPU_F_RESOURCE_BLOB (1U << 3)
+#define VIRTIO_GPU_F_CONTEXT_INIT (1U << 4)
+
+#define VIRTIO_GPU_CAPSET_VIRGL 1
+#define VIRTIO_GPU_CAPSET_VIRGL2 2
+#define VIRTIO_GPU_CAPSET_GFXSTREAM_VULKAN 3
+#define VIRTIO_GPU_CAPSET_VENUS 4
+#define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
+#define VIRTIO_GPU_CAPSET_DRM 6
 
 /* Maximum descriptor chain length accepted by 'virtio_gpu_desc_handler()'.
  *
@@ -253,7 +270,7 @@ PACKED(struct virtio_gpu_transfer_host_3d {
 PACKED(struct virtio_gpu_cmd_submit {
     struct virtio_gpu_ctrl_hdr hdr;
     uint32_t size;
-    uint32_t num_in_fences;
+    uint32_t padding;
 });
 
 PACKED(struct virtio_gpu_resp_map_info {
@@ -363,6 +380,23 @@ struct virtio_gpu_cmd_backend {
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
                                    uint32_t size);
+
+enum virtio_gpu_desc_copy_result {
+    VIRTIO_GPU_DESC_COPY_OK = 0,
+    VIRTIO_GPU_DESC_COPY_SHORT,
+    VIRTIO_GPU_DESC_COPY_INVALID,
+};
+
+bool virtio_gpu_desc_readable_size(const struct virtq_desc *vq_desc,
+                                   int max_desc,
+                                   size_t *size);
+enum virtio_gpu_desc_copy_result virtio_gpu_desc_copy_from_readable(
+    virtio_gpu_state_t *vgpu,
+    const struct virtq_desc *vq_desc,
+    int max_desc,
+    size_t offset,
+    void *buf,
+    size_t bytes);
 void *virtio_gpu_get_request(virtio_gpu_state_t *vgpu,
                              struct virtq_desc *vq_desc,
                              size_t request_size);

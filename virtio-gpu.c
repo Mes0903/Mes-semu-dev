@@ -19,8 +19,6 @@
 #define VIRTIO_F_VERSION_1 1
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
-#define VIRTIO_GPU_F_EDID (1 << 1)
-#define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 #define VIRTIO_GPU_QUEUE (vgpu->queues[vgpu->QueueSel])
@@ -61,20 +59,6 @@
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
-
-void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
-                                   uint32_t addr,
-                                   uint32_t size)
-{
-    if (addr >= RAM_SIZE || size > RAM_SIZE || addr + size > RAM_SIZE) {
-        fprintf(stderr,
-                VIRTIO_GPU_LOG_PREFIX
-                "%s(): guest address 0x%x size 0x%x out of bounds\n",
-                __func__, addr, size);
-        return NULL;
-    }
-    return (void *) ((uintptr_t) vgpu->ram + addr);
-}
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu)
 {
