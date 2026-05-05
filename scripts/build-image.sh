@@ -118,6 +118,12 @@ function build_buildroot_rootfs
     unset LD_LIBRARY_PATH
     pushd buildroot
     ASSERT make olddefconfig
+    if [[ "$mode" == "x11-virgl" &&
+          ! -e output/target/usr/lib/dri/virtio_gpu_dri.so ]] &&
+       compgen -G "output/build/mesa3d-*" >/dev/null; then
+        echo "Mesa was built without virtio_gpu_dri.so; rebuilding mesa3d for VirGL..."
+        ASSERT make mesa3d-dirclean
+    fi
     if [[ ( "$mode" == "x11" || "$mode" == "x11-virgl" ) && \
           ! -x output/host/bin/riscv32-buildroot-linux-gnu-g++ ]]; then
         echo "Rebuilding Buildroot final GCC with C++ support..."
@@ -125,6 +131,14 @@ function build_buildroot_rootfs
     fi
     ASSERT make $PARALLEL
     popd
+
+    if [[ "$mode" == "x11-virgl" &&
+          ! -e buildroot/output/target/usr/lib/dri/virtio_gpu_dri.so ]]; then
+        echo "Error: Mesa VirGL DRI driver was not produced:"
+        echo "  buildroot/output/target/usr/lib/dri/virtio_gpu_dri.so"
+        echo "Try a clean rebuild with: scripts/build-image.sh --virgl --clean-build"
+        exit 1
+    fi
 }
 
 function do_buildroot
@@ -168,12 +182,18 @@ function do_buildroot
             if [[ $BUILD_X11 -eq 1 ]]; then
                 stage_cxx_runtime
             fi
+            if [[ $BUILD_VIRGL -eq 1 ]]; then
+                stage_virgl_smoke_marker
+            fi
             ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
                 "$TEST_TOOLS_SIZE_MB" ./extra_packages
         elif [[ $BUILD_X11 -eq 1 ]]; then
             rm -rf extra_packages
             mkdir -p extra_packages
             stage_cxx_runtime
+            if [[ $BUILD_VIRGL -eq 1 ]]; then
+                stage_virgl_smoke_marker
+            fi
             ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
                 "$TEST_TOOLS_SIZE_MB" ./extra_packages
         fi
@@ -269,6 +289,13 @@ function stage_cxx_runtime
     mkdir -p extra_packages/lib
     ASSERT cp -a "$toolchain_lib/libstdc++.so" "$libstdcpp" \
         "$libstdcpp_real" extra_packages/lib/
+}
+
+function stage_virgl_smoke_marker
+{
+    mkdir -p extra_packages/etc
+    printf 'Mesa VirGL test-tools image\n' > \
+        extra_packages/etc/semu-test-tools-virgl
 }
 
 function show_help {

@@ -141,9 +141,12 @@ $ .ci/test-virgl.sh
 The VirGL smoke script is intentionally not part of headless CI. It requires a
 host display because `semu` must create an SDL OpenGL window. The script checks
 the host SDL/VirGL build dependencies, starts guest `Xorg :0` when needed, then
-checks `/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and a short
-`glxgears` run. After that basic path passes, an optional reboot/reset check can
-be run with:
+checks that the guest image contains `/usr/lib/dri/virtio_gpu_dri.so`, checks
+`/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and runs a short
+`glxgears` test. If `glxinfo -B` reports `softpipe`, the test tools image is
+usually stale; rebuild it with `scripts/build-image.sh --virgl` so Mesa is
+rebuilt with the VirGL gallium driver. After that basic path passes, an optional
+reboot/reset check can be run with:
 
 ```shell
 $ SEMU_VIRGL_REBOOT_TEST=1 .ci/test-virgl.sh
@@ -301,6 +304,10 @@ future virtio-gpu 3D smoke tests:
 ```
 $ scripts/build-image.sh --virgl
 ```
+
+When switching an existing Buildroot tree from the plain X11/swrast image to
+VirGL, the script checks for `usr/lib/dri/virtio_gpu_dri.so` and rebuilds Mesa
+when the driver is missing.
 
 To add a new test tool, extend the `test-tools.img` build path in
 `scripts/build-image.sh` so the tool is staged into `extra_packages`, then
