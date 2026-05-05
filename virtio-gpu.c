@@ -841,12 +841,10 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
         *value = VIRTIO_VENDOR_ID;
         return true;
     case _(DeviceFeatures):
-        /* TODO: Advertise virgl/3D and blob-resource feature bits after the
-         * backend supports their command and display paths.
-         */
-        *value = vgpu->DeviceFeaturesSel == 0
-                     ? VIRTIO_GPU_F_EDID
-                     : (vgpu->DeviceFeaturesSel == 1 ? VIRTIO_F_VERSION_1 : 0);
+        *value =
+            vgpu->DeviceFeaturesSel == 0
+                ? VIRTIO_GPU_F_EDID | (SEMU_HAS(VIRGL) ? VIRTIO_GPU_F_VIRGL : 0)
+                : (vgpu->DeviceFeaturesSel == 1 ? VIRTIO_F_VERSION_1 : 0);
         return true;
     case _(QueueNumMax):
         *value = VIRTIO_GPU_QUEUE_NUM_MAX;
@@ -894,10 +892,7 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
             return true;
         }
         case offsetof(struct virtio_gpu_config, num_capsets): {
-            /* TODO: Return virgl capsets after implementing the corresponding
-             * 3D command backend. Zero capsets keeps guests on the 2D path.
-             */
-            *value = 0;
+            *value = virtio_gpu_backend_get_num_capsets();
             return true;
         }
         default:
@@ -1131,6 +1126,8 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu)
     initialized = true;
 
     vgpu->priv = &virtio_gpu_data;
+    if (g_virtio_gpu_backend.init)
+        g_virtio_gpu_backend.init(vgpu);
 }
 
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,

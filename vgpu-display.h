@@ -20,15 +20,28 @@ struct vgpu_display_cpu_payload {
     uint8_t *pixels;
 };
 
+struct vgpu_display_gl_scanout_payload {
+    uint32_t texture_id;
+    uint32_t width, height;
+    uint32_t src_x, src_y, src_w, src_h;
+    bool y_0_top;
+};
+
+enum vgpu_display_payload_kind {
+    VGPU_DISPLAY_PAYLOAD_CPU = 0,
+    VGPU_DISPLAY_PAYLOAD_GL_SCANOUT,
+};
+
 /* Owning payload object passed through the display queue. The bridge queues
  * and disposes this object, while GPU and window backends only fill or
  * consume the payload it carries.
  */
 struct vgpu_display_payload {
-    struct vgpu_display_cpu_payload cpu;
-    /* TODO: Add a GL/virgl payload when 3D scanout is implemented. The display
-     * bridge currently transports CPU-owned 2D frames only.
-     */
+    enum vgpu_display_payload_kind kind;
+    union {
+        struct vgpu_display_cpu_payload cpu;
+        struct vgpu_display_gl_scanout_payload gl;
+    };
 };
 
 /* Runtime display commands published by the GPU backend and consumed by the

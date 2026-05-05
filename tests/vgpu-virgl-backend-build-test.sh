@@ -9,22 +9,160 @@ cleanup()
 {
     rm -rf "${TMP_DIR}"
     rm -f "${REPO_ROOT}/virtio-gpu-virgl.o" \
-        "${REPO_ROOT}/.virtio-gpu-virgl.o.d"
+        "${REPO_ROOT}/.virtio-gpu-virgl.o.d" \
+        "${REPO_ROOT}/window-sw.o" \
+        "${REPO_ROOT}/.window-sw.o.d"
 }
 trap cleanup EXIT
 
-mkdir -p "${TMP_DIR}/include" "${TMP_DIR}/lib"
+mkdir -p "${TMP_DIR}/include/epoxy" "${TMP_DIR}/lib"
 
 cp "${REPO_ROOT}/tests/fakes/virglrenderer.h" \
     "${TMP_DIR}/include/virglrenderer.h"
 
+cat >"${TMP_DIR}/include/epoxy/gl.h" <<'HEADER'
+#pragma once
+
+#include <stdint.h>
+
+typedef unsigned int GLenum;
+typedef unsigned int GLuint;
+typedef int GLint;
+typedef int GLsizei;
+typedef unsigned int GLbitfield;
+typedef float GLfloat;
+
+#define GL_READ_FRAMEBUFFER 0x8ca8
+#define GL_DRAW_FRAMEBUFFER 0x8ca9
+#define GL_FRAMEBUFFER_COMPLETE 0x8cd5
+#define GL_COLOR_ATTACHMENT0 0x8ce0
+#define GL_TEXTURE_2D 0x0de1
+#define GL_COLOR_BUFFER_BIT 0x00004000
+#define GL_LINEAR 0x2601
+
+void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers);
+void glGenFramebuffers(GLsizei n, GLuint *framebuffers);
+void glBindFramebuffer(GLenum target, GLuint framebuffer);
+void glFramebufferTexture2D(GLenum target,
+                            GLenum attachment,
+                            GLenum textarget,
+                            GLuint texture,
+                            GLint level);
+GLenum glCheckFramebufferStatus(GLenum target);
+void glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+void glClear(GLbitfield mask);
+void glBlitFramebuffer(GLint srcX0,
+                       GLint srcY0,
+                       GLint srcX1,
+                       GLint srcY1,
+                       GLint dstX0,
+                       GLint dstY0,
+                       GLint dstX1,
+                       GLint dstY1,
+                       GLbitfield mask,
+                       GLenum filter);
+HEADER
+
 cat >"${TMP_DIR}/virglrenderer-stub.c" <<'SOURCE'
+#include <epoxy/gl.h>
 #include "virglrenderer.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
+
+void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)
+{
+    (void) n;
+    (void) framebuffers;
+}
+
+void glGenFramebuffers(GLsizei n, GLuint *framebuffers)
+{
+    for (GLsizei i = 0; i < n; i++)
+        framebuffers[i] = (GLuint) (i + 1);
+}
+
+void glBindFramebuffer(GLenum target, GLuint framebuffer)
+{
+    (void) target;
+    (void) framebuffer;
+}
+
+void glFramebufferTexture2D(GLenum target,
+                            GLenum attachment,
+                            GLenum textarget,
+                            GLuint texture,
+                            GLint level)
+{
+    (void) target;
+    (void) attachment;
+    (void) textarget;
+    (void) texture;
+    (void) level;
+}
+
+GLenum glCheckFramebufferStatus(GLenum target)
+{
+    (void) target;
+    return GL_FRAMEBUFFER_COMPLETE;
+}
+
+void glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    (void) x;
+    (void) y;
+    (void) width;
+    (void) height;
+}
+
+void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
+{
+    (void) red;
+    (void) green;
+    (void) blue;
+    (void) alpha;
+}
+
+void glClear(GLbitfield mask)
+{
+    (void) mask;
+}
+
+void glBlitFramebuffer(GLint srcX0,
+                       GLint srcY0,
+                       GLint srcX1,
+                       GLint srcY1,
+                       GLint dstX0,
+                       GLint dstY0,
+                       GLint dstX1,
+                       GLint dstY1,
+                       GLbitfield mask,
+                       GLenum filter)
+{
+    (void) srcX0;
+    (void) srcY0;
+    (void) srcX1;
+    (void) srcY1;
+    (void) dstX0;
+    (void) dstY0;
+    (void) dstX1;
+    (void) dstY1;
+    (void) mask;
+    (void) filter;
+}
+
+int virgl_renderer_init(void *cookie,
+                        int flags,
+                        struct virgl_renderer_callbacks *cb)
+{
+    (void) cookie;
+    (void) flags;
+    (void) cb;
+    return 0;
+}
 
 void virgl_renderer_get_cap_set(uint32_t set,
                                 uint32_t *max_ver,
@@ -106,6 +244,17 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
     (void) res_handle;
 }
 
+int virgl_renderer_resource_get_info(int res_handle,
+                                     struct virgl_renderer_resource_info *info)
+{
+    (void) res_handle;
+    memset(info, 0, sizeof(*info));
+    info->width = 1024;
+    info->height = 768;
+    info->tex_id = 1;
+    return 0;
+}
+
 int virgl_renderer_resource_attach_iov(int res_handle,
                                        struct iovec *iov,
                                        int num_iovs)
@@ -176,6 +325,10 @@ int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
     (void) ndw;
     return 0;
 }
+
+void virgl_renderer_force_ctx_0(void)
+{
+}
 SOURCE
 
 "${CC:-cc}" -c "${TMP_DIR}/virglrenderer-stub.c" \
@@ -205,7 +358,9 @@ SCRIPT
 chmod +x "${fake_pkg_config}"
 
 rm -f "${REPO_ROOT}/virtio-gpu-virgl.o" \
-    "${REPO_ROOT}/.virtio-gpu-virgl.o.d"
+    "${REPO_ROOT}/.virtio-gpu-virgl.o.d" \
+    "${REPO_ROOT}/window-sw.o" \
+    "${REPO_ROOT}/.window-sw.o.d"
 make -s -C "${REPO_ROOT}" ENABLE_VIRGL=1 PKG_CONFIG="${fake_pkg_config}" semu
 strings -a "${REPO_ROOT}/semu" >"${TMP_DIR}/semu.strings"
 grep -q 'SEMU_VIRGL_BACKEND_LINKED' "${TMP_DIR}/semu.strings"

@@ -25,6 +25,8 @@
 #define VIRTIO_GPU_F_RESOURCE_BLOB (1U << 3)
 #define VIRTIO_GPU_F_CONTEXT_INIT (1U << 4)
 
+#define VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP (1U << 0)
+
 #define VIRTIO_GPU_CAPSET_VIRGL 1
 #define VIRTIO_GPU_CAPSET_VIRGL2 2
 #define VIRTIO_GPU_CAPSET_GFXSTREAM_VULKAN 3
@@ -345,6 +347,7 @@ typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
 typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 
 struct virtio_gpu_cmd_backend {
+    virtio_gpu_backend_lifecycle_func init;
     virtio_gpu_backend_lifecycle_func reset;
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
@@ -378,6 +381,7 @@ struct virtio_gpu_cmd_backend {
 };
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend;
+uint32_t virtio_gpu_backend_get_num_capsets(void);
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,

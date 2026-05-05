@@ -19,10 +19,11 @@ A minimalist RISC-V system emulator capable of running Linux the kernel and corr
             - For instance, the following buffer/period size settings on `aplay` has been tested
               with broken and stutter effects yet complete with no any errors: `aplay --buffer-size=32768 --period-size=4096 /usr/share/sounds/alsa/Front_Center.wav`.
     - virtio-input exposes SDL-backed keyboard and mouse devices to the guest.
-    - virtio-gpu exposes a minimal 2D DRM/KMS device to the guest. Linux can
-      bind the `virtio_gpu` driver and create `/dev/dri/card0`.
-      - Only 2D scanout is currently supported; 3D, virgl, and blob resources
-        are not implemented yet.
+    - virtio-gpu exposes a minimal DRM/KMS device to the guest. Linux can bind
+      the `virtio_gpu` driver and create `/dev/dri/card0`.
+      - The default build uses the 2D software scanout path. An experimental
+        VirGL 3D path is available behind `ENABLE_VIRGL=1`; blob resources and
+        Venus are not implemented yet.
     - Press Ctrl+Alt+G to release the mouse cursor from the SDL window.
 
 ## Prerequisites
@@ -50,6 +51,18 @@ For macOS, use the following command:
 ```shell
 $ brew install e2fsprogs
 ```
+
+The experimental virtio-gpu VirGL path is optional and disabled by default. On
+Debian/Ubuntu hosts, install the development packages below before building with
+`ENABLE_VIRGL=1`:
+
+```shell
+$ sudo apt update
+$ sudo apt install libvirglrenderer-dev libepoxy-dev
+$ pkg-config --exists virglrenderer epoxy gl egl
+```
+
+If these packages are missing, keep using the default `ENABLE_VIRGL=0` build.
 
 ## Build and Run
 

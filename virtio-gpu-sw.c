@@ -322,6 +322,7 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
         return NULL;
     }
 
+    payload->kind = VGPU_DISPLAY_PAYLOAD_CPU;
     payload->cpu.format = res_2d->format;
     payload->cpu.width = width;
     payload->cpu.height = height;
@@ -1248,7 +1249,15 @@ static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
 #define VGPU_SW_BACKEND_SYMBOL g_virtio_gpu_backend
 #endif
 
+#if !SEMU_HAS(VIRGL)
+uint32_t virtio_gpu_backend_get_num_capsets(void)
+{
+    return 0;
+}
+#endif
+
 const struct virtio_gpu_cmd_backend VGPU_SW_BACKEND_SYMBOL = {
+    .init = NULL,
     .reset = vgpu_sw_reset,
     .get_display_info = virtio_gpu_get_display_info_handler,
     .resource_create_2d = vgpu_sw_resource_create_2d_handler,

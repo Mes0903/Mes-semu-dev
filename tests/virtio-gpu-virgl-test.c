@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "../tests/fakes/virglrenderer.h"
+#include "../vgpu-display.h"
 #include "../virtio-gpu.h"
 
 #define TEST_RAM_SIZE 4096U
@@ -22,6 +23,11 @@
     } while (0)
 
 struct virgl_test_calls {
+    int renderer_init_count;
+    void *renderer_init_cookie;
+    int renderer_init_flags;
+    int renderer_init_callback_version;
+
     int reset_count;
 
     int context_create_count;
@@ -45,6 +51,9 @@ struct virgl_test_calls {
 
     int resource_unref_count;
     uint32_t resource_unref_handle;
+
+    int resource_get_info_count;
+    int resource_get_info_handle;
 
     int resource_attach_iov_count;
     int resource_attach_iov_handle;
@@ -82,24 +91,62 @@ struct virgl_test_calls {
     int submit_ndw;
     uint32_t submit_words[16];
 
+    int force_ctx_0_count;
+
     int undefined_count;
 };
 
 static uint8_t g_ram[TEST_RAM_SIZE];
+static virtio_gpu_data_t g_vgpu_data;
 static struct virgl_test_calls g_calls;
+static struct vgpu_display_payload *g_last_primary_payload;
+static uint32_t g_last_primary_scanout;
+static int g_publish_primary_set_count;
+static int g_publish_primary_clear_count;
 
 static void reset_fixture(void)
 {
     free(g_calls.attached_iov);
+    free(g_last_primary_payload);
     memset(g_ram, 0, sizeof(g_ram));
+    memset(&g_vgpu_data, 0, sizeof(g_vgpu_data));
     memset(&g_calls, 0, sizeof(g_calls));
+    g_last_primary_payload = NULL;
+    g_last_primary_scanout = 0;
+    g_publish_primary_set_count = 0;
+    g_publish_primary_clear_count = 0;
 }
 
 static virtio_gpu_state_t test_vgpu(void)
 {
     virtio_gpu_state_t vgpu = {0};
     vgpu.ram = (uint32_t *) g_ram;
+    vgpu.priv = &g_vgpu_data;
+    g_vgpu_data.num_scanouts = 1;
+    g_vgpu_data.scanouts[0].width = 1024;
+    g_vgpu_data.scanouts[0].height = 768;
+    g_vgpu_data.scanouts[0].enabled = 1;
     return vgpu;
+}
+
+bool vgpu_display_can_publish(void)
+{
+    return true;
+}
+
+void vgpu_display_publish_primary_set(uint32_t scanout_id,
+                                      struct vgpu_display_payload *payload)
+{
+    free(g_last_primary_payload);
+    g_last_primary_payload = payload;
+    g_last_primary_scanout = scanout_id;
+    g_publish_primary_set_count++;
+}
+
+void vgpu_display_publish_primary_clear(uint32_t scanout_id)
+{
+    (void) scanout_id;
+    g_publish_primary_clear_count++;
 }
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
@@ -230,6 +277,7 @@ void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
 }
 
 const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend = {
+    .init = NULL,
     .reset = NULL,
     .get_display_info = virtio_gpu_cmd_undefined_handler,
     .resource_create_2d = virtio_gpu_cmd_undefined_handler,
@@ -258,6 +306,39 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend = {
     .update_cursor = virtio_gpu_cmd_undefined_handler,
     .move_cursor = virtio_gpu_cmd_undefined_handler,
 };
+
+virgl_renderer_gl_context vgpu_window_virgl_create_context(
+    int scanout_idx,
+    struct virgl_renderer_gl_ctx_param *param)
+{
+    (void) scanout_idx;
+    (void) param;
+    return (void *) 0x1;
+}
+
+void vgpu_window_virgl_destroy_context(virgl_renderer_gl_context ctx)
+{
+    (void) ctx;
+}
+
+int vgpu_window_virgl_make_current(int scanout_idx,
+                                   virgl_renderer_gl_context ctx)
+{
+    (void) scanout_idx;
+    (void) ctx;
+    return 0;
+}
+
+int virgl_renderer_init(void *cookie,
+                        int flags,
+                        struct virgl_renderer_callbacks *cb)
+{
+    g_calls.renderer_init_count++;
+    g_calls.renderer_init_cookie = cookie;
+    g_calls.renderer_init_flags = flags;
+    g_calls.renderer_init_callback_version = cb ? cb->version : 0;
+    return 0;
+}
 
 void virgl_renderer_get_cap_set(uint32_t set,
                                 uint32_t *max_ver,
@@ -336,6 +417,20 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
 {
     g_calls.resource_unref_count++;
     g_calls.resource_unref_handle = res_handle;
+}
+
+int virgl_renderer_resource_get_info(int res_handle,
+                                     struct virgl_renderer_resource_info *info)
+{
+    g_calls.resource_get_info_count++;
+    g_calls.resource_get_info_handle = res_handle;
+    memset(info, 0, sizeof(*info));
+    info->handle = (uint32_t) res_handle;
+    info->width = 640;
+    info->height = 480;
+    info->flags = 1U;
+    info->tex_id = 1234;
+    return 0;
 }
 
 int virgl_renderer_resource_attach_iov(int res_handle,
@@ -419,6 +514,11 @@ int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
     g_calls.submit_ndw = ndw;
     memcpy(g_calls.submit_words, buffer, (size_t) ndw * sizeof(uint32_t));
     return 0;
+}
+
+void virgl_renderer_force_ctx_0(void)
+{
+    g_calls.force_ctx_0_count++;
 }
 
 #include "../virtio-gpu-virgl.c"
@@ -527,6 +627,30 @@ static int test_ctx_create_calls_renderer(void)
     CHECK(g_calls.undefined_count == 0);
     CHECK(plen == sizeof(struct virtio_gpu_ctrl_hdr));
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    return 0;
+}
+
+static int test_renderer_init_calls_virgl_renderer_init(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+
+    g_virtio_gpu_backend.init(&vgpu);
+
+    CHECK(g_calls.renderer_init_count == 1);
+    CHECK(g_calls.renderer_init_cookie == &vgpu);
+    CHECK(g_calls.renderer_init_flags == VIRGL_RENDERER_THREAD_SYNC);
+    CHECK(g_calls.renderer_init_callback_version ==
+          VIRGL_RENDERER_CALLBACKS_VERSION);
+
+    return 0;
+}
+
+static int test_backend_reports_available_capsets(void)
+{
+    reset_fixture();
+
+    CHECK(virtio_gpu_backend_get_num_capsets() == 2);
 
     return 0;
 }
@@ -859,6 +983,86 @@ static int test_transfer_to_host_2d_routes_by_resource_owner(void)
     return 0;
 }
 
+static int test_set_scanout_publishes_gl_payload_for_virgl_resource(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    CHECK(create_virgl_resource(&vgpu, 91) == 0);
+    memset(&g_calls, 0, sizeof(g_calls));
+
+    struct virtio_gpu_set_scanout request = {
+        .r = {.x = 4, .y = 5, .width = 320, .height = 200},
+        .scanout_id = 0,
+        .resource_id = 91,
+    };
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+
+    struct virtq_desc desc[3];
+    init_desc_no_payload(desc, sizeof(request));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.set_scanout(&vgpu, desc, &plen);
+
+    CHECK(g_calls.resource_get_info_count == 1);
+    CHECK(g_calls.resource_get_info_handle == 91);
+    CHECK(g_calls.force_ctx_0_count == 1);
+    CHECK(g_publish_primary_set_count == 1);
+    CHECK(g_last_primary_scanout == 0);
+    CHECK(g_last_primary_payload != NULL);
+    CHECK(g_last_primary_payload->kind == VGPU_DISPLAY_PAYLOAD_GL_SCANOUT);
+    CHECK(g_last_primary_payload->gl.texture_id == 1234);
+    CHECK(g_last_primary_payload->gl.width == 640);
+    CHECK(g_last_primary_payload->gl.height == 480);
+    CHECK(g_last_primary_payload->gl.src_x == 4);
+    CHECK(g_last_primary_payload->gl.src_y == 5);
+    CHECK(g_last_primary_payload->gl.src_w == 320);
+    CHECK(g_last_primary_payload->gl.src_h == 200);
+    CHECK(g_last_primary_payload->gl.y_0_top);
+    CHECK(g_vgpu_data.scanouts[0].primary_resource_id == 91);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    return 0;
+}
+
+static int test_resource_flush_republishes_bound_gl_payload(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    CHECK(create_virgl_resource(&vgpu, 92) == 0);
+
+    g_vgpu_data.scanouts[0].primary_resource_id = 92;
+    g_vgpu_data.scanouts[0].src_x = 7;
+    g_vgpu_data.scanouts[0].src_y = 8;
+    g_vgpu_data.scanouts[0].src_w = 300;
+    g_vgpu_data.scanouts[0].src_h = 180;
+    memset(&g_calls, 0, sizeof(g_calls));
+
+    struct virtio_gpu_res_flush request = {
+        .r = {.x = 0, .y = 0, .width = 300, .height = 180},
+        .resource_id = 92,
+    };
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+
+    struct virtq_desc desc[3];
+    init_desc_no_payload(desc, sizeof(request));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.resource_flush(&vgpu, desc, &plen);
+
+    CHECK(g_calls.resource_get_info_count == 1);
+    CHECK(g_calls.resource_get_info_handle == 92);
+    CHECK(g_calls.force_ctx_0_count == 1);
+    CHECK(g_publish_primary_set_count == 1);
+    CHECK(g_last_primary_payload != NULL);
+    CHECK(g_last_primary_payload->kind == VGPU_DISPLAY_PAYLOAD_GL_SCANOUT);
+    CHECK(g_last_primary_payload->gl.texture_id == 1234);
+    CHECK(g_last_primary_payload->gl.src_x == 7);
+    CHECK(g_last_primary_payload->gl.src_y == 8);
+    CHECK(g_last_primary_payload->gl.src_w == 300);
+    CHECK(g_last_primary_payload->gl.src_h == 180);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    return 0;
+}
+
 static int test_submit_3d_rejects_unaligned_size(void)
 {
     virtio_gpu_state_t vgpu = fresh_vgpu();
@@ -885,6 +1089,8 @@ static int test_submit_3d_rejects_unaligned_size(void)
 
 int main(void)
 {
+    CHECK(test_renderer_init_calls_virgl_renderer_init() == 0);
+    CHECK(test_backend_reports_available_capsets() == 0);
     CHECK(test_ctx_create_calls_renderer() == 0);
     CHECK(test_context_lifecycle_handlers_call_renderer() == 0);
     CHECK(test_ctx_create_rejects_context_init_until_feature_enabled() == 0);
@@ -892,6 +1098,8 @@ int main(void)
     CHECK(test_resource_backing_attach_detach_and_unref() == 0);
     CHECK(test_3d_transfers_call_renderer() == 0);
     CHECK(test_transfer_to_host_2d_routes_by_resource_owner() == 0);
+    CHECK(test_set_scanout_publishes_gl_payload_for_virgl_resource() == 0);
+    CHECK(test_resource_flush_republishes_bound_gl_payload() == 0);
     CHECK(test_submit_3d_copies_payload_to_renderer() == 0);
     CHECK(test_submit_3d_rejects_unaligned_size() == 0);
     return 0;
