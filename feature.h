@@ -37,5 +37,10 @@
 #define SEMU_FEATURE_VIRTIOGPU 1
 #endif
 
+/* virtio-gpu virglrenderer backend */
+#ifndef SEMU_FEATURE_VIRGL
+#define SEMU_FEATURE_VIRGL 0
+#endif
+
 /* Feature test macro */
 #define SEMU_HAS(x) SEMU_FEATURE_##x

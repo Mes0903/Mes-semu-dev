@@ -260,6 +260,13 @@ Build Buildroot and the test tools image with the DirectFB2 test payload. Add
 $ scripts/build-image.sh --x11 --directfb2-test
 ```
 
+Build the X11 test tools image with the Mesa VirGL gallium driver enabled for
+future virtio-gpu 3D smoke tests:
+
+```
+$ scripts/build-image.sh --virgl
+```
+
 To add a new test tool, extend the `test-tools.img` build path in
 `scripts/build-image.sh` so the tool is staged into `extra_packages`, then
 update `target/local-env.sh` if the tool needs an additional binary or library

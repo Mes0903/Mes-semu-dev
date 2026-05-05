@@ -79,15 +79,29 @@ function configure_buildroot
     local mode="${1:-default}"
     local buildroot_config="configs/buildroot.config"
     local x11_config="configs/x11.config"
+    local virgl_config="configs/virgl.config"
     local merge_tool="buildroot/support/kconfig/merge_config.sh"
 
-    if [[ "$mode" == "x11" ]]; then
-        echo "Preparing Buildroot config with X11 fragment..."
-        ASSERT "$merge_tool" -m -r -O buildroot "$buildroot_config" "$x11_config"
-    else
-        echo "Preparing default Buildroot config..."
-        cp -f "$buildroot_config" buildroot/.config
-    fi
+    case "$mode" in
+        x11)
+            echo "Preparing Buildroot config with X11 fragment..."
+            ASSERT "$merge_tool" -m -r -O buildroot "$buildroot_config" \
+                "$x11_config"
+            ;;
+        x11-virgl)
+            echo "Preparing Buildroot config with X11 and VirGL fragments..."
+            ASSERT "$merge_tool" -m -r -O buildroot "$buildroot_config" \
+                "$x11_config" "$virgl_config"
+            ;;
+        default)
+            echo "Preparing default Buildroot config..."
+            cp -f "$buildroot_config" buildroot/.config
+            ;;
+        *)
+            echo "Unknown Buildroot config mode: $mode"
+            exit 1
+            ;;
+    esac
 }
 
 function build_buildroot_rootfs
@@ -104,7 +118,7 @@ function build_buildroot_rootfs
     unset LD_LIBRARY_PATH
     pushd buildroot
     ASSERT make olddefconfig
-    if [[ "$mode" == "x11" && \
+    if [[ ( "$mode" == "x11" || "$mode" == "x11-virgl" ) && \
           ! -x output/host/bin/riscv32-buildroot-linux-gnu-g++ ]]; then
         echo "Rebuilding Buildroot final GCC with C++ support..."
         ASSERT make host-gcc-final-dirclean
@@ -141,7 +155,11 @@ function do_buildroot
 
         local test_tools_rootfs=./rootfs.cpio
         if [[ $BUILD_X11 -eq 1 ]]; then
-            build_buildroot_rootfs x11
+            local test_tools_mode=x11
+            if [[ $BUILD_VIRGL -eq 1 ]]; then
+                test_tools_mode=x11-virgl
+            fi
+            build_buildroot_rootfs "$test_tools_mode"
             test_tools_rootfs=./buildroot/output/images/rootfs.cpio
         fi
 
@@ -261,6 +279,7 @@ Options:
   --buildroot         Build Buildroot userland (produces rootfs.cpio and,
                       unless --no-ext4 is given, ext4.img for vda boot)
   --x11               Build test-tools.img from an X11-enabled rootfs
+  --virgl             Build test-tools.img from an X11 rootfs with Mesa VirGL
   --directfb2-test    Overlay the DirectFB2 test payload into test-tools.img
   --linux             Build the Linux kernel
   --all               Build both Buildroot and Linux
@@ -275,6 +294,7 @@ EOF
 
 BUILD_BUILDROOT=0
 BUILD_X11=0
+BUILD_VIRGL=0
 BUILD_DIRECTFB_TEST=0
 BUILD_LINUX=0
 NO_EXT4=0
@@ -288,6 +308,11 @@ while [[ $# -gt 0 ]]; do
         --x11)
             BUILD_BUILDROOT=1
             BUILD_X11=1
+            ;;
+        --virgl)
+            BUILD_BUILDROOT=1
+            BUILD_X11=1
+            BUILD_VIRGL=1
             ;;
         --directfb2-test)
             BUILD_BUILDROOT=1

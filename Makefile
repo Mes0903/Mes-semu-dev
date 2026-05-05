@@ -4,6 +4,7 @@ include mk/check-libs.mk
 CC ?= gcc
 CFLAGS := -O2 -g -Wall -Wextra
 CFLAGS += -include common.h
+PKG_CONFIG ?= pkg-config
 
 # clock frequency
 CLOCK_FREQ ?= 65000000
@@ -209,6 +210,23 @@ endif
 # virtio-gpu
 ENABLE_VIRTIOGPU ?= 1
 $(call set-feature, VIRTIOGPU)
+ENABLE_VIRGL ?= 0
+VIRGL_PKGS := virglrenderer epoxy gl egl
+VIRGL_CFLAGS :=
+VIRGL_LIBS :=
+$(call set-feature, VIRGL)
+ifeq ($(call has, VIRGL), 1)
+    ifneq ($(call has, VIRTIOGPU), 1)
+        $(error ENABLE_VIRGL=1 requires ENABLE_VIRTIOGPU=1)
+    endif
+    ifneq (0,$(shell $(PKG_CONFIG) --exists $(VIRGL_PKGS) >/dev/null 2>&1; echo $$?))
+        $(error ENABLE_VIRGL=1 requires pkg-config packages: $(VIRGL_PKGS))
+    endif
+    VIRGL_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(VIRGL_PKGS))
+    VIRGL_LIBS := $(shell $(PKG_CONFIG) --libs $(VIRGL_PKGS))
+    CFLAGS += $(VIRGL_CFLAGS)
+    LDFLAGS += $(VIRGL_LIBS)
+endif
 ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu-desc.o
     OBJS_EXTRA += virtio-gpu.o
@@ -374,6 +392,17 @@ test-vgpu-desc: $(VGPU_DESC_TEST)
 $(VGPU_DESC_TEST): tests/virtio-gpu-desc-test.o virtio-gpu-desc.o
 	$(VECHO) "  LD\t$@\n"
 	$(Q)$(CC) -o $@ $^
+
+.PHONY: test-vgpu-virgl-gate
+test-vgpu-virgl-gate:
+	$(Q)bash tests/vgpu-virgl-gate-test.sh
+
+.PHONY: print-vgpu-virgl-config
+print-vgpu-virgl-config:
+	@printf 'SEMU_FEATURE_VIRGL=%s\n' '$(call has, VIRGL)'
+	@printf 'VIRGL_PKGS=%s\n' '$(VIRGL_PKGS)'
+	@printf 'VIRGL_CFLAGS=%s\n' '$(VIRGL_CFLAGS)'
+	@printf 'VIRGL_LIBS=%s\n' '$(VIRGL_LIBS)'
 
 BUILD_IMAGE_ARGS ?= --all
 build-image:
