@@ -226,6 +226,31 @@ uint32_t virtio_gpu_write_ctrl_response(
     return sizeof(*response);
 }
 
+bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
+                                    const struct virtio_gpu_ctrl_hdr *request,
+                                    const struct virtq_desc *response_desc,
+                                    uint32_t response_type)
+{
+    (void) vgpu;
+    (void) request;
+    (void) response_desc;
+    (void) response_type;
+    return false;
+}
+
+void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
+                               bool context_fence,
+                               uint32_t ctx_id,
+                               uint32_t ring_idx,
+                               uint64_t fence_id)
+{
+    (void) vgpu;
+    (void) context_fence;
+    (void) ctx_id;
+    (void) ring_idx;
+    (void) fence_id;
+}
+
 enum virtio_gpu_desc_copy_result virtio_gpu_desc_copy_from_readable(
     virtio_gpu_state_t *vgpu,
     const struct virtq_desc *vq_desc,

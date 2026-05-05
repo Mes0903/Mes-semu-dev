@@ -42,8 +42,9 @@ static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
-    (void) cookie;
     g_vgpu_virgl_fences.last_ctx0_fence = fence;
+    if (cookie)
+        virtio_gpu_complete_fence(cookie, false, 0, 0, fence);
 }
 
 static void vgpu_virgl_write_context_fence(void *cookie,
@@ -51,10 +52,11 @@ static void vgpu_virgl_write_context_fence(void *cookie,
                                            uint32_t ring_idx,
                                            uint64_t fence_id)
 {
-    (void) cookie;
     g_vgpu_virgl_fences.last_context_ctx_id = ctx_id;
     g_vgpu_virgl_fences.last_context_ring_idx = ring_idx;
     g_vgpu_virgl_fences.last_context_fence = fence_id;
+    if (cookie)
+        virtio_gpu_complete_fence(cookie, true, ctx_id, ring_idx, fence_id);
 }
 
 static virgl_renderer_gl_context vgpu_virgl_create_context(
@@ -194,8 +196,7 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
                                       uint32_t type,
                                       uint32_t *plen)
 {
-    *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
-    if (*plen && type == VIRTIO_GPU_RESP_OK_NODATA &&
+    if (type == VIRTIO_GPU_RESP_OK_NODATA &&
         (request->flags & VIRTIO_GPU_FLAG_FENCE)) {
         int ret;
         if (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
@@ -213,10 +214,25 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
                     "%s(): failed to create renderer fence %" PRIu64
                     " for cmd 0x%x (%d)\n",
                     __func__, request->fence_id, request->type, ret);
+            *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc,
+                                                   VIRTIO_GPU_RESP_ERR_UNSPEC);
             return;
         }
-        virgl_renderer_poll();
+
+        if (virtio_gpu_defer_ctrl_response(vgpu, request, response_desc,
+                                           type)) {
+            *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
+            return;
+        }
+
+        *plen =
+            virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
+        if (*plen)
+            virgl_renderer_poll();
+        return;
     }
+
+    *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
 }
 
 static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(

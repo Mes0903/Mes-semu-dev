@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +132,146 @@ uint32_t virtio_gpu_write_ctrl_response(
     }
 
     return sizeof(*response);
+}
+
+static void virtio_gpu_push_used(virtio_gpu_state_t *vgpu,
+                                 uint8_t queue_index,
+                                 uint16_t buffer_idx,
+                                 uint32_t len)
+{
+    if (queue_index >= ARRAY_SIZE(vgpu->queues))
+        return;
+    if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+        return;
+
+    virtio_gpu_queue_t *queue = &vgpu->queues[queue_index];
+    if (!queue->ready || queue->QueueNum == 0)
+        return;
+
+    uint32_t *ram = vgpu->ram;
+    uint16_t used_idx =
+        ram[queue->QueueUsed] >> 16; /* 'virtq_used.idx' (le16) */
+    uint32_t vq_used_addr =
+        queue->QueueUsed + 1 + (used_idx % queue->QueueNum) * 2;
+    ram[vq_used_addr] = buffer_idx; /* 'virtq_used_elem.id'  (le32) */
+    ram[vq_used_addr + 1] = len;    /* 'virtq_used_elem.len' (le32) */
+    used_idx++;
+
+    /* Update 'virtq_used.idx' (keep 'virtq_used.flags' in low 16 bits). */
+    ram[queue->QueueUsed] &= MASK(16); /* clear high 16 bits (idx) */
+    ram[queue->QueueUsed] |= ((uint32_t) used_idx) << 16; /* set idx */
+
+    /* Send interrupt, unless 'VIRTQ_AVAIL_F_NO_INTERRUPT' is set. */
+    if (!(ram[queue->QueueAvail] & 1))
+        vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
+}
+
+static void virtio_gpu_clear_pending_fences(virtio_gpu_state_t *vgpu)
+{
+    if (!vgpu->priv)
+        return;
+
+    memset(PRIV(vgpu)->pending_fences, 0, sizeof(PRIV(vgpu)->pending_fences));
+    memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
+}
+
+bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
+                                    const struct virtio_gpu_ctrl_hdr *request,
+                                    const struct virtq_desc *response_desc,
+                                    uint32_t response_type)
+{
+    if (!request || !response_desc || !(request->flags & VIRTIO_GPU_FLAG_FENCE))
+        return false;
+    if (response_desc->len < sizeof(struct virtio_gpu_ctrl_hdr))
+        return false;
+    if (!PRIV(vgpu)->dispatch.active)
+        return false;
+
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_FENCES_MAX; i++) {
+        struct virtio_gpu_pending_fence *pending =
+            &PRIV(vgpu)->pending_fences[i];
+        if (pending->active)
+            continue;
+
+        *pending = (struct virtio_gpu_pending_fence) {
+            .active = true,
+            .queue_index = PRIV(vgpu)->dispatch.queue_index,
+            .buffer_idx = PRIV(vgpu)->dispatch.buffer_idx,
+            .response_desc = *response_desc,
+            .response_type = response_type,
+            .request_type = request->type,
+            .request_flags = request->flags,
+            .fence_id = request->fence_id,
+            .ctx_id = request->ctx_id,
+            .ring_idx = request->ring_idx,
+        };
+        return true;
+    }
+
+    fprintf(stderr,
+            VIRTIO_GPU_LOG_PREFIX
+            "%s(): no free pending fence slot for fence %" PRIu64 "\n",
+            __func__, request->fence_id);
+    return false;
+}
+
+static bool virtio_gpu_pending_fence_matches(
+    const struct virtio_gpu_pending_fence *pending,
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx,
+    uint64_t fence_id)
+{
+    bool pending_context =
+        (pending->request_flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
+    if (pending_context != context_fence)
+        return false;
+    if (pending->fence_id > fence_id)
+        return false;
+    if (!context_fence)
+        return true;
+
+    return pending->ctx_id == ctx_id && pending->ring_idx == ring_idx;
+}
+
+void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
+                               bool context_fence,
+                               uint32_t ctx_id,
+                               uint32_t ring_idx,
+                               uint64_t fence_id)
+{
+    if (!vgpu->priv)
+        return;
+    if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+        return;
+
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_FENCES_MAX; i++) {
+        struct virtio_gpu_pending_fence *pending =
+            &PRIV(vgpu)->pending_fences[i];
+        if (!pending->active ||
+            !virtio_gpu_pending_fence_matches(pending, context_fence, ctx_id,
+                                              ring_idx, fence_id))
+            continue;
+
+        struct virtio_gpu_pending_fence done = *pending;
+        memset(pending, 0, sizeof(*pending));
+
+        struct virtio_gpu_ctrl_hdr request = {
+            .type = done.request_type,
+            .flags = done.request_flags,
+            .fence_id = done.fence_id,
+            .ctx_id = done.ctx_id,
+            .ring_idx = done.ring_idx,
+        };
+        uint32_t len = virtio_gpu_write_ctrl_response(
+            vgpu, &request, &done.response_desc, done.response_type);
+        if (!len) {
+            virtio_gpu_set_fail(vgpu);
+            continue;
+        }
+
+        virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
+    }
 }
 
 /* 'virtio_gpu' protocol handlers */
@@ -741,8 +882,6 @@ static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
         return;
 
     /* Process them */
-    uint16_t new_used =
-        ram[queue->QueueUsed] >> 16; /* 'virtq_used.idx' (le16) */
     while (queue->last_avail != new_avail) {
         /* Obtain the index in the ring buffer */
         uint16_t queue_idx = queue->last_avail % queue->QueueNum;
@@ -760,29 +899,23 @@ static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
          * descriptor list.
          */
         uint32_t len = 0;
+        PRIV(vgpu)->dispatch = (struct virtio_gpu_dispatch_state) {
+            .active = true,
+            .queue_index = (uint8_t) index,
+            .buffer_idx = buffer_idx,
+        };
         int result =
             virtio_gpu_desc_handler(vgpu, queue, index, buffer_idx, &len);
+        memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
         if (result != 0)
             return;
 
-        /* Write used element information ('struct virtq_used_elem') to the used
-         * queue
-         */
-        uint32_t vq_used_addr =
-            queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram[vq_used_addr] = buffer_idx; /* 'virtq_used_elem.id'  (le32) */
-        ram[vq_used_addr + 1] = len;    /* 'virtq_used_elem.len' (le32) */
         queue->last_avail++;
-        new_used++;
+        if (len == VIRTIO_GPU_RESPONSE_DEFERRED)
+            continue;
+
+        virtio_gpu_push_used(vgpu, (uint8_t) index, buffer_idx, len);
     }
-
-    /* Update 'virtq_used.idx' (keep 'virtq_used.flags' in low 16 bits). */
-    ram[queue->QueueUsed] &= MASK(16); /* clear high 16 bits (idx) */
-    ram[queue->QueueUsed] |= ((uint32_t) new_used) << 16; /* set idx */
-
-    /* Send interrupt, unless 'VIRTQ_AVAIL_F_NO_INTERRUPT' is set. */
-    if (!(ram[queue->QueueAvail] & 1))
-        vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
 }
 
 static inline uint32_t virtio_gpu_preprocess(virtio_gpu_state_t *vgpu,
@@ -799,6 +932,8 @@ static void virtio_gpu_update_status(virtio_gpu_state_t *vgpu, uint32_t status)
     vgpu->Status |= status;
     if (status)
         return;
+
+    virtio_gpu_clear_pending_fences(vgpu);
 
     if (g_virtio_gpu_backend.reset)
         g_virtio_gpu_backend.reset(vgpu);
