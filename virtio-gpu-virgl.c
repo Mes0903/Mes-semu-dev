@@ -114,17 +114,22 @@ static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
 {
     memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
+    /* Clear display generations before virglrenderer destroys GL resources.
+     * This makes any queued GL scanout payload stale while the texture IDs it
+     * names are still valid.
+     */
+    if (g_virtio_gpu_sw_backend.reset)
+        g_virtio_gpu_sw_backend.reset(vgpu);
+
     virgl_renderer_reset();
     /* The renderer destroys all contexts/resources on reset. Mirror that in
-     * semu's ownership registry before resetting the software scanout path.
+     * semu's ownership registry after the renderer reset completes.
      */
     while (g_vgpu_virgl_resources) {
         struct vgpu_virgl_resource *res = g_vgpu_virgl_resources;
         g_vgpu_virgl_resources = res->next;
         free(res);
     }
-    if (g_virtio_gpu_sw_backend.reset)
-        g_virtio_gpu_sw_backend.reset(vgpu);
 }
 
 #define VGPU_VIRGL_DELEGATE_CMD(name)                                         \
@@ -173,6 +178,23 @@ static void vgpu_virgl_remove_resource(uint32_t resource_id)
             return;
         }
         cursor = &res->next;
+    }
+}
+
+static void vgpu_virgl_clear_resource_scanouts(virtio_gpu_state_t *vgpu,
+                                               uint32_t resource_id)
+{
+    for (uint32_t i = 0; i < PRIV(vgpu)->num_scanouts; i++) {
+        struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[i];
+        if (!scanout->enabled || scanout->primary_resource_id != resource_id)
+            continue;
+
+        scanout->primary_resource_id = 0;
+        scanout->src_x = 0;
+        scanout->src_y = 0;
+        scanout->src_w = 0;
+        scanout->src_h = 0;
+        vgpu_display_publish_primary_clear(i);
     }
 }
 
@@ -463,6 +485,7 @@ static void vgpu_virgl_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
     if (!response_desc)
         return;
 
+    vgpu_virgl_clear_resource_scanouts(vgpu, request->resource_id);
     if (res->backing_attached)
         vgpu_virgl_detach_iov(request->resource_id);
     virgl_renderer_resource_unref(request->resource_id);
