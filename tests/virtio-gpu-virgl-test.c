@@ -603,9 +603,10 @@ static struct virtio_gpu_ctrl_hdr *response_hdr(void)
     return (struct virtio_gpu_ctrl_hdr *) &g_ram[RESP_ADDR];
 }
 
-static void init_desc_no_payload(struct virtq_desc desc[3], size_t request_size)
+static void init_desc_no_payload(struct virtq_desc desc[VIRTIO_GPU_MAX_DESC],
+                                 size_t request_size)
 {
-    memset(desc, 0, sizeof(struct virtq_desc) * 3);
+    memset(desc, 0, sizeof(struct virtq_desc) * VIRTIO_GPU_MAX_DESC);
     desc[0] = (struct virtq_desc) {
         .addr = REQ_ADDR,
         .len = (uint32_t) request_size,
@@ -618,11 +619,11 @@ static void init_desc_no_payload(struct virtq_desc desc[3], size_t request_size)
     };
 }
 
-static void init_desc_with_payload(struct virtq_desc desc[3],
+static void init_desc_with_payload(struct virtq_desc desc[VIRTIO_GPU_MAX_DESC],
                                    size_t request_size,
                                    size_t payload_size)
 {
-    memset(desc, 0, sizeof(struct virtq_desc) * 3);
+    memset(desc, 0, sizeof(struct virtq_desc) * VIRTIO_GPU_MAX_DESC);
     desc[0] = (struct virtq_desc) {
         .addr = REQ_ADDR,
         .len = (uint32_t) request_size,
@@ -657,7 +658,7 @@ static int create_virgl_resource(virtio_gpu_state_t *vgpu, uint32_t resource_id)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -678,7 +679,7 @@ static int test_ctx_create_calls_renderer(void)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -741,7 +742,7 @@ static int test_submit_3d_copies_payload_to_renderer(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(commands));
     uint32_t plen = 0;
 
@@ -769,7 +770,7 @@ static int test_fenced_submit_creates_renderer_fence_from_request_flags(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(commands));
     uint32_t plen = 0;
 
@@ -800,7 +801,7 @@ static int test_descriptor_write_flag_does_not_create_renderer_fence(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(commands));
     uint32_t plen = 0;
 
@@ -831,7 +832,7 @@ static int test_ring_idx_fence_uses_context_fence_api(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(commands));
     uint32_t plen = 0;
 
@@ -883,7 +884,7 @@ static int test_context_lifecycle_handlers_call_renderer(void)
         .hdr = {.ctx_id = 11},
     };
     memcpy(&g_ram[REQ_ADDR], &destroy, sizeof(destroy));
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(destroy));
     uint32_t plen = 0;
 
@@ -936,7 +937,7 @@ static int test_ctx_create_rejects_context_init_until_feature_enabled(void)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -967,7 +968,7 @@ static int test_resource_create_3d_calls_renderer(void)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -1008,7 +1009,7 @@ static int test_resource_backing_attach_detach_and_unref(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], entries, sizeof(entries));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(entries));
     uint32_t plen = 0;
 
@@ -1071,7 +1072,7 @@ static int test_3d_transfers_call_renderer(void)
         .layer_stride = 4096,
     };
     memcpy(&g_ram[REQ_ADDR], &to_host, sizeof(to_host));
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(to_host));
     uint32_t plen = 0;
 
@@ -1140,7 +1141,7 @@ static int test_transfer_to_host_2d_routes_by_resource_owner(void)
         .resource_id = 81,
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -1188,7 +1189,7 @@ static int test_set_scanout_publishes_gl_payload_for_virgl_resource(void)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -1233,7 +1234,7 @@ static int test_resource_flush_republishes_bound_gl_payload(void)
     };
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_no_payload(desc, sizeof(request));
     uint32_t plen = 0;
 
@@ -1266,7 +1267,7 @@ static int test_submit_3d_rejects_unaligned_size(void)
     memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
     memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
 
-    struct virtq_desc desc[3];
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
     init_desc_with_payload(desc, sizeof(request), sizeof(commands));
     uint32_t plen = 0;
 

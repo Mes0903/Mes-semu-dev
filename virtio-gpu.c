@@ -21,7 +21,6 @@
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
 
-#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 #define VIRTIO_GPU_QUEUE (vgpu->queues[vgpu->QueueSel])
 #define VIRTIO_GPU_CONTROLQ 0
 #define VIRTIO_GPU_CURSORQ 1
@@ -87,14 +86,11 @@ int virtio_gpu_get_response_desc(struct virtq_desc *vq_desc,
     if (response_size > UINT32_MAX)
         return -1;
 
-    /* This helper works with the current fixed-shape descriptor parser:
-     * 'vq_desc[0]' is the request, optional command data follows, and the
-     * first writable descriptor is the response buffer. A writable descriptor
-     * that is too small therefore means the expected response buffer is
-     * malformed; this helper does not skip it and search for a later writable
-     * descriptor.
-     *
-     * TODO: Support generic descriptor-chain parsing.
+    /* 'vq_desc[0]' is the request, optional readable command data follows, and
+     * the first writable descriptor is the response buffer. A writable
+     * descriptor that is too small therefore means the expected response buffer
+     * is malformed; this helper does not skip it and search for a later
+     * writable descriptor.
      */
     for (int i = 1; i < max_desc; i++) {
         if (!(vq_desc[i].flags & VIRTIO_DESC_F_WRITE))
@@ -784,10 +780,9 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         return -1;
     }
 
-    /* Keep the fixed 3-descriptor contract explicit. Longer chains need
-     * multi-SG parsing, so reject them before command dispatch.
-     *
-     * TODO: Support generic descriptor-chain parsing.
+    /* A valid chain cannot contain more entries than the virtqueue. If the
+     * parser cap is reached and NEXT is still set, the chain is either
+     * malformed or cyclic, so reject it before command dispatch.
      */
     if (vq_desc[VIRTIO_GPU_MAX_DESC - 1].flags & VIRTIO_DESC_F_NEXT) {
         int resp_idx = virtio_gpu_get_response_desc(

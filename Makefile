@@ -392,6 +392,7 @@ check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_
 VGPU_DESC_TEST := tests/virtio-gpu-desc-test
 VGPU_VIRGL_TEST := tests/virtio-gpu-virgl-test
 VGPU_FENCE_TEST := tests/virtio-gpu-fence-test
+VGPU_CHAIN_TEST := tests/virtio-gpu-chain-test
 .PHONY: test-vgpu-desc
 test-vgpu-desc: $(VGPU_DESC_TEST)
 	$(Q)./$<
@@ -414,6 +415,15 @@ test-vgpu-fence: $(VGPU_FENCE_TEST)
 	$(Q)./$<
 
 $(VGPU_FENCE_TEST): tests/virtio-gpu-fence-test.c virtio-gpu.c virtio-gpu.h
+	$(VECHO) "  CC\t$@\n"
+	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
+	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $<
+
+.PHONY: test-vgpu-chain
+test-vgpu-chain: $(VGPU_CHAIN_TEST)
+	$(Q)./$<
+
+$(VGPU_CHAIN_TEST): tests/virtio-gpu-chain-test.c virtio-gpu.c virtio-gpu-desc.c virtio-gpu.h
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
 	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $<
@@ -442,6 +452,7 @@ clean:
 	$(Q)$(RM) $(VGPU_DESC_TEST) tests/virtio-gpu-desc-test.o $(test_deps)
 	$(Q)$(RM) $(VGPU_VIRGL_TEST)
 	$(Q)$(RM) $(VGPU_FENCE_TEST)
+	$(Q)$(RM) $(VGPU_CHAIN_TEST)
 	$(Q)$(MAKE) -C mini-gdbstub clean
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \

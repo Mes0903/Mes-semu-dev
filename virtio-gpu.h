@@ -18,6 +18,7 @@
 #define VIRTIO_GPU_PENDING_FENCES_MAX 256
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 #define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
+#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
 /* Feature masks exposed in DeviceFeaturesSel 0. Linux UAPI names these as bit
  * numbers; semu stores the selected 32-bit feature word, so keep masks here.
@@ -37,29 +38,13 @@
 #define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
 #define VIRTIO_GPU_CAPSET_DRM 6
 
-/* Maximum descriptor chain length accepted by 'virtio_gpu_desc_handler()'.
- *
- * semu follows the common Linux virtio-gpu control queue shape in
- * 'virtio_gpu_queue_fenced_ctrl_buffer()': 'sgs[3]' holds 'vcmd' (request),
- * optional 'vout' (command data, e.g. 'RESOURCE_ATTACH_BACKING' entries), and
- * optional 'vresp' (response). The supported commands therefore fit in "request
- * + one data segment + response".
- *
- * This is not a general virtio-gpu descriptor-chain limit. Linux allocates the
- * backing-entry array in 'virtio_gpu_object_shmem_init()' with
- * 'kvmalloc_objs()'. If that buffer falls back to 'vmalloc',
- * 'virtio_gpu_queue_fenced_ctrl_buffer()' detects it with 'is_vmalloc_addr()'
- * and 'vmalloc_to_sgt()' expands 'vout' into multiple scatter-gather entries.
- *
- * Supporting that path would require accepting a longer descriptor chain and
- * auditing every handler that indexes 'vq_desc[]'. Longer chains are rejected.
- * The current response-descriptor lookup is also part of this fixed-shape
- * parser: it scans the zero-initialized 3-entry array, not an arbitrary
- * guest-provided scatter-gather chain.
- *
- * TODO: Support generic descriptor-chain parsing.
+/* Maximum descriptor-chain entries collected from a virtio-gpu queue.
+ * A valid chain cannot contain more entries than the queue itself, so use the
+ * queue maximum as the parser cap. Descriptor 0 is the fixed request; any
+ * following device-readable descriptors form the command payload byte stream;
+ * the first writable descriptor is the response buffer.
  */
-#define VIRTIO_GPU_MAX_DESC 3
+#define VIRTIO_GPU_MAX_DESC VIRTIO_GPU_QUEUE_NUM_MAX
 
 /* Core per-scanout metadata keyed by the guest-visible 'scanout_id'. This
  * combines guest-visible display info ('width'/'height'/'enabled') with the
