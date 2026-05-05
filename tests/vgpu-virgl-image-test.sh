@@ -28,6 +28,16 @@ require_literal()
         fail "${path} does not contain: ${needle}"
 }
 
+reject_literal()
+{
+    local needle="$1"
+    local path="$2"
+
+    if grep -Fq -- "${needle}" "${path}"; then
+        fail "${path} unexpectedly contains: ${needle}"
+    fi
+}
+
 require_help_literal()
 {
     local needle="$1"
@@ -61,6 +71,9 @@ require_literal 'virtio_gpu_dri.so' README.md
 require_literal 'glamoregl' README.md
 require_literal 'glxinfo -B' README.md
 require_literal 'glxgears' README.md
+require_literal 'profile changes' README.md
+require_literal 'buildroot/output/target' README.md
+reject_literal 'buildroot-output/' README.md
 
 require_file .ci/test-virgl.sh
 require_literal 'ENABLE_VIRGL=1' .ci/test-virgl.sh
@@ -90,6 +103,25 @@ require_literal 'xserver_xorg-server-dirclean' scripts/build-image.sh
 require_literal 'libglamoregl.so' scripts/build-image.sh
 require_literal 'stage_virgl_smoke_marker' scripts/build-image.sh
 require_literal 'semu-test-tools-virgl' scripts/build-image.sh
+require_literal 'detect_buildroot_profile_from_config' scripts/build-image.sh
+require_literal 'clean_buildroot_target_on_profile_switch "$mode"' \
+    scripts/build-image.sh
+require_literal 'rm -rf buildroot/output/target buildroot/output/images' \
+    scripts/build-image.sh
+require_literal "find buildroot/output/build -name '.stamp_target_installed' -delete" \
+    scripts/build-image.sh
+require_literal 'record_buildroot_profile "$mode"' scripts/build-image.sh
+reject_literal 'BUILDROOT_OUTPUT_BASE' scripts/build-image.sh
+reject_literal 'buildroot-output' scripts/build-image.sh
+require_literal 'cp -f buildroot/output/images/rootfs.cpio ./rootfs.cpio' \
+    scripts/build-image.sh
+require_literal 'test_tools_rootfs=./buildroot/output/images/rootfs.cpio' \
+    scripts/build-image.sh
+require_literal 'export PATH="$PWD/buildroot/output/host/bin:$PATH"' \
+    scripts/build-image.sh
+require_literal 'stage_cxx_runtime' scripts/build-image.sh
+require_literal 'do_extra_packages' scripts/build-image.sh
+reject_literal 'buildroot-output/' .gitignore
 require_literal 'configs/virgl.config' mk/external.mk
 require_literal 'configs/virgl.config' .github/workflows/prebuilt.yml
 require_literal './scripts/build-image.sh --all --virgl --directfb2-test' \

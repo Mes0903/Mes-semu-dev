@@ -94,6 +94,7 @@ static struct virgl_renderer_callbacks g_vgpu_virgl_callbacks = {
 
 static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
 {
+    vgpu_gl_lock();
     int ret = virgl_renderer_init(vgpu, VIRGL_RENDERER_THREAD_SYNC,
                                   &g_vgpu_virgl_callbacks);
     if (ret) {
@@ -101,18 +102,50 @@ static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): failed to initialize virglrenderer (%d)\n",
                 __func__, ret);
+        vgpu_gl_unlock();
         exit(EXIT_FAILURE);
     }
+
+    /* virglrenderer initializes ctx0 on the caller's thread, but semu runs
+     * guest GPU commands on the emulator thread once the SDL main loop starts.
+     * Drop the init-thread current context; thread_enter will rebind ctx0 on
+     * the thread that actually executes virglrenderer commands.
+     */
+    vgpu_window_virgl_make_current(0, NULL);
+    vgpu_gl_unlock();
+}
+
+static void vgpu_virgl_thread_enter(virtio_gpu_state_t *vgpu)
+{
+    (void) vgpu;
+    vgpu_gl_lock();
+    virgl_renderer_force_ctx_0();
+    vgpu_gl_unlock();
+}
+
+static void vgpu_virgl_command_enter(virtio_gpu_state_t *vgpu)
+{
+    (void) vgpu;
+    vgpu_gl_lock();
+}
+
+static void vgpu_virgl_command_leave(virtio_gpu_state_t *vgpu)
+{
+    (void) vgpu;
+    vgpu_gl_unlock();
 }
 
 static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
 {
     (void) vgpu;
+    vgpu_gl_lock();
     virgl_renderer_poll();
+    vgpu_gl_unlock();
 }
 
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
 {
+    vgpu_gl_lock();
     memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
     /* Clear display generations before virglrenderer destroys GL resources.
      * This makes any queued GL scanout payload stale while the texture IDs it
@@ -120,7 +153,6 @@ static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
      */
     if (g_virtio_gpu_sw_backend.reset)
         g_virtio_gpu_sw_backend.reset(vgpu);
-
     virgl_renderer_reset();
     /* The renderer destroys all contexts/resources on reset. Mirror that in
      * semu's ownership registry after the renderer reset completes.
@@ -130,6 +162,7 @@ static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
         g_vgpu_virgl_resources = res->next;
         free(res);
     }
+    vgpu_gl_unlock();
 }
 
 #define VGPU_VIRGL_DELEGATE_CMD(name)                                         \
@@ -249,8 +282,9 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
 
         *plen =
             virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
-        if (*plen)
+        if (*plen) {
             virgl_renderer_poll();
+        }
         return;
     }
 
@@ -287,7 +321,6 @@ static int vgpu_virgl_detach_iov(uint32_t resource_id)
 {
     struct iovec *iov = NULL;
     int num_iovs = 0;
-
     virgl_renderer_resource_detach_iov(resource_id, &iov, &num_iovs);
     free(iov);
     return num_iovs;
@@ -321,7 +354,6 @@ static void vgpu_virgl_cmd_ctx_create_handler(virtio_gpu_state_t *vgpu,
                                   VIRTIO_GPU_RESP_ERR_UNSPEC, plen);
         return;
     }
-
     int ret = virgl_renderer_context_create(request->hdr.ctx_id, request->nlen,
                                             request->debug_name);
     vgpu_virgl_write_response(
@@ -345,7 +377,6 @@ static void vgpu_virgl_cmd_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
-
     virgl_renderer_context_destroy(request->hdr.ctx_id);
     vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
                               VIRTIO_GPU_RESP_OK_NODATA, plen);
@@ -368,7 +399,6 @@ static void vgpu_virgl_cmd_ctx_attach_resource_handler(
         *plen = 0;
         return;
     }
-
     virgl_renderer_ctx_attach_resource(request->hdr.ctx_id,
                                        request->resource_id);
     vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
@@ -392,7 +422,6 @@ static void vgpu_virgl_cmd_ctx_detach_resource_handler(
         *plen = 0;
         return;
     }
-
     virgl_renderer_ctx_detach_resource(request->hdr.ctx_id,
                                        request->resource_id);
     vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
@@ -446,7 +475,6 @@ static void vgpu_virgl_cmd_resource_create_3d_handler(
         .nr_samples = request->nr_samples,
         .flags = request->flags,
     };
-
     int ret = virgl_renderer_resource_create(&args, NULL, 0);
     if (ret) {
         free(res);
@@ -620,7 +648,6 @@ static void vgpu_virgl_cmd_resource_attach_backing_handler(
             return;
         }
     }
-
     int ret = virgl_renderer_resource_attach_iov(request->resource_id, iov,
                                                  (int) nr_entries);
     if (ret) {
@@ -844,7 +871,6 @@ static bool vgpu_virgl_publish_gl_scanout(
         vgpu_virgl_create_gl_payload(resource_id, scanout, &info);
     if (!payload)
         return false;
-
     virgl_renderer_force_ctx_0();
     vgpu_display_publish_primary_set(scanout_id, payload);
     return true;
@@ -1017,7 +1043,6 @@ static void vgpu_virgl_cmd_submit_3d_handler(virtio_gpu_state_t *vgpu,
         }
         return;
     }
-
     int ret = virgl_renderer_submit_cmd(
         buffer, request->hdr.ctx_id, (int) (request->size / sizeof(uint32_t)));
     free(buffer);
@@ -1182,6 +1207,9 @@ static void vgpu_virgl_cmd_get_capset_handler(virtio_gpu_state_t *vgpu,
 
 const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .init = vgpu_virgl_init,
+    .thread_enter = vgpu_virgl_thread_enter,
+    .command_enter = vgpu_virgl_command_enter,
+    .command_leave = vgpu_virgl_command_leave,
     .poll = vgpu_virgl_poll,
     .reset = vgpu_virgl_delegate_reset,
     .get_display_info = vgpu_virgl_delegate_get_display_info,

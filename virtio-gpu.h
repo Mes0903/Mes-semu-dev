@@ -358,6 +358,9 @@ typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func init;
+    virtio_gpu_backend_lifecycle_func thread_enter;
+    virtio_gpu_backend_lifecycle_func command_enter;
+    virtio_gpu_backend_lifecycle_func command_leave;
     virtio_gpu_backend_lifecycle_func poll;
     virtio_gpu_backend_lifecycle_func reset;
     /* 2D commands */
@@ -393,6 +396,7 @@ struct virtio_gpu_cmd_backend {
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend;
 uint32_t virtio_gpu_backend_get_num_capsets(void);
+void virtio_gpu_thread_enter(virtio_gpu_state_t *vgpu);
 void virtio_gpu_poll(virtio_gpu_state_t *vgpu);
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,

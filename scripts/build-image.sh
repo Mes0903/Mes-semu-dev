@@ -104,10 +104,70 @@ function configure_buildroot
     esac
 }
 
+function detect_buildroot_profile_from_config
+{
+    local config="$1"
+
+    if [ ! -f "$config" ]; then
+        return 1
+    fi
+
+    if grep -Eq '^BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y$' "$config"; then
+        printf 'x11-virgl\n'
+    elif grep -Eq \
+        '^BR2_PACKAGE_XORG7=y$|^BR2_PACKAGE_XSERVER_XORG_SERVER=y$' \
+        "$config"; then
+        printf 'x11\n'
+    else
+        printf 'default\n'
+    fi
+}
+
+function current_buildroot_profile
+{
+    if [ -f buildroot/output/.semu-profile ]; then
+        sed -n '1p' buildroot/output/.semu-profile
+    elif [ -f buildroot/.config ]; then
+        detect_buildroot_profile_from_config buildroot/.config
+    else
+        return 1
+    fi
+}
+
+function clean_buildroot_target_on_profile_switch
+{
+    local next_profile="$1"
+    local current_profile
+
+    current_profile="$(current_buildroot_profile || true)"
+    if [ -z "$current_profile" ] || [ "$current_profile" = "$next_profile" ]; then
+        return
+    fi
+    if [ ! -d buildroot/output ]; then
+        return
+    fi
+
+    echo "Buildroot profile changed: $current_profile -> $next_profile"
+    echo "Cleaning target rootfs output while preserving source, host tools, and downloads..."
+    rm -rf buildroot/output/target buildroot/output/images
+    if [ -d buildroot/output/build ]; then
+        find buildroot/output/build -name '.stamp_target_installed' -delete
+    fi
+}
+
+function record_buildroot_profile
+{
+    local mode="$1"
+
+    mkdir -p buildroot/output
+    printf '%s\n' "$mode" > buildroot/output/.semu-profile
+}
+
 function build_buildroot_rootfs
 {
     local mode="${1:-default}"
 
+    clean_buildroot_target_on_profile_switch "$mode"
     configure_buildroot "$mode"
     safe_copy configs/busybox.config buildroot/busybox.config
     cp -f target/init buildroot/fs/cpio/init
@@ -137,6 +197,7 @@ function build_buildroot_rootfs
     fi
     ASSERT make $PARALLEL
     popd
+    record_buildroot_profile "$mode"
 
     if [[ "$mode" == "x11-virgl" &&
           ! -e buildroot/output/target/usr/lib/dri/virtio_gpu_dri.so ]]; then

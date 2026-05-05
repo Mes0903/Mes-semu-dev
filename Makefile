@@ -390,6 +390,7 @@ check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_
 	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -H $(INITRD_OPT) $(if $(NETDEV),-n $(NETDEV)) $(OPTS)
 
 VGPU_DESC_TEST := tests/virtio-gpu-desc-test
+VGPU_DISPLAY_TEST := tests/vgpu-display-test
 VGPU_VIRGL_TEST := tests/virtio-gpu-virgl-test
 VGPU_FENCE_TEST := tests/virtio-gpu-fence-test
 VGPU_CHAIN_TEST := tests/virtio-gpu-chain-test
@@ -400,6 +401,15 @@ test-vgpu-desc: $(VGPU_DESC_TEST)
 $(VGPU_DESC_TEST): tests/virtio-gpu-desc-test.o virtio-gpu-desc.o
 	$(VECHO) "  LD\t$@\n"
 	$(Q)$(CC) -o $@ $^
+
+.PHONY: test-vgpu-display
+test-vgpu-display: $(VGPU_DISPLAY_TEST)
+	$(Q)./$<
+
+$(VGPU_DISPLAY_TEST): tests/vgpu-display-test.c vgpu-display.c vgpu-display.h virtio-gpu.h
+	$(VECHO) "  CC\t$@\n"
+	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
+	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $< vgpu-display.c
 
 .PHONY: test-vgpu-virgl
 test-vgpu-virgl: $(VGPU_VIRGL_TEST)
@@ -444,6 +454,10 @@ test-vgpu-virgl-init-order:
 test-vgpu-virgl-backend-build:
 	$(Q)bash tests/vgpu-virgl-backend-build-test.sh
 
+.PHONY: test-vinput-event-coalesce
+test-vinput-event-coalesce:
+	$(Q)bash tests/vinput-event-coalesce-test.sh
+
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
 	@printf 'SEMU_FEATURE_VIRGL=%s\n' '$(call has, VIRGL)'
@@ -458,6 +472,7 @@ build-image:
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
 	$(Q)$(RM) $(VGPU_DESC_TEST) tests/virtio-gpu-desc-test.o $(test_deps)
+	$(Q)$(RM) $(VGPU_DISPLAY_TEST)
 	$(Q)$(RM) $(VGPU_VIRGL_TEST)
 	$(Q)$(RM) $(VGPU_FENCE_TEST)
 	$(Q)$(RM) $(VGPU_CHAIN_TEST)

@@ -1,5 +1,6 @@
 #include <SDL.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "device.h"
 #include "virtio-input-codes.h"
@@ -255,6 +256,15 @@ bool vinput_may_have_pending_cmds(void)
     return __atomic_load_n(&vinput_cmd_wake_pending, __ATOMIC_RELAXED);
 }
 
+static void vinput_publish_mouse_motion(int dx, int dy)
+{
+    struct vinput_cmd event = {
+        .type = VINPUT_CMD_MOUSE_MOTION,
+        .u.mouse_motion = {.dx = dx, .dy = dy},
+    };
+    vinput_push_cmd(VINPUT_MOUSE_ID, &event);
+}
+
 void vinput_reset_host_events(int dev_id)
 {
     /* Drop every pending event for this device only. The other device's queue
@@ -366,11 +376,7 @@ bool vinput_handle_events(void)
             if (!g_window.window_is_mouse_grabbed() ||
                 (e.motion.xrel == 0 && e.motion.yrel == 0))
                 break;
-            struct vinput_cmd event = {
-                .type = VINPUT_CMD_MOUSE_MOTION,
-                .u.mouse_motion = {.dx = e.motion.xrel, .dy = e.motion.yrel},
-            };
-            vinput_push_cmd(VINPUT_MOUSE_ID, &event);
+            vinput_publish_mouse_motion(e.motion.xrel, e.motion.yrel);
         } break;
         case SDL_MOUSEWHEEL: {
             int dx = e.wheel.x;

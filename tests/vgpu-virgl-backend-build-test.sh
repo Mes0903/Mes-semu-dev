@@ -31,6 +31,7 @@ typedef int GLint;
 typedef int GLsizei;
 typedef unsigned int GLbitfield;
 typedef float GLfloat;
+typedef double GLdouble;
 
 #define GL_READ_FRAMEBUFFER 0x8ca8
 #define GL_DRAW_FRAMEBUFFER 0x8ca9
@@ -38,10 +39,30 @@ typedef float GLfloat;
 #define GL_COLOR_ATTACHMENT0 0x8ce0
 #define GL_TEXTURE_2D 0x0de1
 #define GL_COLOR_BUFFER_BIT 0x00004000
+#define GL_RGBA8 0x8058
+#define GL_RGBA 0x1908
+#define GL_BGRA 0x80e1
+#define GL_UNSIGNED_BYTE 0x1401
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#define GL_TEXTURE_MAG_FILTER 0x2800
+#define GL_TEXTURE_WRAP_S 0x2802
+#define GL_TEXTURE_WRAP_T 0x2803
+#define GL_CLAMP_TO_EDGE 0x812f
+#define GL_NEAREST 0x2600
 #define GL_LINEAR 0x2601
+#define GL_UNPACK_ALIGNMENT 0x0cf5
+#define GL_UNPACK_ROW_LENGTH 0x0cf2
+#define GL_BLEND 0x0be2
+#define GL_SRC_ALPHA 0x0302
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_PROJECTION 0x1701
+#define GL_MODELVIEW 0x1700
+#define GL_QUADS 0x0007
 
 void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers);
 void glGenFramebuffers(GLsizei n, GLuint *framebuffers);
+void glDeleteTextures(GLsizei n, const GLuint *textures);
+void glGenTextures(GLsizei n, GLuint *textures);
 void glBindFramebuffer(GLenum target, GLuint framebuffer);
 void glFramebufferTexture2D(GLenum target,
                             GLenum attachment,
@@ -52,6 +73,18 @@ GLenum glCheckFramebufferStatus(GLenum target);
 void glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
 void glClear(GLbitfield mask);
+void glBindTexture(GLenum target, GLuint texture);
+void glTexParameteri(GLenum target, GLenum pname, GLint param);
+void glPixelStorei(GLenum pname, GLint param);
+void glTexImage2D(GLenum target,
+                  GLint level,
+                  GLint internalformat,
+                  GLsizei width,
+                  GLsizei height,
+                  GLint border,
+                  GLenum format,
+                  GLenum type,
+                  const void *pixels);
 void glBlitFramebuffer(GLint srcX0,
                        GLint srcY0,
                        GLint srcX1,
@@ -62,6 +95,22 @@ void glBlitFramebuffer(GLint srcX0,
                        GLint dstY1,
                        GLbitfield mask,
                        GLenum filter);
+void glEnable(GLenum cap);
+void glDisable(GLenum cap);
+void glBlendFunc(GLenum sfactor, GLenum dfactor);
+void glMatrixMode(GLenum mode);
+void glLoadIdentity(void);
+void glOrtho(GLdouble left,
+             GLdouble right,
+             GLdouble bottom,
+             GLdouble top,
+             GLdouble near_val,
+             GLdouble far_val);
+void glColor4f(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+void glBegin(GLenum mode);
+void glTexCoord2f(GLfloat s, GLfloat t);
+void glVertex2f(GLfloat x, GLfloat y);
+void glEnd(void);
 HEADER
 
 cat >"${TMP_DIR}/virglrenderer-stub.c" <<'SOURCE'
@@ -83,6 +132,18 @@ void glGenFramebuffers(GLsizei n, GLuint *framebuffers)
 {
     for (GLsizei i = 0; i < n; i++)
         framebuffers[i] = (GLuint) (i + 1);
+}
+
+void glDeleteTextures(GLsizei n, const GLuint *textures)
+{
+    (void) n;
+    (void) textures;
+}
+
+void glGenTextures(GLsizei n, GLuint *textures)
+{
+    for (GLsizei i = 0; i < n; i++)
+        textures[i] = (GLuint) (i + 1);
 }
 
 void glBindFramebuffer(GLenum target, GLuint framebuffer)
@@ -131,6 +192,46 @@ void glClear(GLbitfield mask)
     (void) mask;
 }
 
+void glBindTexture(GLenum target, GLuint texture)
+{
+    (void) target;
+    (void) texture;
+}
+
+void glTexParameteri(GLenum target, GLenum pname, GLint param)
+{
+    (void) target;
+    (void) pname;
+    (void) param;
+}
+
+void glPixelStorei(GLenum pname, GLint param)
+{
+    (void) pname;
+    (void) param;
+}
+
+void glTexImage2D(GLenum target,
+                  GLint level,
+                  GLint internalformat,
+                  GLsizei width,
+                  GLsizei height,
+                  GLint border,
+                  GLenum format,
+                  GLenum type,
+                  const void *pixels)
+{
+    (void) target;
+    (void) level;
+    (void) internalformat;
+    (void) width;
+    (void) height;
+    (void) border;
+    (void) format;
+    (void) type;
+    (void) pixels;
+}
+
 void glBlitFramebuffer(GLint srcX0,
                        GLint srcY0,
                        GLint srcX1,
@@ -152,6 +253,75 @@ void glBlitFramebuffer(GLint srcX0,
     (void) dstY1;
     (void) mask;
     (void) filter;
+}
+
+void glEnable(GLenum cap)
+{
+    (void) cap;
+}
+
+void glDisable(GLenum cap)
+{
+    (void) cap;
+}
+
+void glBlendFunc(GLenum sfactor, GLenum dfactor)
+{
+    (void) sfactor;
+    (void) dfactor;
+}
+
+void glMatrixMode(GLenum mode)
+{
+    (void) mode;
+}
+
+void glLoadIdentity(void)
+{
+}
+
+void glOrtho(GLdouble left,
+             GLdouble right,
+             GLdouble bottom,
+             GLdouble top,
+             GLdouble near_val,
+             GLdouble far_val)
+{
+    (void) left;
+    (void) right;
+    (void) bottom;
+    (void) top;
+    (void) near_val;
+    (void) far_val;
+}
+
+void glColor4f(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
+{
+    (void) red;
+    (void) green;
+    (void) blue;
+    (void) alpha;
+}
+
+void glBegin(GLenum mode)
+{
+    (void) mode;
+}
+
+void glTexCoord2f(GLfloat s, GLfloat t)
+{
+    (void) s;
+    (void) t;
+}
+
+void glVertex2f(GLfloat x, GLfloat y)
+{
+    (void) x;
+    (void) y;
+}
+
+void glEnd(void)
+{
 }
 
 int virgl_renderer_init(void *cookie,

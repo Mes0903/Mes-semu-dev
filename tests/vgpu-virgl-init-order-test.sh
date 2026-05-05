@@ -36,3 +36,21 @@ grep -Fq 'if (!frame->y_0_top)' window-sw.c ||
 if grep -Fq 'frame->height - frame->src_y' window-sw.c; then
     fail "VirGL GL scanout blit should not invert Y_0_TOP source rectangles"
 fi
+
+grep -Fq 'gl_cursor_texture' window-sw.c ||
+    fail "VirGL window path should retain a GL cursor texture"
+
+grep -Fq 'sdl_scanout_apply_gl_cursor_frame' window-sw.c ||
+    fail "VirGL window path should upload cursor frames without SDL_Renderer"
+
+grep -Fq 'SDL_ConvertPixels' window-sw.c ||
+    fail "VirGL cursor upload should convert SDL pixel formats before GL upload"
+
+grep -Fq 'GL_RGBA' window-sw.c ||
+    fail "VirGL cursor upload should use an explicit RGBA GL upload format"
+
+grep -Fq 'glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)' window-sw.c ||
+    fail "VirGL cursor overlay should alpha-blend the cursor plane"
+
+grep -Fq 'scanout->gl_context' window-sw.c ||
+    fail "VirGL cursor handling should branch on the GL context"

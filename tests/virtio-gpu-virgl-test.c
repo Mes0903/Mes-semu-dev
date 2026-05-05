@@ -27,6 +27,7 @@ struct virgl_test_calls {
     void *renderer_init_cookie;
     int renderer_init_flags;
     int renderer_init_callback_version;
+    int renderer_init_lock_depth;
 
     int poll_count;
 
@@ -110,6 +111,13 @@ struct virgl_test_calls {
     uint32_t submit_words[16];
 
     int force_ctx_0_count;
+    int force_ctx_0_lock_depth;
+    int window_make_current_count;
+    int window_make_current_null_count;
+    virgl_renderer_gl_context window_make_current_last_ctx;
+    int gl_lock_depth;
+    int gl_lock_max_depth;
+    int gl_lock_underflow_count;
 
     int undefined_count;
 };
@@ -397,8 +405,27 @@ int vgpu_window_virgl_make_current(int scanout_idx,
                                    virgl_renderer_gl_context ctx)
 {
     (void) scanout_idx;
-    (void) ctx;
+    g_calls.window_make_current_count++;
+    g_calls.window_make_current_last_ctx = ctx;
+    if (!ctx)
+        g_calls.window_make_current_null_count++;
     return 0;
+}
+
+void vgpu_gl_lock(void)
+{
+    g_calls.gl_lock_depth++;
+    if (g_calls.gl_lock_depth > g_calls.gl_lock_max_depth)
+        g_calls.gl_lock_max_depth = g_calls.gl_lock_depth;
+}
+
+void vgpu_gl_unlock(void)
+{
+    if (g_calls.gl_lock_depth <= 0) {
+        g_calls.gl_lock_underflow_count++;
+        return;
+    }
+    g_calls.gl_lock_depth--;
 }
 
 int virgl_renderer_init(void *cookie,
@@ -409,6 +436,7 @@ int virgl_renderer_init(void *cookie,
     g_calls.renderer_init_cookie = cookie;
     g_calls.renderer_init_flags = flags;
     g_calls.renderer_init_callback_version = cb ? cb->version : 0;
+    g_calls.renderer_init_lock_depth = g_calls.gl_lock_depth;
     return 0;
 }
 
@@ -626,6 +654,7 @@ int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
 void virgl_renderer_force_ctx_0(void)
 {
     g_calls.force_ctx_0_count++;
+    g_calls.force_ctx_0_lock_depth = g_calls.gl_lock_depth;
 }
 
 #include "../virtio-gpu-virgl.c"
@@ -752,6 +781,36 @@ static int test_renderer_init_calls_virgl_renderer_init(void)
     CHECK(g_calls.renderer_init_flags == VIRGL_RENDERER_THREAD_SYNC);
     CHECK(g_calls.renderer_init_callback_version ==
           VIRGL_RENDERER_CALLBACKS_VERSION);
+    CHECK(g_calls.renderer_init_lock_depth > 0);
+    CHECK(g_calls.gl_lock_depth == 0);
+    CHECK(g_calls.gl_lock_underflow_count == 0);
+
+    return 0;
+}
+
+static int test_renderer_init_detaches_and_thread_enter_binds_ctx0(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+
+    g_virtio_gpu_backend.init(&vgpu);
+
+    CHECK(g_calls.window_make_current_count == 1);
+    CHECK(g_calls.window_make_current_null_count == 1);
+    CHECK(g_calls.window_make_current_last_ctx == NULL);
+    CHECK(g_calls.force_ctx_0_count == 0);
+
+    g_virtio_gpu_backend.thread_enter(&vgpu);
+
+    CHECK(g_calls.force_ctx_0_count == 1);
+    CHECK(g_calls.force_ctx_0_lock_depth > 0);
+    CHECK(g_calls.gl_lock_depth == 0);
+    CHECK(g_calls.gl_lock_underflow_count == 0);
+
+    g_virtio_gpu_backend.command_enter(&vgpu);
+    CHECK(g_calls.gl_lock_depth == 1);
+    g_virtio_gpu_backend.command_leave(&vgpu);
+    CHECK(g_calls.gl_lock_depth == 0);
+    CHECK(g_calls.gl_lock_underflow_count == 0);
 
     return 0;
 }
@@ -1399,6 +1458,7 @@ static int test_submit_3d_rejects_unaligned_size(void)
 int main(void)
 {
     CHECK(test_renderer_init_calls_virgl_renderer_init() == 0);
+    CHECK(test_renderer_init_detaches_and_thread_enter_binds_ctx0() == 0);
     CHECK(test_backend_reports_available_capsets() == 0);
     CHECK(test_backend_poll_calls_virgl_renderer_poll() == 0);
     CHECK(test_ctx_create_calls_renderer() == 0);

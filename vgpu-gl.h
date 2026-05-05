@@ -6,6 +6,9 @@
 
 #include <virglrenderer.h>
 
+void vgpu_gl_lock(void);
+void vgpu_gl_unlock(void);
+
 virgl_renderer_gl_context vgpu_window_virgl_create_context(
     int scanout_idx,
     struct virgl_renderer_gl_ctx_param *param);

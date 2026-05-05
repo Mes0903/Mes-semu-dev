@@ -123,7 +123,7 @@ static bool vgpu_display_is_cmd_queue_full(void)
     return next == tail;
 }
 
-static void vgpu_display_push_cmd(struct vgpu_display_cmd *cmd)
+static bool vgpu_display_push_cmd(struct vgpu_display_cmd *cmd)
 {
     uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_RELAXED);
     uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
@@ -135,11 +135,12 @@ static void vgpu_display_push_cmd(struct vgpu_display_cmd *cmd)
      */
     if (next == tail) {
         vgpu_display_release_cmd(cmd);
-        return;
+        return false;
     }
 
     vgpu_display_cmd_queue[head] = *cmd;
     __atomic_store_n(&vgpu_display_cmd_head, next, __ATOMIC_RELEASE);
+    return true;
 }
 
 static bool vgpu_display_pop_queued_cmd(struct vgpu_display_cmd *cmd)
@@ -250,6 +251,11 @@ void vgpu_display_publish_cursor_set(uint32_t scanout_id,
                                      uint32_t hot_y)
 {
     if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE)) {
+        free(payload);
+        return;
+    }
+
+    if (vgpu_display_is_cmd_queue_full()) {
         free(payload);
         return;
     }

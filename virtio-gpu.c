@@ -811,6 +811,11 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         return 0;
     }
 
+    if (g_virtio_gpu_backend.command_enter)
+        g_virtio_gpu_backend.command_enter(vgpu);
+
+    int ret = 0;
+
     /* Process the command */
     switch (header->type) {
         /* 2D commands */
@@ -843,10 +848,14 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         VIRTIO_GPU_CMD_CASE(MOVE_CURSOR, move_cursor)
     default:
         virtio_gpu_cmd_undefined_handler(vgpu, vq_desc, plen);
-        return -1;
+        ret = -1;
+        break;
     }
 
-    return 0;
+    if (g_virtio_gpu_backend.command_leave)
+        g_virtio_gpu_backend.command_leave(vgpu);
+
+    return ret;
 }
 
 static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
@@ -1258,6 +1267,12 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu)
     vgpu->priv = &virtio_gpu_data;
     if (g_virtio_gpu_backend.init)
         g_virtio_gpu_backend.init(vgpu);
+}
+
+void virtio_gpu_thread_enter(virtio_gpu_state_t *vgpu)
+{
+    if (g_virtio_gpu_backend.thread_enter)
+        g_virtio_gpu_backend.thread_enter(vgpu);
 }
 
 void virtio_gpu_poll(virtio_gpu_state_t *vgpu)

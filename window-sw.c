@@ -1,6 +1,7 @@
 #include <SDL.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,6 +27,20 @@ static int wake_write_fd = -1;
 static bool sdl_initialized = false;
 static bool headless_mode = false;
 static bool should_exit = false;
+
+#if SEMU_HAS(VIRGL)
+static pthread_mutex_t vgpu_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void vgpu_gl_lock(void)
+{
+    pthread_mutex_lock(&vgpu_gl_mutex);
+}
+
+void vgpu_gl_unlock(void)
+{
+    pthread_mutex_unlock(&vgpu_gl_mutex);
+}
+#endif
 
 #if SEMU_HAS(VIRTIOINPUT)
 static bool mouse_grabbed = false;
@@ -65,7 +80,11 @@ struct sdl_scanout_info {
 #if SEMU_HAS(VIRGL)
     SDL_GLContext gl_context;
     GLuint gl_primary_fb;
+    GLuint gl_cursor_texture;
+    uint32_t gl_cursor_width;
+    uint32_t gl_cursor_height;
     bool gl_primary_valid;
+    bool gl_cursor_valid;
     struct vgpu_display_gl_scanout_payload gl_primary;
 #endif
 };
@@ -205,6 +224,8 @@ static void sdl_scanout_info_cleanup(struct sdl_scanout_info *scanout)
         SDL_GL_MakeCurrent(scanout->window, scanout->gl_context);
     if (scanout->gl_primary_fb)
         glDeleteFramebuffers(1, &scanout->gl_primary_fb);
+    if (scanout->gl_cursor_texture)
+        glDeleteTextures(1, &scanout->gl_cursor_texture);
     if (scanout->gl_context)
         SDL_GL_MakeCurrent(scanout->window, NULL);
     if (scanout->gl_context)
@@ -235,6 +256,19 @@ static void sdl_scanout_clear_primary(struct sdl_scanout_info *scanout)
     sdl_plane_info_reset(&scanout->primary_plane);
 #if SEMU_HAS(VIRGL)
     scanout->gl_primary_valid = false;
+#endif
+}
+
+static void sdl_scanout_clear_cursor(struct sdl_scanout_info *scanout)
+{
+    memset(&scanout->cursor_rect, 0, sizeof(scanout->cursor_rect));
+    scanout->cursor_hot_x = 0;
+    scanout->cursor_hot_y = 0;
+    sdl_plane_info_reset(&scanout->cursor_plane);
+#if SEMU_HAS(VIRGL)
+    scanout->gl_cursor_width = 0;
+    scanout->gl_cursor_height = 0;
+    scanout->gl_cursor_valid = false;
 #endif
 }
 
@@ -420,6 +454,115 @@ static void sdl_scanout_detach_gl_context(struct sdl_scanout_info *scanout)
     (void) ret;
 }
 
+static bool sdl_scanout_apply_gl_cursor_frame(
+    struct sdl_scanout_info *scanout,
+    const struct vgpu_display_payload *payload,
+    int32_t x,
+    int32_t y,
+    uint32_t hot_x,
+    uint32_t hot_y)
+{
+    if (!scanout->gl_context || payload->kind != VGPU_DISPLAY_PAYLOAD_CPU)
+        return false;
+
+    const struct vgpu_display_cpu_payload *frame = &payload->cpu;
+    SDL_Rect new_cursor_rect = scanout->cursor_rect;
+    uint32_t src_sdl_format;
+
+    if (frame->width > INT_MAX || frame->height > INT_MAX) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): cursor size out of GL/SDL range (%ux%u)\n",
+                __func__, frame->width, frame->height);
+        return false;
+    }
+    uint64_t required_stride = (uint64_t) frame->width * 4u;
+    if (frame->bits_per_pixel != 32 || frame->stride < required_stride ||
+        frame->stride % 4u != 0) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): unsupported cursor layout (%u bpp stride=%u width=%u)\n",
+                __func__, frame->bits_per_pixel, frame->stride, frame->width);
+        return false;
+    }
+    if (required_stride > INT_MAX || frame->stride > INT_MAX) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): cursor pitch out of SDL range (stride=%u row=%" PRIu64
+                ")\n",
+                __func__, frame->stride, required_stride);
+        return false;
+    }
+    if (!sdl_plane_info_get_sdl_format(&scanout->cursor_plane, payload,
+                                       &src_sdl_format))
+        return false;
+    if (!sdl_cursor_rect_update_position(&new_cursor_rect, x, y, hot_x, hot_y))
+        return false;
+
+    uint64_t rgba_size = required_stride * frame->height;
+    if (frame->height != 0 && rgba_size / frame->height != required_stride) {
+        fprintf(stderr, "%s(): cursor conversion size overflow\n", __func__);
+        return false;
+    }
+    if (rgba_size > SIZE_MAX) {
+        fprintf(stderr, "%s(): cursor conversion buffer too large\n", __func__);
+        return false;
+    }
+
+    void *rgba_pixels = SDL_malloc((size_t) rgba_size);
+    if (!rgba_pixels) {
+        fprintf(stderr, "%s(): failed to allocate cursor conversion buffer\n",
+                __func__);
+        return false;
+    }
+
+    if (SDL_ConvertPixels((int) frame->width, (int) frame->height,
+                          src_sdl_format, frame->pixels, (int) frame->stride,
+                          SDL_PIXELFORMAT_RGBA32, rgba_pixels,
+                          (int) required_stride) < 0) {
+        fprintf(stderr, "%s(): failed to convert cursor pixels: %s\n", __func__,
+                SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
+        fprintf(stderr, "%s(): failed to make GL context current: %s\n",
+                __func__, SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (!scanout->gl_cursor_texture)
+        glGenTextures(1, &scanout->gl_cursor_texture);
+
+    glBindTexture(GL_TEXTURE_2D, scanout->gl_cursor_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint) frame->width);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) frame->width,
+                 (GLsizei) frame->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 rgba_pixels);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    SDL_free(rgba_pixels);
+
+    scanout->cursor_hot_x = hot_x;
+    scanout->cursor_hot_y = hot_y;
+    new_cursor_rect.w = (int) frame->width;
+    new_cursor_rect.h = (int) frame->height;
+    scanout->cursor_rect = new_cursor_rect;
+    scanout->gl_cursor_width = frame->width;
+    scanout->gl_cursor_height = frame->height;
+    scanout->gl_cursor_valid = true;
+
+    sdl_scanout_detach_gl_context(scanout);
+    return true;
+}
+
 static bool sdl_scanout_apply_gl_frame(
     struct sdl_scanout_info *scanout,
     const struct vgpu_display_gl_scanout_payload *frame)
@@ -453,6 +596,48 @@ static bool sdl_scanout_apply_gl_frame(
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     sdl_scanout_detach_gl_context(scanout);
     return true;
+}
+
+static void sdl_scanout_render_gl_cursor(struct sdl_scanout_info *scanout,
+                                         int window_width,
+                                         int window_height)
+{
+    if (!scanout->gl_cursor_valid || !scanout->gl_cursor_texture ||
+        scanout->cursor_rect.w <= 0 || scanout->cursor_rect.h <= 0)
+        return;
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, (GLdouble) window_width, (GLdouble) window_height, 0.0, -1.0,
+            1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, scanout->gl_cursor_texture);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    GLfloat x0 = (GLfloat) scanout->cursor_rect.x;
+    GLfloat y0 = (GLfloat) scanout->cursor_rect.y;
+    GLfloat x1 = (GLfloat) (scanout->cursor_rect.x + scanout->cursor_rect.w);
+    GLfloat y1 = (GLfloat) (scanout->cursor_rect.y + scanout->cursor_rect.h);
+
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f);
+    glVertex2f(x0, y0);
+    glTexCoord2f(1.0f, 0.0f);
+    glVertex2f(x1, y0);
+    glTexCoord2f(1.0f, 1.0f);
+    glVertex2f(x1, y1);
+    glTexCoord2f(0.0f, 1.0f);
+    glVertex2f(x0, y1);
+    glEnd();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
 }
 
 static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
@@ -498,6 +683,7 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     }
 
+    sdl_scanout_render_gl_cursor(scanout, width, height);
     SDL_GL_SwapWindow(scanout->window);
     sdl_scanout_detach_gl_context(scanout);
 }
@@ -507,7 +693,9 @@ static void sdl_scanout_render(struct sdl_scanout_info *scanout)
 {
 #if SEMU_HAS(VIRGL)
     if (scanout->gl_context) {
+        vgpu_gl_lock();
         sdl_scanout_render_gl(scanout);
+        vgpu_gl_unlock();
         return;
     }
 #endif
@@ -549,10 +737,7 @@ static void window_drain_display_queue(void)
             dirty_scanouts[cmd.scanout_id] = true;
             break;
         case VGPU_DISPLAY_CMD_CURSOR_CLEAR:
-            memset(&scanout->cursor_rect, 0, sizeof(scanout->cursor_rect));
-            scanout->cursor_hot_x = 0;
-            scanout->cursor_hot_y = 0;
-            sdl_plane_info_reset(&scanout->cursor_plane);
+            sdl_scanout_clear_cursor(scanout);
             dirty_scanouts[cmd.scanout_id] = true;
             break;
         case VGPU_DISPLAY_CMD_PRIMARY_SET:
@@ -574,8 +759,10 @@ static void window_drain_display_queue(void)
 #if SEMU_HAS(VIRGL)
             } else if (cmd.u.primary_set.payload->kind ==
                        VGPU_DISPLAY_PAYLOAD_GL_SCANOUT) {
+                vgpu_gl_lock();
                 dirty_scanouts[cmd.scanout_id] |= sdl_scanout_apply_gl_frame(
                     scanout, &cmd.u.primary_set.payload->gl);
+                vgpu_gl_unlock();
 #endif
             }
             break;
@@ -584,19 +771,41 @@ static void window_drain_display_queue(void)
              * upload leaves the old cursor visible and does not dirty the
              * scanout by itself.
              */
+#if SEMU_HAS(VIRGL)
+            if (scanout->gl_context) {
+                vgpu_gl_lock();
+                dirty_scanouts[cmd.scanout_id] |=
+                    sdl_scanout_apply_gl_cursor_frame(
+                        scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
+                        cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
+                        cmd.u.cursor_set.hot_y);
+                vgpu_gl_unlock();
+                break;
+            }
+#endif
             dirty_scanouts[cmd.scanout_id] |= sdl_scanout_apply_cursor_frame(
                 scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
                 cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
                 cmd.u.cursor_set.hot_y);
             break;
-        case VGPU_DISPLAY_CMD_CURSOR_MOVE:
+        case VGPU_DISPLAY_CMD_CURSOR_MOVE: {
+            int old_cursor_x = scanout->cursor_rect.x;
+            int old_cursor_y = scanout->cursor_rect.y;
             if (!sdl_cursor_rect_update_position(
                     &scanout->cursor_rect, cmd.u.cursor_move.x,
                     cmd.u.cursor_move.y, scanout->cursor_hot_x,
                     scanout->cursor_hot_y))
                 break;
+            if (old_cursor_x == scanout->cursor_rect.x &&
+                old_cursor_y == scanout->cursor_rect.y)
+                break;
+#if SEMU_HAS(VIRGL)
+            if (scanout->gl_context && !scanout->gl_cursor_valid)
+                break;
+#endif
             dirty_scanouts[cmd.scanout_id] = true;
             break;
+        }
         }
 
         vgpu_display_release_cmd(&cmd);

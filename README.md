@@ -276,7 +276,7 @@ Options:
   --no-ext4           Skip ext4.img generation; produce only rootfs.cpio
                       (matches the legacy ENABLE_EXTERNAL_ROOT=0 path)
   --clean-build       Remove buildroot/ and/or linux/ before building;
-                      with --directfb2-test, also remove DirectFB2 build outputs
+                      with --directfb2-test, also remove DirectFB2 sources
   --help              Show this message
 ```
 
@@ -322,6 +322,12 @@ $ scripts/build-image.sh --virgl
 When switching an existing Buildroot tree from the plain X11/swrast image to
 VirGL, the script checks for `usr/lib/dri/virtio_gpu_dri.so` and rebuilds Mesa
 when the driver is missing.
+
+The script uses a single `buildroot/output` directory. When the Buildroot
+profile changes between `default`, `x11`, and `x11-virgl`, it removes
+`buildroot/output/target`, `buildroot/output/images`, and target-install
+stamps before rebuilding. This keeps the published default `rootfs.cpio` and
+`ext4.img` small without requiring a full `--clean-build`.
 
 To add a new test tool, extend the `test-tools.img` build path in
 `scripts/build-image.sh` so the tool is staged into `extra_packages`, then
