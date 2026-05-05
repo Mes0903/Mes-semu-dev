@@ -15,29 +15,16 @@ trap cleanup EXIT
 
 mkdir -p "${TMP_DIR}/include" "${TMP_DIR}/lib"
 
-cat >"${TMP_DIR}/include/virglrenderer.h" <<'HEADER'
-#pragma once
-
-#include <stdint.h>
-#include <string.h>
-
-#define VIRGL_RENDERER_CALLBACKS_VERSION 4
-#define VIRGL_RENDERER_THREAD_SYNC 2
-
-struct virgl_renderer_callbacks {
-    int version;
-};
-
-void virgl_renderer_get_cap_set(uint32_t set,
-                                uint32_t *max_ver,
-                                uint32_t *max_size);
-void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps);
-void virgl_renderer_reset(void);
-HEADER
+cp "${REPO_ROOT}/tests/fakes/virglrenderer.h" \
+    "${TMP_DIR}/include/virglrenderer.h"
 
 cat >"${TMP_DIR}/virglrenderer-stub.c" <<'SOURCE'
+#include "virglrenderer.h"
+
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 
 void virgl_renderer_get_cap_set(uint32_t set,
                                 uint32_t *max_ver,
@@ -63,9 +50,136 @@ void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps)
 void virgl_renderer_reset(void)
 {
 }
+
+int virgl_renderer_context_create(uint32_t handle,
+                                  uint32_t nlen,
+                                  const char *name)
+{
+    (void) handle;
+    (void) nlen;
+    (void) name;
+    return 0;
+}
+
+void virgl_renderer_context_destroy(uint32_t handle)
+{
+    (void) handle;
+}
+
+int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
+                                             uint32_t ctx_flags,
+                                             uint32_t nlen,
+                                             const char *name)
+{
+    (void) ctx_id;
+    (void) ctx_flags;
+    (void) nlen;
+    (void) name;
+    return 0;
+}
+
+void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
+{
+    (void) ctx_id;
+    (void) res_handle;
+}
+
+void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
+{
+    (void) ctx_id;
+    (void) res_handle;
+}
+
+int virgl_renderer_resource_create(
+    struct virgl_renderer_resource_create_args *args,
+    struct iovec *iov,
+    uint32_t num_iovs)
+{
+    (void) args;
+    (void) iov;
+    (void) num_iovs;
+    return 0;
+}
+
+void virgl_renderer_resource_unref(uint32_t res_handle)
+{
+    (void) res_handle;
+}
+
+int virgl_renderer_resource_attach_iov(int res_handle,
+                                       struct iovec *iov,
+                                       int num_iovs)
+{
+    (void) res_handle;
+    (void) iov;
+    (void) num_iovs;
+    return 0;
+}
+
+void virgl_renderer_resource_detach_iov(int res_handle,
+                                        struct iovec **iov,
+                                        int *num_iovs)
+{
+    (void) res_handle;
+    *iov = NULL;
+    *num_iovs = 0;
+}
+
+int virgl_renderer_transfer_write_iov(uint32_t handle,
+                                      uint32_t ctx_id,
+                                      int level,
+                                      uint32_t stride,
+                                      uint32_t layer_stride,
+                                      struct virgl_box *box,
+                                      uint64_t offset,
+                                      struct iovec *iovec,
+                                      unsigned int iovec_cnt)
+{
+    (void) handle;
+    (void) ctx_id;
+    (void) level;
+    (void) stride;
+    (void) layer_stride;
+    (void) box;
+    (void) offset;
+    (void) iovec;
+    (void) iovec_cnt;
+    return 0;
+}
+
+int virgl_renderer_transfer_read_iov(uint32_t handle,
+                                     uint32_t ctx_id,
+                                     uint32_t level,
+                                     uint32_t stride,
+                                     uint32_t layer_stride,
+                                     struct virgl_box *box,
+                                     uint64_t offset,
+                                     struct iovec *iov,
+                                     int iovec_cnt)
+{
+    (void) handle;
+    (void) ctx_id;
+    (void) level;
+    (void) stride;
+    (void) layer_stride;
+    (void) box;
+    (void) offset;
+    (void) iov;
+    (void) iovec_cnt;
+    return 0;
+}
+
+int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
+{
+    (void) buffer;
+    (void) ctx_id;
+    (void) ndw;
+    return 0;
+}
 SOURCE
 
 "${CC:-cc}" -c "${TMP_DIR}/virglrenderer-stub.c" \
+    -I"${TMP_DIR}/include" \
     -o "${TMP_DIR}/virglrenderer-stub.o"
 ar rcs "${TMP_DIR}/lib/libvirglrenderer.a" \
     "${TMP_DIR}/virglrenderer-stub.o"

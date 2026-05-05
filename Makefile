@@ -390,6 +390,7 @@ check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_
 	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -H $(INITRD_OPT) $(if $(NETDEV),-n $(NETDEV)) $(OPTS)
 
 VGPU_DESC_TEST := tests/virtio-gpu-desc-test
+VGPU_VIRGL_TEST := tests/virtio-gpu-virgl-test
 .PHONY: test-vgpu-desc
 test-vgpu-desc: $(VGPU_DESC_TEST)
 	$(Q)./$<
@@ -397,6 +398,15 @@ test-vgpu-desc: $(VGPU_DESC_TEST)
 $(VGPU_DESC_TEST): tests/virtio-gpu-desc-test.o virtio-gpu-desc.o
 	$(VECHO) "  LD\t$@\n"
 	$(Q)$(CC) -o $@ $^
+
+.PHONY: test-vgpu-virgl
+test-vgpu-virgl: $(VGPU_VIRGL_TEST)
+	$(Q)./$<
+
+$(VGPU_VIRGL_TEST): tests/virtio-gpu-virgl-test.c virtio-gpu-virgl.c virtio-gpu.h tests/fakes/virglrenderer.h
+	$(VECHO) "  CC\t$@\n"
+	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
+	    -DSEMU_FEATURE_VIRGL=1 -Itests/fakes -o $@ $<
 
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:
@@ -420,6 +430,7 @@ build-image:
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
 	$(Q)$(RM) $(VGPU_DESC_TEST) tests/virtio-gpu-desc-test.o $(test_deps)
+	$(Q)$(RM) $(VGPU_VIRGL_TEST)
 	$(Q)$(MAKE) -C mini-gdbstub clean
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \
