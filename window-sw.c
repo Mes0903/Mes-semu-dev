@@ -482,9 +482,13 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
         GLint src_x1 = (GLint) (frame->src_x + frame->src_w);
         GLint src_y0 = (GLint) frame->src_y;
         GLint src_y1 = (GLint) (frame->src_y + frame->src_h);
-        if (frame->y_0_top) {
-            src_y0 = (GLint) (frame->height - frame->src_y);
-            src_y1 = (GLint) (frame->height - frame->src_y - frame->src_h);
+        /* Match QEMU's VirGL scanout presentation: Y_0_TOP resources are
+         * already scanout-oriented. Normal GL-origin resources need a reversed
+         * read rectangle when blitted into the window framebuffer.
+         */
+        if (!frame->y_0_top) {
+            src_y0 = (GLint) (frame->src_y + frame->src_h);
+            src_y1 = (GLint) frame->src_y;
         }
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, scanout->gl_primary_fb);

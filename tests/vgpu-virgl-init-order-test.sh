@@ -29,3 +29,10 @@ fi
 
 grep -Fq 'SDL_GL_MakeCurrent(NULL, NULL)' window-sw.c ||
     fail "window-sw.c should detach GL contexts with SDL_GL_MakeCurrent(NULL, NULL)"
+
+grep -Fq 'if (!frame->y_0_top)' window-sw.c ||
+    fail "VirGL GL scanout blit should only flip non-Y_0_TOP resources"
+
+if grep -Fq 'frame->height - frame->src_y' window-sw.c; then
+    fail "VirGL GL scanout blit should not invert Y_0_TOP source rectangles"
+fi
