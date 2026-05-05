@@ -41,6 +41,7 @@ require_file configs/x11.config
 require_file configs/virgl.config
 require_literal 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=n' configs/x11.config
 require_literal 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' configs/virgl.config
+require_literal 'BR2_PACKAGE_LIBEPOXY=y' configs/virgl.config
 
 set +e
 help_output="$(scripts/build-image.sh --help 2>&1)"
@@ -57,6 +58,7 @@ require_help_literal 'Build test-tools.img from an X11 rootfs with Mesa VirGL' \
 require_literal 'scripts/build-image.sh --virgl' README.md
 require_literal '.ci/test-virgl.sh' README.md
 require_literal 'virtio_gpu_dri.so' README.md
+require_literal 'glamoregl' README.md
 require_literal 'glxinfo -B' README.md
 require_literal 'glxgears' README.md
 
@@ -84,6 +86,8 @@ require_literal 'configs/virgl.config' .ci/publish-prebuilt.sh
 require_literal 'scripts/build-image.sh --all --virgl --directfb2-test' \
     .ci/publish-prebuilt.sh
 require_literal 'mesa3d-dirclean' scripts/build-image.sh
+require_literal 'xserver_xorg-server-dirclean' scripts/build-image.sh
+require_literal 'libglamoregl.so' scripts/build-image.sh
 require_literal 'stage_virgl_smoke_marker' scripts/build-image.sh
 require_literal 'semu-test-tools-virgl' scripts/build-image.sh
 require_literal 'configs/virgl.config' mk/external.mk

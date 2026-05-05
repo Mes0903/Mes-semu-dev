@@ -124,6 +124,12 @@ function build_buildroot_rootfs
         echo "Mesa was built without virtio_gpu_dri.so; rebuilding mesa3d for VirGL..."
         ASSERT make mesa3d-dirclean
     fi
+    if [[ "$mode" == "x11-virgl" &&
+          ! -e output/target/usr/lib/xorg/modules/libglamoregl.so ]] &&
+       compgen -G "output/build/xserver_xorg-server-*" >/dev/null; then
+        echo "Xorg was built without glamor; rebuilding xserver_xorg-server for VirGL..."
+        ASSERT make xserver_xorg-server-dirclean
+    fi
     if [[ ( "$mode" == "x11" || "$mode" == "x11-virgl" ) && \
           ! -x output/host/bin/riscv32-buildroot-linux-gnu-g++ ]]; then
         echo "Rebuilding Buildroot final GCC with C++ support..."
@@ -136,6 +142,13 @@ function build_buildroot_rootfs
           ! -e buildroot/output/target/usr/lib/dri/virtio_gpu_dri.so ]]; then
         echo "Error: Mesa VirGL DRI driver was not produced:"
         echo "  buildroot/output/target/usr/lib/dri/virtio_gpu_dri.so"
+        echo "Try a clean rebuild with: scripts/build-image.sh --virgl --clean-build"
+        exit 1
+    fi
+    if [[ "$mode" == "x11-virgl" &&
+          ! -e buildroot/output/target/usr/lib/xorg/modules/libglamoregl.so ]]; then
+        echo "Error: Xorg glamor module was not produced:"
+        echo "  buildroot/output/target/usr/lib/xorg/modules/libglamoregl.so"
         echo "Try a clean rebuild with: scripts/build-image.sh --virgl --clean-build"
         exit 1
     fi

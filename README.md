@@ -143,10 +143,13 @@ host display because `semu` must create an SDL OpenGL window. The script checks
 the host SDL/VirGL build dependencies, starts guest `Xorg :0` when needed, then
 checks that the guest image contains `/usr/lib/dri/virtio_gpu_dri.so`, checks
 `/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and runs a short
-`glxgears` test. If `glxinfo -B` reports `softpipe`, the test tools image is
-usually stale; rebuild it with `scripts/build-image.sh --virgl` so Mesa is
-rebuilt with the VirGL gallium driver. After that basic path passes, an optional
-reboot/reset check can be run with:
+`glxgears` test. The VirGL guest image also enables `libepoxy` so Xorg builds
+the `glamoregl` module; without Xorg glamor, GLX can fall back to
+`swrast`/`softpipe` even when the kernel virtio-gpu driver negotiated VirGL. If
+`glxinfo -B` reports `softpipe`, the test tools image is usually stale; rebuild
+it with `scripts/build-image.sh --virgl` so Mesa and Xorg are rebuilt with the
+VirGL/glamor path. After that basic path passes, an optional reboot/reset check
+can be run with:
 
 ```shell
 $ SEMU_VIRGL_REBOOT_TEST=1 .ci/test-virgl.sh
