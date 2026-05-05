@@ -28,6 +28,18 @@ struct virgl_test_calls {
     int renderer_init_flags;
     int renderer_init_callback_version;
 
+    int poll_count;
+
+    int create_fence_count;
+    int create_fence_client_id;
+    uint32_t create_fence_ctx_id;
+
+    int context_create_fence_count;
+    uint32_t context_create_fence_ctx_id;
+    uint32_t context_create_fence_flags;
+    uint32_t context_create_fence_ring_idx;
+    uint64_t context_create_fence_id;
+
     int reset_count;
 
     int context_create_count;
@@ -278,6 +290,7 @@ void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
 
 const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend = {
     .init = NULL,
+    .poll = NULL,
     .reset = NULL,
     .get_display_info = virtio_gpu_cmd_undefined_handler,
     .resource_create_2d = virtio_gpu_cmd_undefined_handler,
@@ -337,6 +350,32 @@ int virgl_renderer_init(void *cookie,
     g_calls.renderer_init_cookie = cookie;
     g_calls.renderer_init_flags = flags;
     g_calls.renderer_init_callback_version = cb ? cb->version : 0;
+    return 0;
+}
+
+void virgl_renderer_poll(void)
+{
+    g_calls.poll_count++;
+}
+
+int virgl_renderer_create_fence(int client_fence_id, uint32_t ctx_id)
+{
+    g_calls.create_fence_count++;
+    g_calls.create_fence_client_id = client_fence_id;
+    g_calls.create_fence_ctx_id = ctx_id;
+    return 0;
+}
+
+int virgl_renderer_context_create_fence(uint32_t ctx_id,
+                                        uint32_t flags,
+                                        uint32_t ring_idx,
+                                        uint64_t fence_id)
+{
+    g_calls.context_create_fence_count++;
+    g_calls.context_create_fence_ctx_id = ctx_id;
+    g_calls.context_create_fence_flags = flags;
+    g_calls.context_create_fence_ring_idx = ring_idx;
+    g_calls.context_create_fence_id = fence_id;
     return 0;
 }
 
@@ -655,6 +694,17 @@ static int test_backend_reports_available_capsets(void)
     return 0;
 }
 
+static int test_backend_poll_calls_virgl_renderer_poll(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+
+    g_virtio_gpu_backend.poll(&vgpu);
+
+    CHECK(g_calls.poll_count == 1);
+
+    return 0;
+}
+
 static int test_submit_3d_copies_payload_to_renderer(void)
 {
     virtio_gpu_state_t vgpu = fresh_vgpu();
@@ -679,6 +729,123 @@ static int test_submit_3d_copies_payload_to_renderer(void)
     CHECK(g_calls.undefined_count == 0);
     CHECK(plen == sizeof(struct virtio_gpu_ctrl_hdr));
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    return 0;
+}
+
+static int test_fenced_submit_creates_renderer_fence_from_request_flags(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    struct virtio_gpu_cmd_submit request = {
+        .hdr = {.flags = VIRTIO_GPU_FLAG_FENCE, .fence_id = 123, .ctx_id = 7},
+        .size = 16,
+    };
+    uint32_t commands[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+    memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
+
+    struct virtq_desc desc[3];
+    init_desc_with_payload(desc, sizeof(request), sizeof(commands));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &plen);
+
+    CHECK(g_calls.submit_count == 1);
+    CHECK(g_calls.create_fence_count == 1);
+    CHECK(g_calls.create_fence_client_id == 123);
+    CHECK(g_calls.create_fence_ctx_id == 0);
+    CHECK(g_calls.context_create_fence_count == 0);
+    CHECK(g_calls.poll_count == 1);
+    CHECK(plen == sizeof(struct virtio_gpu_ctrl_hdr));
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
+    CHECK(response_hdr()->fence_id == 123);
+
+    return 0;
+}
+
+static int test_descriptor_write_flag_does_not_create_renderer_fence(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    struct virtio_gpu_cmd_submit request = {
+        .hdr = {.ctx_id = 7},
+        .size = 16,
+    };
+    uint32_t commands[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+    memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
+
+    struct virtq_desc desc[3];
+    init_desc_with_payload(desc, sizeof(request), sizeof(commands));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &plen);
+
+    CHECK(g_calls.submit_count == 1);
+    CHECK(g_calls.create_fence_count == 0);
+    CHECK(g_calls.context_create_fence_count == 0);
+    CHECK(g_calls.poll_count == 0);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == 0);
+
+    return 0;
+}
+
+static int test_ring_idx_fence_uses_context_fence_api(void)
+{
+    const uint32_t test_info_ring_idx_flag = 1U << 1;
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    struct virtio_gpu_cmd_submit request = {
+        .hdr = {.flags = VIRTIO_GPU_FLAG_FENCE | test_info_ring_idx_flag,
+                .fence_id = 0x123456789ULL,
+                .ctx_id = 77,
+                .ring_idx = 3},
+        .size = 16,
+    };
+    uint32_t commands[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+    memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
+
+    struct virtq_desc desc[3];
+    init_desc_with_payload(desc, sizeof(request), sizeof(commands));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &plen);
+
+    CHECK(g_calls.submit_count == 1);
+    CHECK(g_calls.create_fence_count == 0);
+    CHECK(g_calls.context_create_fence_count == 1);
+    CHECK(g_calls.context_create_fence_ctx_id == 77);
+    CHECK(g_calls.context_create_fence_flags ==
+          VIRGL_RENDERER_FENCE_FLAG_MERGEABLE);
+    CHECK(g_calls.context_create_fence_ring_idx == 3);
+    CHECK(g_calls.context_create_fence_id == 0x123456789ULL);
+    CHECK(g_calls.poll_count == 1);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
+    CHECK(response_hdr()->fence_id == 0x123456789ULL);
+
+    return 0;
+}
+
+static int test_fence_callbacks_record_state_and_reset_clears_it(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+
+    vgpu_virgl_write_fence(&vgpu, 55);
+    vgpu_virgl_write_context_fence(&vgpu, 77, 3, 0x123456789ULL);
+
+    CHECK(g_vgpu_virgl_fences.last_ctx0_fence == 55);
+    CHECK(g_vgpu_virgl_fences.last_context_ctx_id == 77);
+    CHECK(g_vgpu_virgl_fences.last_context_ring_idx == 3);
+    CHECK(g_vgpu_virgl_fences.last_context_fence == 0x123456789ULL);
+
+    g_virtio_gpu_backend.reset(&vgpu);
+
+    CHECK(g_vgpu_virgl_fences.last_ctx0_fence == 0);
+    CHECK(g_vgpu_virgl_fences.last_context_ctx_id == 0);
+    CHECK(g_vgpu_virgl_fences.last_context_ring_idx == 0);
+    CHECK(g_vgpu_virgl_fences.last_context_fence == 0);
 
     return 0;
 }
@@ -1091,6 +1258,7 @@ int main(void)
 {
     CHECK(test_renderer_init_calls_virgl_renderer_init() == 0);
     CHECK(test_backend_reports_available_capsets() == 0);
+    CHECK(test_backend_poll_calls_virgl_renderer_poll() == 0);
     CHECK(test_ctx_create_calls_renderer() == 0);
     CHECK(test_context_lifecycle_handlers_call_renderer() == 0);
     CHECK(test_ctx_create_rejects_context_init_until_feature_enabled() == 0);
@@ -1101,6 +1269,10 @@ int main(void)
     CHECK(test_set_scanout_publishes_gl_payload_for_virgl_resource() == 0);
     CHECK(test_resource_flush_republishes_bound_gl_payload() == 0);
     CHECK(test_submit_3d_copies_payload_to_renderer() == 0);
+    CHECK(test_fenced_submit_creates_renderer_fence_from_request_flags() == 0);
+    CHECK(test_descriptor_write_flag_does_not_create_renderer_fence() == 0);
+    CHECK(test_ring_idx_fence_uses_context_fence_api() == 0);
+    CHECK(test_fence_callbacks_record_state_and_reset_clears_it() == 0);
     CHECK(test_submit_3d_rejects_unaligned_size() == 0);
     return 0;
 }

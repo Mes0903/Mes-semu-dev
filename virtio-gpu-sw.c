@@ -1258,6 +1258,7 @@ uint32_t virtio_gpu_backend_get_num_capsets(void)
 
 const struct virtio_gpu_cmd_backend VGPU_SW_BACKEND_SYMBOL = {
     .init = NULL,
+    .poll = NULL,
     .reset = vgpu_sw_reset,
     .get_display_info = virtio_gpu_get_display_info_handler,
     .resource_create_2d = vgpu_sw_resource_create_2d_handler,

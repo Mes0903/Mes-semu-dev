@@ -7,6 +7,7 @@
 #define VIRGL_RENDERER_CALLBACKS_VERSION 4
 #define VIRGL_RENDERER_THREAD_SYNC 2
 #define VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK 0xff
+#define VIRGL_RENDERER_FENCE_FLAG_MERGEABLE (1 << 0)
 
 struct virgl_box {
     uint32_t x, y, z;
@@ -34,6 +35,10 @@ struct virgl_renderer_callbacks {
     int (*make_current)(void *cookie,
                         int scanout_idx,
                         virgl_renderer_gl_context ctx);
+    void (*write_context_fence)(void *cookie,
+                                uint32_t ctx_id,
+                                uint32_t ring_idx,
+                                uint64_t fence_id);
 };
 
 struct virgl_renderer_resource_create_args {
@@ -66,6 +71,12 @@ struct virgl_renderer_resource_info {
 int virgl_renderer_init(void *cookie,
                         int flags,
                         struct virgl_renderer_callbacks *cb);
+void virgl_renderer_poll(void);
+int virgl_renderer_create_fence(int client_fence_id, uint32_t ctx_id);
+int virgl_renderer_context_create_fence(uint32_t ctx_id,
+                                        uint32_t flags,
+                                        uint32_t ring_idx,
+                                        uint64_t fence_id);
 void virgl_renderer_get_cap_set(uint32_t set,
                                 uint32_t *max_ver,
                                 uint32_t *max_size);

@@ -1130,6 +1130,12 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu)
         g_virtio_gpu_backend.init(vgpu);
 }
 
+void virtio_gpu_poll(virtio_gpu_state_t *vgpu)
+{
+    if (g_virtio_gpu_backend.poll)
+        g_virtio_gpu_backend.poll(vgpu);
+}
+
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
                                      uint32_t width,
                                      uint32_t height)

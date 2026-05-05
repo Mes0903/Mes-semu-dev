@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,12 +30,31 @@ struct vgpu_virgl_box {
     uint32_t w, h, d;
 };
 
+struct vgpu_virgl_fence_state {
+    uint64_t last_ctx0_fence;
+    uint32_t last_context_ctx_id;
+    uint32_t last_context_ring_idx;
+    uint64_t last_context_fence;
+};
+
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
+static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
     (void) cookie;
-    (void) fence;
+    g_vgpu_virgl_fences.last_ctx0_fence = fence;
+}
+
+static void vgpu_virgl_write_context_fence(void *cookie,
+                                           uint32_t ctx_id,
+                                           uint32_t ring_idx,
+                                           uint64_t fence_id)
+{
+    (void) cookie;
+    g_vgpu_virgl_fences.last_context_ctx_id = ctx_id;
+    g_vgpu_virgl_fences.last_context_ring_idx = ring_idx;
+    g_vgpu_virgl_fences.last_context_fence = fence_id;
 }
 
 static virgl_renderer_gl_context vgpu_virgl_create_context(
@@ -67,6 +87,7 @@ static struct virgl_renderer_callbacks g_vgpu_virgl_callbacks = {
     .create_gl_context = vgpu_virgl_create_context,
     .destroy_gl_context = vgpu_virgl_destroy_context,
     .make_current = vgpu_virgl_make_current,
+    .write_context_fence = vgpu_virgl_write_context_fence,
 };
 
 static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
@@ -82,8 +103,15 @@ static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
     }
 }
 
+static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
+{
+    (void) vgpu;
+    virgl_renderer_poll();
+}
+
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
 {
+    memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
     virgl_renderer_reset();
     /* The renderer destroys all contexts/resources on reset. Mirror that in
      * semu's ownership registry before resetting the software scanout path.
@@ -167,6 +195,28 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
                                       uint32_t *plen)
 {
     *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
+    if (*plen && type == VIRTIO_GPU_RESP_OK_NODATA &&
+        (request->flags & VIRTIO_GPU_FLAG_FENCE)) {
+        int ret;
+        if (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
+            ret = virgl_renderer_context_create_fence(
+                request->ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                request->ring_idx, request->fence_id);
+        } else {
+            ret = virgl_renderer_create_fence(
+                (int) (uint32_t) request->fence_id, 0);
+        }
+
+        if (ret) {
+            fprintf(stderr,
+                    VIRTIO_GPU_LOG_PREFIX
+                    "%s(): failed to create renderer fence %" PRIu64
+                    " for cmd 0x%x (%d)\n",
+                    __func__, request->fence_id, request->type, ret);
+            return;
+        }
+        virgl_renderer_poll();
+    }
 }
 
 static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
@@ -1093,6 +1143,7 @@ static void vgpu_virgl_cmd_get_capset_handler(virtio_gpu_state_t *vgpu,
 
 const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .init = vgpu_virgl_init,
+    .poll = vgpu_virgl_poll,
     .reset = vgpu_virgl_delegate_reset,
     .get_display_info = vgpu_virgl_delegate_get_display_info,
     .resource_create_2d = vgpu_virgl_delegate_resource_create_2d,

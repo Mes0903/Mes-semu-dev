@@ -253,6 +253,11 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
         if (emu->vfs.InterruptStatus)
             emu_update_vfs_interrupts(vm);
 #endif
+#if SEMU_HAS(VIRTIOGPU)
+        virtio_gpu_poll(&emu->vgpu);
+        if (emu->vgpu.InterruptStatus)
+            emu_update_vgpu_interrupts(vm);
+#endif
 #if SEMU_HAS(VIRTIOINPUT)
         /* The empty path is common during CI and boot workloads, so only
          * drain the host-side queue after the window thread has published

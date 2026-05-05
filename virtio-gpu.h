@@ -15,6 +15,7 @@
 #define VIRTIO_GPU_LOG_PREFIX "[SEMU VGPU] "
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
 
 /* Feature masks exposed in DeviceFeaturesSel 0. Linux UAPI names these as bit
  * numbers; semu stores the selected 32-bit feature word, so keep masks here.
@@ -348,6 +349,7 @@ typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func init;
+    virtio_gpu_backend_lifecycle_func poll;
     virtio_gpu_backend_lifecycle_func reset;
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
@@ -382,6 +384,7 @@ struct virtio_gpu_cmd_backend {
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend;
 uint32_t virtio_gpu_backend_get_num_capsets(void);
+void virtio_gpu_poll(virtio_gpu_state_t *vgpu);
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,

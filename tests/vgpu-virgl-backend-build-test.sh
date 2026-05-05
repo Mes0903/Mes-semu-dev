@@ -164,6 +164,29 @@ int virgl_renderer_init(void *cookie,
     return 0;
 }
 
+void virgl_renderer_poll(void)
+{
+}
+
+int virgl_renderer_create_fence(int client_fence_id, uint32_t ctx_id)
+{
+    (void) client_fence_id;
+    (void) ctx_id;
+    return 0;
+}
+
+int virgl_renderer_context_create_fence(uint32_t ctx_id,
+                                        uint32_t flags,
+                                        uint32_t ring_idx,
+                                        uint64_t fence_id)
+{
+    (void) ctx_id;
+    (void) flags;
+    (void) ring_idx;
+    (void) fence_id;
+    return 0;
+}
+
 void virgl_renderer_get_cap_set(uint32_t set,
                                 uint32_t *max_ver,
                                 uint32_t *max_size)
