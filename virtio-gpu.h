@@ -377,6 +377,8 @@ struct virtio_gpu_cmd_backend {
     virtio_gpu_cmd_func move_cursor;
 };
 
+extern const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend;
+
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
                                    uint32_t size);

@@ -1242,7 +1242,13 @@ static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
  * TODO: Implement these handlers after the feature bits, backend resource
  * model, and display payload path grow matching virgl/blob support.
  */
-const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
+#if SEMU_HAS(VIRGL)
+#define VGPU_SW_BACKEND_SYMBOL g_virtio_gpu_sw_backend
+#else
+#define VGPU_SW_BACKEND_SYMBOL g_virtio_gpu_backend
+#endif
+
+const struct virtio_gpu_cmd_backend VGPU_SW_BACKEND_SYMBOL = {
     .reset = vgpu_sw_reset,
     .get_display_info = virtio_gpu_get_display_info_handler,
     .resource_create_2d = vgpu_sw_resource_create_2d_handler,

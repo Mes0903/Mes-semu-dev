@@ -230,8 +230,13 @@ endif
 ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu-desc.o
     OBJS_EXTRA += virtio-gpu.o
-    OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += vgpu-display.o
+    ifeq ($(call has, VIRGL), 1)
+        OBJS_EXTRA += virtio-gpu-sw.o
+        OBJS_EXTRA += virtio-gpu-virgl.o
+    else
+        OBJS_EXTRA += virtio-gpu-sw.o
+    endif
 endif
 
 ifneq ($(filter 1,$(call has, VIRTIOGPU) $(call has, VIRTIOINPUT)),)
@@ -396,6 +401,10 @@ $(VGPU_DESC_TEST): tests/virtio-gpu-desc-test.o virtio-gpu-desc.o
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:
 	$(Q)bash tests/vgpu-virgl-gate-test.sh
+
+.PHONY: test-vgpu-virgl-backend-build
+test-vgpu-virgl-backend-build:
+	$(Q)bash tests/vgpu-virgl-backend-build-test.sh
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
