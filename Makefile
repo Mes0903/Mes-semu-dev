@@ -436,6 +436,10 @@ test-vgpu-virgl-gate:
 test-vgpu-virgl-image:
 	$(Q)bash tests/vgpu-virgl-image-test.sh
 
+.PHONY: test-vgpu-virgl-init-order
+test-vgpu-virgl-init-order:
+	$(Q)bash tests/vgpu-virgl-init-order-test.sh
+
 .PHONY: test-vgpu-virgl-backend-build
 test-vgpu-virgl-backend-build:
 	$(Q)bash tests/vgpu-virgl-backend-build-test.sh

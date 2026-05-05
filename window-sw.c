@@ -415,10 +415,8 @@ static bool sdl_scanout_apply_cursor_frame(
 #if SEMU_HAS(VIRGL)
 static void sdl_scanout_detach_gl_context(struct sdl_scanout_info *scanout)
 {
-    if (!scanout->window)
-        return;
-
-    int ret = SDL_GL_MakeCurrent(scanout->window, NULL);
+    (void) scanout;
+    int ret = SDL_GL_MakeCurrent(NULL, NULL);
     (void) ret;
 }
 

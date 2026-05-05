@@ -1035,6 +1035,17 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 
 #if SEMU_HAS(VIRTIOGPU)
     emu->vgpu.ram = emu->ram;
+#endif
+
+#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
+    g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
+#endif
+
+#if SEMU_HAS(VIRTIOGPU)
+    /* VirGL initialization asks the window backend to create an OpenGL
+     * context through virglrenderer callbacks, so the SDL window must exist
+     * before the virtio-gpu backend is initialized.
+     */
     virtio_gpu_init(&(emu->vgpu));
     uint32_t scanout_id =
         virtio_gpu_register_scanout(&(emu->vgpu), SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1042,8 +1053,6 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-    g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
-
     emu->wake_fd[0] = emu->wake_fd[1] = -1;
     if (vm->n_hart > 1 && g_window.window_main_loop) {
         if (pipe(emu->wake_fd) < 0) {
