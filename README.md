@@ -129,6 +129,20 @@ project and can be listed in the guest with:
 # ls /usr/local/bin/df_*
 ```
 
+To smoke-test the experimental VirGL 3D path, rebuild the guest test tools
+image with the Mesa VirGL gallium driver and run the visible SDL/OpenGL path:
+
+```shell
+$ scripts/build-image.sh --virgl
+$ make ENABLE_VIRGL=1 semu minimal.dtb Image test-tools.img
+$ .ci/test-virgl.sh
+```
+
+The VirGL smoke script is intentionally not part of headless CI. It requires a
+host display because `semu` must create an SDL OpenGL window. Inside the guest it
+checks `/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and a short
+`glxgears` run.
+
 ## Usage
 
 ```shell
@@ -226,11 +240,13 @@ This command invokes the underlying script: `scripts/build-image.sh --all`, whic
 ### Script Usage
 
 ```
-./scripts/build-image.sh [--buildroot] [--linux] [--directfb2-test] [--all] [--no-ext4] [--clean-build] [--help]
+./scripts/build-image.sh [--buildroot] [--x11] [--virgl] [--linux] [--directfb2-test] [--all] [--no-ext4] [--clean-build] [--help]
 
 Options:
   --buildroot         Build Buildroot userland (produces rootfs.cpio and,
                       unless --no-ext4 is given, ext4.img for vda boot)
+  --x11               Build test-tools.img from an X11-enabled rootfs
+  --virgl             Build test-tools.img from an X11 rootfs with Mesa VirGL
   --directfb2-test    Build test-tools.img with the DirectFB2 test payload
   --linux             Build the Linux kernel
   --all               Build both Buildroot and Linux

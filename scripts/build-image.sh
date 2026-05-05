@@ -273,7 +273,7 @@ function stage_cxx_runtime
 
 function show_help {
     cat << EOF
-Usage: $0 [--buildroot] [--x11] [--linux] [--directfb2-test] [--all] [--no-ext4] [--clean-build] [--help]
+Usage: $0 [--buildroot] [--x11] [--virgl] [--linux] [--directfb2-test] [--all] [--no-ext4] [--clean-build] [--help]
 
 Options:
   --buildroot         Build Buildroot userland (produces rootfs.cpio and,

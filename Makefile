@@ -432,6 +432,10 @@ $(VGPU_CHAIN_TEST): tests/virtio-gpu-chain-test.c virtio-gpu.c virtio-gpu-desc.c
 test-vgpu-virgl-gate:
 	$(Q)bash tests/vgpu-virgl-gate-test.sh
 
+.PHONY: test-vgpu-virgl-image
+test-vgpu-virgl-image:
+	$(Q)bash tests/vgpu-virgl-image-test.sh
+
 .PHONY: test-vgpu-virgl-backend-build
 test-vgpu-virgl-backend-build:
 	$(Q)bash tests/vgpu-virgl-backend-build-test.sh

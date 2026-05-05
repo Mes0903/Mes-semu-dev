@@ -97,6 +97,7 @@ PREBUILT_INPUTS := \
     configs/busybox.config \
     configs/buildroot.config \
     configs/x11.config \
+    configs/virgl.config \
     configs/riscv-cross-file \
     scripts/build-image.sh \
     scripts/rootfs_ext4.sh \
