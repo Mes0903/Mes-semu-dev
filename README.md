@@ -155,6 +155,17 @@ can be run with:
 $ SEMU_VIRGL_REBOOT_TEST=1 .ci/test-virgl.sh
 ```
 
+For interactive VirGL crashes that make the whole VM exit, collect host-side
+evidence before reproducing the issue:
+
+```shell
+$ scripts/run-vgpu-crash-debug.sh
+```
+
+Use the guest normally from that terminal (`root`, `startx`, `glxgears`, mouse
+movement). If the `semu` host process segfaults, the script leaves the serial
+console output and a host `gdb` backtrace under `vgpu-crash-logs/`.
+
 ## Usage
 
 ```shell

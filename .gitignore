@@ -10,6 +10,7 @@ ext4.img
 test-tools.img
 rootfs.cpio
 prebuilt.sha1
+vgpu-crash-logs/
 
 # intermediate
 riscv-harts.dtsi
