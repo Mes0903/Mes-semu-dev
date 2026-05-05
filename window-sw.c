@@ -206,6 +206,8 @@ static void sdl_scanout_info_cleanup(struct sdl_scanout_info *scanout)
     if (scanout->gl_primary_fb)
         glDeleteFramebuffers(1, &scanout->gl_primary_fb);
     if (scanout->gl_context)
+        SDL_GL_MakeCurrent(scanout->window, NULL);
+    if (scanout->gl_context)
         SDL_GL_DeleteContext(scanout->gl_context);
 #endif
     if (scanout->renderer)
@@ -411,6 +413,15 @@ static bool sdl_scanout_apply_cursor_frame(
 }
 
 #if SEMU_HAS(VIRGL)
+static void sdl_scanout_detach_gl_context(struct sdl_scanout_info *scanout)
+{
+    if (!scanout->window)
+        return;
+
+    int ret = SDL_GL_MakeCurrent(scanout->window, NULL);
+    (void) ret;
+}
+
 static bool sdl_scanout_apply_gl_frame(
     struct sdl_scanout_info *scanout,
     const struct vgpu_display_gl_scanout_payload *frame)
@@ -435,12 +446,14 @@ static bool sdl_scanout_apply_gl_frame(
         fprintf(stderr, "%s(): incomplete VirGL scanout framebuffer\n",
                 __func__);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        sdl_scanout_detach_gl_context(scanout);
         return false;
     }
 
     scanout->gl_primary = *frame;
     scanout->gl_primary_valid = true;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    sdl_scanout_detach_gl_context(scanout);
     return true;
 }
 
@@ -454,8 +467,10 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
 
     int width = 0, height = 0;
     SDL_GetWindowSize(scanout->window, &width, &height);
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0) {
+        sdl_scanout_detach_gl_context(scanout);
         return;
+    }
 
     glViewport(0, 0, width, height);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -482,6 +497,7 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
     }
 
     SDL_GL_SwapWindow(scanout->window);
+    sdl_scanout_detach_gl_context(scanout);
 }
 #endif
 
@@ -759,6 +775,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     SDL_GL_SwapWindow(scanout->window);
+    sdl_scanout_detach_gl_context(scanout);
 #else
     SDL_SetRenderDrawColor(scanout->renderer, 0, 0, 0, 255);
     SDL_RenderClear(scanout->renderer);
@@ -848,7 +865,9 @@ virgl_renderer_gl_context vgpu_window_virgl_create_context(
                                 SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
     }
 
-    return SDL_GL_CreateContext(scanout->window);
+    virgl_renderer_gl_context ctx = SDL_GL_CreateContext(scanout->window);
+    sdl_scanout_detach_gl_context(scanout);
+    return ctx;
 }
 
 void vgpu_window_virgl_destroy_context(virgl_renderer_gl_context ctx)

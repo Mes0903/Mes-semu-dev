@@ -139,9 +139,15 @@ $ .ci/test-virgl.sh
 ```
 
 The VirGL smoke script is intentionally not part of headless CI. It requires a
-host display because `semu` must create an SDL OpenGL window. Inside the guest it
+host display because `semu` must create an SDL OpenGL window. The script checks
+the host SDL/VirGL build dependencies, starts guest `Xorg :0` when needed, then
 checks `/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and a short
-`glxgears` run.
+`glxgears` run. After that basic path passes, an optional reboot/reset check can
+be run with:
+
+```shell
+$ SEMU_VIRGL_REBOOT_TEST=1 .ci/test-virgl.sh
+```
 
 ## Usage
 

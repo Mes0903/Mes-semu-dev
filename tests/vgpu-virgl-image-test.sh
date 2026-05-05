@@ -61,10 +61,15 @@ require_literal 'glxgears' README.md
 
 require_file .ci/test-virgl.sh
 require_literal 'ENABLE_VIRGL=1' .ci/test-virgl.sh
+require_literal 'pkg-config --exists virglrenderer epoxy gl egl' \
+    .ci/test-virgl.sh
 require_literal './semu -k Image -c 1 -b minimal.dtb -d test-tools.img' \
     .ci/test-virgl.sh
+require_literal 'Xorg :0 -noreset -nolisten tcp' .ci/test-virgl.sh
+require_literal '__VIRGL_XORG_READY__' .ci/test-virgl.sh
 require_literal 'glxinfo -B' .ci/test-virgl.sh
 require_literal 'glxgears' .ci/test-virgl.sh
+require_literal 'SEMU_VIRGL_REBOOT_TEST' .ci/test-virgl.sh
 require_literal '__VIRGL_RENDERER_OK__' .ci/test-virgl.sh
 require_literal 'PASS: visible VirGL virtio-gpu smoke checks' .ci/test-virgl.sh
 
