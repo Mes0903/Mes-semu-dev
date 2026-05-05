@@ -150,53 +150,55 @@ function do_buildroot
         echo "buildroot/ already exists, skipping clone"
     fi
 
-    build_buildroot_rootfs default
+    if [[ $BUILD_DEFAULT_ROOTFS -eq 1 ]]; then
+        build_buildroot_rootfs default
 
-    # Always publish the cpio. It is the canonical buildroot output and
-    # serves both as the source for the ext4 image and as the legacy
-    # initramfs payload (when ENABLE_EXTERNAL_ROOT=0).
-    echo "Publishing rootfs.cpio"
-    cp -f buildroot/output/images/rootfs.cpio ./rootfs.cpio
+        # Always publish the cpio. It is the canonical buildroot output and
+        # serves both as the source for the ext4 image and as the legacy
+        # initramfs payload (when ENABLE_EXTERNAL_ROOT=0).
+        echo "Publishing rootfs.cpio"
+        cp -f buildroot/output/images/rootfs.cpio ./rootfs.cpio
 
-    # Build ext4.img unless --no-ext4 was passed. The make default
-    # (ENABLE_EXTERNAL_ROOT=1) boots from /dev/vda and needs this image.
-    # --no-ext4 is the escape hatch for users who only want the legacy
-    # initramfs path or do not have fakeroot/mkfs.ext4 installed.
-    if [[ $NO_EXT4 -eq 1 ]]; then
-        echo "Skipping ext4.img build (--no-ext4)"
-    else
-        ASSERT ./scripts/rootfs_ext4.sh ./rootfs.cpio ./ext4.img
+        # Build ext4.img unless --no-ext4 was passed. The make default
+        # (ENABLE_EXTERNAL_ROOT=1) boots from /dev/vda and needs this image.
+        # --no-ext4 is the escape hatch for users who only want the legacy
+        # initramfs path or do not have fakeroot/mkfs.ext4 installed.
+        if [[ $NO_EXT4 -eq 1 ]]; then
+            echo "Skipping ext4.img build (--no-ext4)"
+        else
+            ASSERT ./scripts/rootfs_ext4.sh ./rootfs.cpio ./ext4.img
+        fi
+    fi
 
-        local test_tools_rootfs=./rootfs.cpio
+    local test_tools_rootfs=./rootfs.cpio
+    if [[ $BUILD_X11 -eq 1 ]]; then
+        local test_tools_mode=x11
+        if [[ $BUILD_VIRGL -eq 1 ]]; then
+            test_tools_mode=x11-virgl
+        fi
+        build_buildroot_rootfs "$test_tools_mode"
+        test_tools_rootfs=./buildroot/output/images/rootfs.cpio
+    fi
+
+    if [[ $BUILD_DIRECTFB_TEST -eq 1 ]]; then
+        do_extra_packages
         if [[ $BUILD_X11 -eq 1 ]]; then
-            local test_tools_mode=x11
-            if [[ $BUILD_VIRGL -eq 1 ]]; then
-                test_tools_mode=x11-virgl
-            fi
-            build_buildroot_rootfs "$test_tools_mode"
-            test_tools_rootfs=./buildroot/output/images/rootfs.cpio
-        fi
-
-        if [[ $BUILD_DIRECTFB_TEST -eq 1 ]]; then
-            do_extra_packages
-            if [[ $BUILD_X11 -eq 1 ]]; then
-                stage_cxx_runtime
-            fi
-            if [[ $BUILD_VIRGL -eq 1 ]]; then
-                stage_virgl_smoke_marker
-            fi
-            ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
-                "$TEST_TOOLS_SIZE_MB" ./extra_packages
-        elif [[ $BUILD_X11 -eq 1 ]]; then
-            rm -rf extra_packages
-            mkdir -p extra_packages
             stage_cxx_runtime
-            if [[ $BUILD_VIRGL -eq 1 ]]; then
-                stage_virgl_smoke_marker
-            fi
-            ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
-                "$TEST_TOOLS_SIZE_MB" ./extra_packages
         fi
+        if [[ $BUILD_VIRGL -eq 1 ]]; then
+            stage_virgl_smoke_marker
+        fi
+        ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
+            "$TEST_TOOLS_SIZE_MB" ./extra_packages
+    elif [[ $BUILD_X11 -eq 1 ]]; then
+        rm -rf extra_packages
+        mkdir -p extra_packages
+        stage_cxx_runtime
+        if [[ $BUILD_VIRGL -eq 1 ]]; then
+            stage_virgl_smoke_marker
+        fi
+        ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
+            "$TEST_TOOLS_SIZE_MB" ./extra_packages
     fi
 }
 
@@ -320,6 +322,7 @@ EOF
 }
 
 BUILD_BUILDROOT=0
+BUILD_DEFAULT_ROOTFS=0
 BUILD_X11=0
 BUILD_VIRGL=0
 BUILD_DIRECTFB_TEST=0
@@ -331,6 +334,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --buildroot)
             BUILD_BUILDROOT=1
+            BUILD_DEFAULT_ROOTFS=1
             ;;
         --x11)
             BUILD_BUILDROOT=1
@@ -350,6 +354,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --all)
             BUILD_BUILDROOT=1
+            BUILD_DEFAULT_ROOTFS=1
             BUILD_LINUX=1
             ;;
         --no-ext4)
@@ -377,6 +382,10 @@ fi
 if [[ ( $BUILD_DIRECTFB_TEST -eq 1 || $BUILD_X11 -eq 1 ) && $NO_EXT4 -eq 1 ]]; then
     echo "Error: --x11/--directfb2-test requires an ext4 image; remove --no-ext4."
     show_help
+fi
+
+if [[ $BUILD_DIRECTFB_TEST -eq 1 && $BUILD_X11 -eq 0 ]]; then
+    BUILD_DEFAULT_ROOTFS=1
 fi
 
 if [[ $CLEAN_BUILD -eq 1 && $BUILD_BUILDROOT -eq 1 && -d buildroot ]]; then
