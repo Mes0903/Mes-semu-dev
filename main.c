@@ -1931,10 +1931,6 @@ static void *emu_thread_func(void *arg)
 {
     emu_state_t *emu = (emu_state_t *) arg;
 
-#if SEMU_HAS(VIRTIOGPU)
-    virtio_gpu_thread_enter(&emu->vgpu);
-#endif
-
     if (emu->debug)
         semu_run_debug(emu);
     else

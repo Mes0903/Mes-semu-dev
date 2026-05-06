@@ -38,10 +38,37 @@ struct vgpu_virgl_fence_state {
     uint64_t last_context_fence;
 };
 
+struct vgpu_virgl_ctrl_work {
+    virtio_gpu_state_t *vgpu;
+    struct virtio_gpu_ctrl_hdr hdr;
+    union {
+        struct virtio_gpu_ctx_create ctx_create;
+        struct virtio_gpu_ctx_destroy ctx_destroy;
+        struct virtio_gpu_ctx_resource ctx_resource;
+        struct virtio_gpu_resource_create_3d resource_create_3d;
+        struct virtio_gpu_res_unref resource_unref;
+        struct virtio_gpu_res_attach_backing attach_backing;
+        struct virtio_gpu_res_detach_backing detach_backing;
+        struct virtio_gpu_trans_to_host_2d transfer_to_host_2d;
+        struct virtio_gpu_transfer_host_3d transfer_3d;
+        struct virtio_gpu_set_scanout set_scanout;
+        struct virtio_gpu_res_flush resource_flush;
+        struct virtio_gpu_cmd_submit submit_3d;
+        struct virtio_gpu_get_capset_info get_capset_info;
+        struct virtio_gpu_get_capset get_capset;
+    } cmd;
+    struct iovec *iov;
+    int iov_count;
+    void *data;
+    size_t data_size;
+    size_t response_capacity;
+};
+
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
 static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 static uint32_t g_vgpu_virgl_pending_fences;
 static bool g_vgpu_virgl_poll_request_pending;
+static uint32_t g_vgpu_virgl_next_token;
 
 static uint32_t vgpu_virgl_count_capsets(void)
 {
@@ -108,6 +135,30 @@ static void vgpu_virgl_request_poll(void)
     if (!vgpu_renderer_submit(&request))
         __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
                          __ATOMIC_RELEASE);
+}
+
+static uint32_t vgpu_virgl_next_token(void)
+{
+    uint32_t token =
+        __atomic_add_fetch(&g_vgpu_virgl_next_token, 1, __ATOMIC_RELAXED);
+    return token ? token :
+                   __atomic_add_fetch(&g_vgpu_virgl_next_token, 1,
+                                      __ATOMIC_RELAXED);
+}
+
+static void vgpu_virgl_free_ctrl_work(struct vgpu_virgl_ctrl_work *work)
+{
+    if (!work)
+        return;
+
+    free(work->iov);
+    free(work->data);
+    free(work);
+}
+
+static void vgpu_virgl_release_ctrl_payload(void *payload)
+{
+    vgpu_virgl_free_ctrl_work(payload);
 }
 
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
@@ -193,7 +244,6 @@ static struct virgl_renderer_callbacks g_vgpu_virgl_callbacks = {
 
 static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
 {
-    vgpu_gl_lock();
     int ret = virgl_renderer_init(vgpu, VIRGL_RENDERER_THREAD_SYNC,
                                   &g_vgpu_virgl_callbacks);
     if (ret) {
@@ -201,39 +251,15 @@ static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): failed to initialize virglrenderer (%d)\n",
                 __func__, ret);
-        vgpu_gl_unlock();
         exit(EXIT_FAILURE);
     }
 
     vgpu_virgl_publish_capsets(vgpu);
 
-    /* virglrenderer initializes ctx0 on the caller's thread, but semu runs
-     * guest GPU commands on the emulator thread once the SDL main loop starts.
-     * Drop the init-thread current context; thread_enter will rebind ctx0 on
-     * the thread that actually executes virglrenderer commands.
+    /* virglrenderer initializes ctx0 on this SDL/main thread. Keep all later
+     * renderer work on the same owner through the renderer request queue.
      */
     vgpu_window_virgl_make_current(0, NULL);
-    vgpu_gl_unlock();
-}
-
-static void vgpu_virgl_thread_enter(virtio_gpu_state_t *vgpu)
-{
-    (void) vgpu;
-    vgpu_gl_lock();
-    virgl_renderer_force_ctx_0();
-    vgpu_gl_unlock();
-}
-
-static void vgpu_virgl_command_enter(virtio_gpu_state_t *vgpu)
-{
-    (void) vgpu;
-    vgpu_gl_lock();
-}
-
-static void vgpu_virgl_command_leave(virtio_gpu_state_t *vgpu)
-{
-    (void) vgpu;
-    vgpu_gl_unlock();
 }
 
 static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
@@ -244,26 +270,15 @@ static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
 
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
 {
-    vgpu_gl_lock();
-    vgpu_virgl_reset_poll_state();
-    memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
-    /* Clear display generations before virglrenderer destroys GL resources.
-     * This makes any queued GL scanout payload stale while the texture IDs it
-     * names are still valid.
-     */
-    if (g_virtio_gpu_sw_backend.reset)
-        g_virtio_gpu_sw_backend.reset(vgpu);
-    virgl_renderer_reset();
-    vgpu_virgl_publish_capsets(vgpu);
-    /* The renderer destroys all contexts/resources on reset. Mirror that in
-     * semu's ownership registry after the renderer reset completes.
-     */
-    while (g_vgpu_virgl_resources) {
-        struct vgpu_virgl_resource *res = g_vgpu_virgl_resources;
-        g_vgpu_virgl_resources = res->next;
-        free(res);
-    }
-    vgpu_gl_unlock();
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_RESET,
+        .payload = vgpu,
+    };
+    if (!vgpu_renderer_submit(&request))
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): dropped renderer reset request\n",
+                __func__);
 }
 
 #define VGPU_VIRGL_DELEGATE_CMD(name)                                         \
@@ -352,50 +367,93 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
                                       uint32_t type,
                                       uint32_t *plen)
 {
-    if (type == VIRTIO_GPU_RESP_OK_NODATA &&
-        (request->flags & VIRTIO_GPU_FLAG_FENCE)) {
-        uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
-        bool deferred = virtio_gpu_defer_ctrl_response(
-            vgpu, request, response_desc, type, generation);
+    *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
+}
 
+static void vgpu_virgl_complete_ctrl_work(
+    const struct vgpu_renderer_request *request,
+    struct vgpu_virgl_ctrl_work *work,
+    uint32_t response_type,
+    void *response,
+    size_t response_size)
+{
+    if (response_type == VIRTIO_GPU_RESP_OK_NODATA &&
+        (work->hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
         int ret;
-        if (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
+        vgpu_virgl_note_fence_created();
+        if (work->hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
             ret = virgl_renderer_context_create_fence(
-                request->ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
-                request->ring_idx, request->fence_id);
+                work->hdr.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                work->hdr.ring_idx, work->hdr.fence_id);
         } else {
             ret = virgl_renderer_create_fence(
-                (int) (uint32_t) request->fence_id, 0);
+                (int) (uint32_t) work->hdr.fence_id, 0);
         }
 
-        if (ret) {
-            if (deferred)
-                virtio_gpu_cancel_ctrl_response(vgpu, generation, request);
-            fprintf(stderr,
-                    VIRTIO_GPU_LOG_PREFIX
-                    "%s(): failed to create renderer fence %" PRIu64
-                    " for cmd 0x%x (%d)\n",
-                    __func__, request->fence_id, request->type, ret);
-            *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc,
-                                                   VIRTIO_GPU_RESP_ERR_UNSPEC);
-            return;
-        }
-        vgpu_virgl_note_fence_created();
-
-        if (deferred) {
+        if (!ret) {
             vgpu_virgl_request_poll();
-            *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
+            free(response);
             return;
         }
 
-        *plen =
-            virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
-        if (*plen)
-            vgpu_virgl_request_poll();
-        return;
+        vgpu_virgl_note_fence_completed();
+        free(response);
+        response = NULL;
+        response_size = 0;
+        response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
     }
 
-    *plen = virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = request->token,
+        .response_type = response_type,
+        .response = response,
+        .response_size = response_size,
+        .release_response = free,
+    };
+    if (!vgpu_renderer_complete(&completion))
+        free(response);
+}
+
+static bool vgpu_virgl_submit_ctrl_work(
+    virtio_gpu_state_t *vgpu,
+    const struct virtq_desc *response_desc,
+    struct vgpu_virgl_ctrl_work *work,
+    uint32_t response_type,
+    uint32_t *plen)
+{
+    uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
+    uint32_t token = vgpu_virgl_next_token();
+    if (!virtio_gpu_defer_ctrl_response_token(
+            vgpu, &work->hdr, response_desc, response_type, generation,
+            token)) {
+        struct virtio_gpu_ctrl_hdr hdr = work->hdr;
+        vgpu_virgl_free_ctrl_work(work);
+        *plen = virtio_gpu_write_ctrl_response(vgpu, &hdr, response_desc,
+                                               VIRTIO_GPU_RESP_ERR_UNSPEC);
+        return false;
+    }
+
+    work->response_capacity = response_desc->len;
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.id = token, .generation = generation},
+        .command_type = work->hdr.type,
+        .payload = work,
+        .payload_size = sizeof(*work),
+        .release_payload = vgpu_virgl_release_ctrl_payload,
+    };
+    if (!vgpu_renderer_submit(&request)) {
+        struct virtio_gpu_ctrl_hdr hdr = work->hdr;
+        virtio_gpu_cancel_ctrl_response_token(vgpu, generation, token);
+        *plen = virtio_gpu_write_ctrl_response(vgpu, &hdr, response_desc,
+                                               VIRTIO_GPU_RESP_ERR_UNSPEC);
+        vgpu_virgl_free_ctrl_work(work);
+        return false;
+    }
+
+    *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
+    return true;
 }
 
 static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
@@ -461,11 +519,20 @@ static void vgpu_virgl_cmd_ctx_create_handler(virtio_gpu_state_t *vgpu,
                                   VIRTIO_GPU_RESP_ERR_UNSPEC, plen);
         return;
     }
-    int ret = virgl_renderer_context_create(request->hdr.ctx_id, request->nlen,
-                                            request->debug_name);
-    vgpu_virgl_write_response(
-        vgpu, &request->hdr, response_desc,
-        ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    work->cmd.ctx_create = *request;
+    work->cmd.ctx_create.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
@@ -484,9 +551,20 @@ static void vgpu_virgl_cmd_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
-    virgl_renderer_context_destroy(request->hdr.ctx_id);
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    work->cmd.ctx_destroy = *request;
+    work->cmd.ctx_destroy.hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_ctx_attach_resource_handler(
@@ -506,10 +584,20 @@ static void vgpu_virgl_cmd_ctx_attach_resource_handler(
         *plen = 0;
         return;
     }
-    virgl_renderer_ctx_attach_resource(request->hdr.ctx_id,
-                                       request->resource_id);
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    work->cmd.ctx_resource = *request;
+    work->cmd.ctx_resource.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_ctx_detach_resource_handler(
@@ -529,10 +617,20 @@ static void vgpu_virgl_cmd_ctx_detach_resource_handler(
         *plen = 0;
         return;
     }
-    virgl_renderer_ctx_detach_resource(request->hdr.ctx_id,
-                                       request->resource_id);
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    work->cmd.ctx_resource = *request;
+    work->cmd.ctx_resource.hdr.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_resource_create_3d_handler(
@@ -569,31 +667,26 @@ static void vgpu_virgl_cmd_resource_create_3d_handler(
         return;
     }
 
-    struct virgl_renderer_resource_create_args args = {
-        .handle = request->resource_id,
-        .target = request->target,
-        .format = request->format,
-        .bind = request->bind,
-        .width = request->width,
-        .height = request->height,
-        .depth = request->depth,
-        .array_size = request->array_size,
-        .last_level = request->last_level,
-        .nr_samples = request->nr_samples,
-        .flags = request->flags,
-    };
-    int ret = virgl_renderer_resource_create(&args, NULL, 0);
-    if (ret) {
-        free(res);
+    res->resource_id = request->resource_id;
+    vgpu_virgl_insert_resource(res);
+
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_remove_resource(request->resource_id);
         vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                  VIRTIO_GPU_RESP_ERR_UNSPEC, plen);
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
         return;
     }
 
-    res->resource_id = request->resource_id;
-    vgpu_virgl_insert_resource(res);
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    work->cmd.resource_create_3d = *request;
+    work->cmd.resource_create_3d.hdr.type =
+        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    if (!vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                     VIRTIO_GPU_RESP_OK_NODATA, plen))
+        vgpu_virgl_remove_resource(request->resource_id);
 }
 
 static void vgpu_virgl_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
@@ -620,13 +713,20 @@ static void vgpu_virgl_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
     if (!response_desc)
         return;
 
-    vgpu_virgl_clear_resource_scanouts(vgpu, request->resource_id);
-    if (res->backing_attached)
-        vgpu_virgl_detach_iov(request->resource_id);
-    virgl_renderer_resource_unref(request->resource_id);
-    vgpu_virgl_remove_resource(request->resource_id);
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    work->cmd.resource_unref = *request;
+    work->cmd.resource_unref.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static bool vgpu_virgl_validate_backing_payload(
@@ -755,18 +855,23 @@ static void vgpu_virgl_cmd_resource_attach_backing_handler(
             return;
         }
     }
-    int ret = virgl_renderer_resource_attach_iov(request->resource_id, iov,
-                                                 (int) nr_entries);
-    if (ret) {
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
         free(iov);
         vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                  VIRTIO_GPU_RESP_ERR_UNSPEC, plen);
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
         return;
     }
 
-    res->backing_attached = true;
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    work->cmd.attach_backing = *request;
+    work->cmd.attach_backing.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    work->iov = iov;
+    work->iov_count = (int) nr_entries;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_resource_detach_backing_handler(
@@ -801,10 +906,20 @@ static void vgpu_virgl_cmd_resource_detach_backing_handler(
         return;
     }
 
-    vgpu_virgl_detach_iov(request->resource_id);
-    res->backing_attached = false;
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    work->cmd.detach_backing = *request;
+    work->cmd.detach_backing.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_transfer_to_host_2d_handler(
@@ -830,13 +945,21 @@ static void vgpu_virgl_cmd_transfer_to_host_2d_handler(
     if (!response_desc)
         return;
 
-    struct vgpu_virgl_box box = vgpu_virgl_box_from_rect(&request->r);
-    int ret = virgl_renderer_transfer_write_iov(request->resource_id, 0, 0, 0,
-                                                0, (struct virgl_box *) &box,
-                                                request->offset, NULL, 0);
-    vgpu_virgl_write_response(
-        vgpu, &request->hdr, response_desc,
-        ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    work->cmd.transfer_to_host_2d = *request;
+    work->cmd.transfer_to_host_2d.hdr.type =
+        VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_transfer_to_host_3d_handler(
@@ -870,14 +993,20 @@ static void vgpu_virgl_cmd_transfer_to_host_3d_handler(
         return;
     }
 
-    struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
-    int ret = virgl_renderer_transfer_write_iov(
-        request->resource_id, request->hdr.ctx_id, (int) request->level,
-        request->stride, request->layer_stride, (struct virgl_box *) &box,
-        request->offset, NULL, 0);
-    vgpu_virgl_write_response(
-        vgpu, &request->hdr, response_desc,
-        ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    work->cmd.transfer_3d = *request;
+    work->cmd.transfer_3d.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_transfer_from_host_3d_handler(
@@ -905,14 +1034,20 @@ static void vgpu_virgl_cmd_transfer_from_host_3d_handler(
         return;
     }
 
-    struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&request->box);
-    int ret = virgl_renderer_transfer_read_iov(
-        request->resource_id, request->hdr.ctx_id, request->level,
-        request->stride, request->layer_stride, (struct virgl_box *) &box,
-        request->offset, NULL, 0);
-    vgpu_virgl_write_response(
-        vgpu, &request->hdr, response_desc,
-        ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
+
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    work->cmd.transfer_3d = *request;
+    work->cmd.transfer_3d.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static struct virtio_gpu_scanout_info *vgpu_virgl_get_scanout(
@@ -1024,44 +1159,20 @@ static void vgpu_virgl_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    struct virgl_renderer_resource_info info = {0};
-    int ret =
-        virgl_renderer_resource_get_info((int) request->resource_id, &info);
-    if (ret) {
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
         vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                  VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID,
-                                  plen);
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
         return;
     }
 
-    if (!vgpu_virgl_rect_fits(info.width, info.height, &request->r) ||
-        request->r.width > scanout->width ||
-        request->r.height > scanout->height) {
-        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                  VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, plen);
-        return;
-    }
-
-    scanout->primary_resource_id = request->resource_id;
-    scanout->src_x = request->r.x;
-    scanout->src_y = request->r.y;
-    scanout->src_w = request->r.width;
-    scanout->src_h = request->r.height;
-
-    if (vgpu_display_can_publish()) {
-        struct vgpu_display_payload *payload =
-            vgpu_virgl_create_gl_payload(request->resource_id, scanout, &info);
-        if (!payload) {
-            vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                      VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
-            return;
-        }
-        virgl_renderer_force_ctx_0();
-        vgpu_display_publish_primary_set(request->scanout_id, payload);
-    }
-
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    work->cmd.set_scanout = *request;
+    work->cmd.set_scanout.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
@@ -1086,21 +1197,20 @@ static void vgpu_virgl_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
     if (!response_desc)
         return;
 
-    for (uint32_t i = 0; i < PRIV(vgpu)->num_scanouts; i++) {
-        struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[i];
-        if (!scanout->enabled ||
-            scanout->primary_resource_id != request->resource_id)
-            continue;
-
-        if (!vgpu_virgl_publish_gl_scanout(i, request->resource_id, scanout)) {
-            vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                                      VIRTIO_GPU_RESP_ERR_UNSPEC, plen);
-            return;
-        }
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
     }
 
-    vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
-                              VIRTIO_GPU_RESP_OK_NODATA, plen);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    work->cmd.resource_flush = *request;
+    work->cmd.resource_flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static void vgpu_virgl_cmd_submit_3d_handler(virtio_gpu_state_t *vgpu,
@@ -1150,13 +1260,23 @@ static void vgpu_virgl_cmd_submit_3d_handler(virtio_gpu_state_t *vgpu,
         }
         return;
     }
-    int ret = virgl_renderer_submit_cmd(
-        buffer, request->hdr.ctx_id, (int) (request->size / sizeof(uint32_t)));
-    free(buffer);
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        free(buffer);
+        vgpu_virgl_write_response(vgpu, &request->hdr, response_desc,
+                                  VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, plen);
+        return;
+    }
 
-    vgpu_virgl_write_response(
-        vgpu, &request->hdr, response_desc,
-        ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA, plen);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    work->cmd.submit_3d = *request;
+    work->cmd.submit_3d.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    work->data = buffer;
+    work->data_size = request->size;
+    vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
+                                VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
 
 static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
@@ -1188,6 +1308,286 @@ uint32_t virtio_gpu_backend_get_num_capsets(void)
     return vgpu_virgl_count_capsets();
 }
 
+static void vgpu_virgl_execute_ctrl_request(
+    const struct vgpu_renderer_request *request,
+    struct vgpu_virgl_ctrl_work *work)
+{
+    uint32_t response_type = VIRTIO_GPU_RESP_OK_NODATA;
+    void *response = NULL;
+    size_t response_size = 0;
+
+    switch (request->command_type) {
+    case VIRTIO_GPU_CMD_CTX_CREATE: {
+        const struct virtio_gpu_ctx_create *cmd = &work->cmd.ctx_create;
+        int ret = virgl_renderer_context_create(cmd->hdr.ctx_id, cmd->nlen,
+                                                cmd->debug_name);
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_CTX_DESTROY:
+        virgl_renderer_context_destroy(work->cmd.ctx_destroy.hdr.ctx_id);
+        break;
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+        virgl_renderer_ctx_attach_resource(
+            work->cmd.ctx_resource.hdr.ctx_id,
+            work->cmd.ctx_resource.resource_id);
+        break;
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
+        virgl_renderer_ctx_detach_resource(
+            work->cmd.ctx_resource.hdr.ctx_id,
+            work->cmd.ctx_resource.resource_id);
+        break;
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
+        const struct virtio_gpu_resource_create_3d *cmd =
+            &work->cmd.resource_create_3d;
+        struct virgl_renderer_resource_create_args args = {
+            .handle = cmd->resource_id,
+            .target = cmd->target,
+            .format = cmd->format,
+            .bind = cmd->bind,
+            .width = cmd->width,
+            .height = cmd->height,
+            .depth = cmd->depth,
+            .array_size = cmd->array_size,
+            .last_level = cmd->last_level,
+            .nr_samples = cmd->nr_samples,
+            .flags = cmd->flags,
+        };
+        int ret = virgl_renderer_resource_create(&args, NULL, 0);
+        if (ret) {
+            vgpu_virgl_remove_resource(cmd->resource_id);
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        }
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
+        const struct virtio_gpu_res_unref *cmd = &work->cmd.resource_unref;
+        struct vgpu_virgl_resource *res =
+            vgpu_virgl_find_resource(cmd->resource_id);
+        if (!res) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+        vgpu_virgl_clear_resource_scanouts(work->vgpu, cmd->resource_id);
+        if (res->backing_attached)
+            vgpu_virgl_detach_iov(cmd->resource_id);
+        virgl_renderer_resource_unref(cmd->resource_id);
+        vgpu_virgl_remove_resource(cmd->resource_id);
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: {
+        const struct virtio_gpu_res_attach_backing *cmd =
+            &work->cmd.attach_backing;
+        struct vgpu_virgl_resource *res =
+            vgpu_virgl_find_resource(cmd->resource_id);
+        if (!res || res->backing_attached) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        int ret = virgl_renderer_resource_attach_iov(
+            cmd->resource_id, work->iov, work->iov_count);
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        work->iov = NULL;
+        work->iov_count = 0;
+        res->backing_attached = true;
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: {
+        const struct virtio_gpu_res_detach_backing *cmd =
+            &work->cmd.detach_backing;
+        struct vgpu_virgl_resource *res =
+            vgpu_virgl_find_resource(cmd->resource_id);
+        if (!res || !res->backing_attached) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        vgpu_virgl_detach_iov(cmd->resource_id);
+        res->backing_attached = false;
+        break;
+    }
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: {
+        const struct virtio_gpu_trans_to_host_2d *cmd =
+            &work->cmd.transfer_to_host_2d;
+        struct vgpu_virgl_box box = vgpu_virgl_box_from_rect(&cmd->r);
+        int ret = virgl_renderer_transfer_write_iov(
+            cmd->resource_id, 0, 0, 0, 0, (struct virgl_box *) &box,
+            cmd->offset, NULL, 0);
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: {
+        const struct virtio_gpu_transfer_host_3d *cmd = &work->cmd.transfer_3d;
+        struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&cmd->box);
+        int ret = virgl_renderer_transfer_write_iov(
+            cmd->resource_id, cmd->hdr.ctx_id, (int) cmd->level, cmd->stride,
+            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL,
+            0);
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: {
+        const struct virtio_gpu_transfer_host_3d *cmd = &work->cmd.transfer_3d;
+        struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&cmd->box);
+        int ret = virgl_renderer_transfer_read_iov(
+            cmd->resource_id, cmd->hdr.ctx_id, cmd->level, cmd->stride,
+            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL,
+            0);
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_SUBMIT_3D: {
+        const struct virtio_gpu_cmd_submit *cmd = &work->cmd.submit_3d;
+        int ret = virgl_renderer_submit_cmd(
+            work->data, cmd->hdr.ctx_id,
+            (int) (cmd->size / sizeof(uint32_t)));
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_SET_SCANOUT: {
+        const struct virtio_gpu_set_scanout *cmd = &work->cmd.set_scanout;
+        struct virtio_gpu_scanout_info *scanout =
+            vgpu_virgl_get_scanout(work->vgpu, cmd->scanout_id);
+        if (!scanout) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+            break;
+        }
+
+        if (cmd->resource_id == 0) {
+            scanout->primary_resource_id = 0;
+            scanout->src_x = scanout->src_y = 0;
+            scanout->src_w = scanout->src_h = 0;
+            vgpu_display_publish_primary_clear(cmd->scanout_id);
+            break;
+        }
+
+        struct virgl_renderer_resource_info info = {0};
+        int ret = virgl_renderer_resource_get_info((int) cmd->resource_id,
+                                                   &info);
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+
+        if (!vgpu_virgl_rect_fits(info.width, info.height, &cmd->r) ||
+            cmd->r.width > scanout->width || cmd->r.height > scanout->height) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+
+        scanout->primary_resource_id = cmd->resource_id;
+        scanout->src_x = cmd->r.x;
+        scanout->src_y = cmd->r.y;
+        scanout->src_w = cmd->r.width;
+        scanout->src_h = cmd->r.height;
+
+        if (vgpu_display_can_publish()) {
+            struct vgpu_display_payload *payload =
+                vgpu_virgl_create_gl_payload(cmd->resource_id, scanout, &info);
+            if (!payload) {
+                response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+                break;
+            }
+            virgl_renderer_force_ctx_0();
+            vgpu_display_publish_primary_set(cmd->scanout_id, payload);
+        }
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_FLUSH: {
+        const struct virtio_gpu_res_flush *cmd = &work->cmd.resource_flush;
+        for (uint32_t i = 0; i < PRIV(work->vgpu)->num_scanouts; i++) {
+            struct virtio_gpu_scanout_info *scanout =
+                &PRIV(work->vgpu)->scanouts[i];
+            if (!scanout->enabled ||
+                scanout->primary_resource_id != cmd->resource_id)
+                continue;
+
+            if (!vgpu_virgl_publish_gl_scanout(i, cmd->resource_id,
+                                               scanout)) {
+                response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+                break;
+            }
+        }
+        break;
+    }
+    case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
+        const struct virtio_gpu_get_capset_info *cmd =
+            &work->cmd.get_capset_info;
+        struct virtio_gpu_resp_capset_info *out = calloc(1, sizeof(*out));
+        if (!out) {
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            break;
+        }
+        out->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            out->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+            out->hdr.fence_id = cmd->hdr.fence_id;
+        }
+        out->capset_id = vgpu_virgl_capset_id_for_index(cmd->capset_index);
+        if (out->capset_id) {
+            uint32_t max_version = 0;
+            uint32_t max_size = 0;
+            virgl_renderer_get_cap_set(out->capset_id, &max_version,
+                                       &max_size);
+            out->capset_max_version = max_version;
+            out->capset_max_size = max_size;
+        }
+        response = out;
+        response_size = sizeof(*out);
+        response_type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+        break;
+    }
+    case VIRTIO_GPU_CMD_GET_CAPSET: {
+        const struct virtio_gpu_get_capset *cmd = &work->cmd.get_capset;
+        uint32_t max_version = 0;
+        uint32_t max_size = 0;
+        virgl_renderer_get_cap_set(cmd->capset_id, &max_version, &max_size);
+        if (!max_version || !max_size || cmd->capset_version > max_version) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+
+        response_size = sizeof(struct virtio_gpu_resp_capset) + max_size;
+        if (response_size < max_size || response_size > UINT32_MAX ||
+            work->response_capacity < response_size) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            response_size = 0;
+            break;
+        }
+
+        struct virtio_gpu_resp_capset *out = calloc(1, response_size);
+        if (!out) {
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            response_size = 0;
+            break;
+        }
+        out->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            out->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+            out->hdr.fence_id = cmd->hdr.fence_id;
+        }
+        virgl_renderer_fill_caps(cmd->capset_id, cmd->capset_version,
+                                 out->capset_data);
+        response = out;
+        response_type = VIRTIO_GPU_RESP_OK_CAPSET;
+        break;
+    }
+    default:
+        response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        break;
+    }
+
+    vgpu_virgl_complete_ctrl_work(request, work, response_type, response,
+                                  response_size);
+}
+
 void vgpu_virgl_execute_renderer_request(
     const struct vgpu_renderer_request *request)
 {
@@ -1195,10 +1595,31 @@ void vgpu_virgl_execute_renderer_request(
         return;
 
     switch (request->type) {
+    case VGPU_RENDERER_REQ_RESET: {
+        virtio_gpu_state_t *vgpu = request->payload;
+        vgpu_virgl_reset_poll_state();
+        memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
+        if (g_virtio_gpu_sw_backend.reset)
+            g_virtio_gpu_sw_backend.reset(vgpu);
+        virgl_renderer_reset();
+        vgpu_virgl_publish_capsets(vgpu);
+        while (g_vgpu_virgl_resources) {
+            struct vgpu_virgl_resource *res = g_vgpu_virgl_resources;
+            g_vgpu_virgl_resources = res->next;
+            free(res);
+        }
+        break;
+    }
     case VGPU_RENDERER_REQ_POLL:
         virgl_renderer_poll();
         __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
                          __ATOMIC_RELEASE);
+        break;
+    case VGPU_RENDERER_REQ_CTRL:
+        vgpu_virgl_execute_ctrl_request(
+            request, (struct vgpu_virgl_ctrl_work *) request->payload);
+        vgpu_virgl_free_ctrl_work(
+            (struct vgpu_virgl_ctrl_work *) request->payload);
         break;
     default:
         fprintf(stderr,
@@ -1229,34 +1650,21 @@ static void vgpu_virgl_cmd_get_capset_info_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    struct virtio_gpu_resp_capset_info *response = virtio_gpu_mem_guest_to_host(
-        vgpu, vq_desc[resp_idx].addr,
-        sizeof(struct virtio_gpu_resp_capset_info));
-    if (!response) {
-        virtio_gpu_set_fail(vgpu);
-        *plen = 0;
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &request->hdr, &vq_desc[resp_idx],
+            VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
         return;
     }
 
-    memset(response, 0, sizeof(*response));
-    response->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
-    if (request->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
-        response->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
-        response->hdr.fence_id = request->hdr.fence_id;
-    }
-
-    response->capset_id = vgpu_virgl_capset_id_for_index(request->capset_index);
-    if (response->capset_id) {
-        uint32_t max_version = 0;
-        uint32_t max_size = 0;
-
-        virgl_renderer_get_cap_set(response->capset_id, &max_version,
-                                   &max_size);
-        response->capset_max_version = max_version;
-        response->capset_max_size = max_size;
-    }
-
-    *plen = sizeof(*response);
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    work->cmd.get_capset_info = *request;
+    work->cmd.get_capset_info.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    vgpu_virgl_submit_ctrl_work(vgpu, &vq_desc[resp_idx], work,
+                                VIRTIO_GPU_RESP_OK_CAPSET_INFO, plen);
 }
 
 static void vgpu_virgl_cmd_get_capset_handler(virtio_gpu_state_t *vgpu,
@@ -1278,50 +1686,25 @@ static void vgpu_virgl_cmd_get_capset_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    uint32_t max_version = 0;
-    uint32_t max_size = 0;
-    virgl_renderer_get_cap_set(request->capset_id, &max_version, &max_size);
-    if (!max_version || !max_size || request->capset_version > max_version) {
+    struct vgpu_virgl_ctrl_work *work = calloc(1, sizeof(*work));
+    if (!work) {
         *plen = virtio_gpu_write_ctrl_response(
             vgpu, &request->hdr, &vq_desc[resp_idx],
-            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+            VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
         return;
     }
 
-    size_t response_size = sizeof(struct virtio_gpu_resp_capset) + max_size;
-    if (response_size < max_size || response_size > UINT32_MAX ||
-        vq_desc[resp_idx].len < response_size) {
-        *plen = virtio_gpu_write_ctrl_response(
-            vgpu, &request->hdr, &vq_desc[resp_idx],
-            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
-        return;
-    }
-
-    struct virtio_gpu_resp_capset *response = virtio_gpu_mem_guest_to_host(
-        vgpu, vq_desc[resp_idx].addr, (uint32_t) response_size);
-    if (!response) {
-        virtio_gpu_set_fail(vgpu);
-        *plen = 0;
-        return;
-    }
-
-    memset(response, 0, sizeof(*response));
-    response->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
-    if (request->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
-        response->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
-        response->hdr.fence_id = request->hdr.fence_id;
-    }
-    virgl_renderer_fill_caps(request->capset_id, request->capset_version,
-                             response->capset_data);
-
-    *plen = (uint32_t) response_size;
+    work->vgpu = vgpu;
+    work->hdr = request->hdr;
+    work->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    work->cmd.get_capset = *request;
+    work->cmd.get_capset.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    vgpu_virgl_submit_ctrl_work(vgpu, &vq_desc[resp_idx], work,
+                                VIRTIO_GPU_RESP_OK_CAPSET, plen);
 }
 
 const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .init = vgpu_virgl_init,
-    .thread_enter = vgpu_virgl_thread_enter,
-    .command_enter = vgpu_virgl_command_enter,
-    .command_leave = vgpu_virgl_command_leave,
     .poll = vgpu_virgl_poll,
     .reset = vgpu_virgl_delegate_reset,
     .get_display_info = vgpu_virgl_delegate_get_display_info,

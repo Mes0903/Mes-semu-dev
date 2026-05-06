@@ -14,6 +14,10 @@
 
 static int wake_count;
 static int backend_wake_count;
+static int released_payload_count;
+static void *last_released_payload;
+static int released_response_count;
+static void *last_released_response;
 
 static void test_wake_frontend(void)
 {
@@ -44,6 +48,18 @@ static struct vgpu_renderer_completion test_completion(uint32_t id,
         .token = {.id = id, .generation = generation},
         .response_type = VIRTIO_GPU_RESP_OK_NODATA,
     };
+}
+
+static void release_payload(void *payload)
+{
+    released_payload_count++;
+    last_released_payload = payload;
+}
+
+static void release_response(void *response)
+{
+    released_response_count++;
+    last_released_response = response;
 }
 
 static int test_request_fifo_ordering(void)
@@ -157,6 +173,48 @@ static int test_reset_generation_filters_stale_completions(void)
     return 0;
 }
 
+static int test_reset_releases_queued_request_payloads(void)
+{
+    vgpu_renderer_reset_queues(1);
+    released_payload_count = 0;
+    last_released_payload = NULL;
+
+    struct vgpu_renderer_request request = test_request(40);
+    request.release_payload = release_payload;
+    CHECK(vgpu_renderer_submit(&request));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_payload_count == 1);
+    CHECK(last_released_payload == request.payload);
+
+    struct vgpu_renderer_request out;
+    CHECK(!vgpu_renderer_pop_request(&out));
+    return 0;
+}
+
+static int test_reset_releases_queued_completion_responses(void)
+{
+    vgpu_renderer_reset_queues(1);
+    released_response_count = 0;
+    last_released_response = NULL;
+
+    struct vgpu_renderer_completion completion = test_completion(41, 1);
+    completion.response = (void *) (uintptr_t) 0x41410000U;
+    completion.response_size = 32;
+    completion.release_response = release_response;
+    CHECK(vgpu_renderer_complete(&completion));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_response_count == 1);
+    CHECK(last_released_response == completion.response);
+
+    struct vgpu_renderer_completion out;
+    CHECK(!vgpu_renderer_pop_completion(&out));
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_request_fifo_ordering() == 0);
@@ -164,5 +222,7 @@ int main(void)
     CHECK(test_completion_wakes_backend() == 0);
     CHECK(test_full_queue_rejects_newest_request() == 0);
     CHECK(test_reset_generation_filters_stale_completions() == 0);
+    CHECK(test_reset_releases_queued_request_payloads() == 0);
+    CHECK(test_reset_releases_queued_completion_responses() == 0);
     return 0;
 }

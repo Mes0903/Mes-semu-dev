@@ -35,12 +35,16 @@ struct vgpu_renderer_request {
     uint32_t command_type;
     void *payload;
     size_t payload_size;
+    void (*release_payload)(void *payload);
 };
 
 struct vgpu_renderer_completion {
     enum vgpu_renderer_completion_type type;
     struct vgpu_renderer_token token;
     uint32_t response_type;
+    void *response;
+    size_t response_size;
+    void (*release_response)(void *response);
     bool context_fence;
     uint32_t ctx_id;
     uint32_t ring_idx;

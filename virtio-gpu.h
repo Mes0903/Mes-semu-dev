@@ -67,6 +67,7 @@ struct virtio_gpu_pending_ctrl {
     uint32_t response_type;
     uint32_t request_type;
     uint32_t request_flags;
+    uint32_t token_id;
     uint64_t fence_id;
     uint32_t ctx_id;
     uint32_t ring_idx;
@@ -356,15 +357,11 @@ enum virtio_gpu_formats {
 typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
                                     struct virtq_desc *vq_desc,
                                     uint32_t *plen);
-typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 
 struct virtio_gpu_cmd_backend {
-    virtio_gpu_backend_lifecycle_func init;
-    virtio_gpu_backend_lifecycle_func thread_enter;
-    virtio_gpu_backend_lifecycle_func command_enter;
-    virtio_gpu_backend_lifecycle_func command_leave;
-    virtio_gpu_backend_lifecycle_func poll;
-    virtio_gpu_backend_lifecycle_func reset;
+    void (*init)(virtio_gpu_state_t *vgpu);
+    void (*poll)(virtio_gpu_state_t *vgpu);
+    void (*reset)(virtio_gpu_state_t *vgpu);
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
     virtio_gpu_cmd_func resource_create_2d;
@@ -398,7 +395,6 @@ struct virtio_gpu_cmd_backend {
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_sw_backend;
 uint32_t virtio_gpu_backend_get_num_capsets(void);
-void virtio_gpu_thread_enter(virtio_gpu_state_t *vgpu);
 void virtio_gpu_poll(virtio_gpu_state_t *vgpu);
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
@@ -437,10 +433,20 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
                                     const struct virtq_desc *response_desc,
                                     uint32_t response_type,
                                     uint32_t generation);
+bool virtio_gpu_defer_ctrl_response_token(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_ctrl_hdr *request,
+    const struct virtq_desc *response_desc,
+    uint32_t response_type,
+    uint32_t generation,
+    uint32_t token_id);
 bool virtio_gpu_cancel_ctrl_response(
     virtio_gpu_state_t *vgpu,
     uint32_t generation,
     const struct virtio_gpu_ctrl_hdr *request);
+bool virtio_gpu_cancel_ctrl_response_token(virtio_gpu_state_t *vgpu,
+                                           uint32_t generation,
+                                           uint32_t token_id);
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu);
 void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
                                 uint32_t num_capsets);
@@ -450,6 +456,12 @@ void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
                                        bool context_fence,
                                        uint32_t ctx_id,
                                        uint32_t ring_idx);
+void virtio_gpu_complete_ctrl_response_token(virtio_gpu_state_t *vgpu,
+                                             uint32_t generation,
+                                             uint32_t token_id,
+                                             uint32_t response_type,
+                                             const void *response,
+                                             size_t response_size);
 void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
                                bool context_fence,
                                uint32_t ctx_id,

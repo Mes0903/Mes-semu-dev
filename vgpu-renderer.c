@@ -29,6 +29,32 @@ static bool vgpu_renderer_completion_queue_full(void)
     return ((head + 1U) & VGPU_RENDERER_QUEUE_MASK) == tail;
 }
 
+static void vgpu_renderer_release_queued_requests(void)
+{
+    uint32_t tail = __atomic_load_n(&request_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&request_head, __ATOMIC_ACQUIRE);
+
+    while (tail != head) {
+        struct vgpu_renderer_request request = request_queue[tail];
+        if (request.release_payload)
+            request.release_payload(request.payload);
+        tail = (tail + 1U) & VGPU_RENDERER_QUEUE_MASK;
+    }
+}
+
+static void vgpu_renderer_release_queued_completions(void)
+{
+    uint32_t tail = __atomic_load_n(&completion_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&completion_head, __ATOMIC_ACQUIRE);
+
+    while (tail != head) {
+        struct vgpu_renderer_completion completion = completion_queue[tail];
+        if (completion.response && completion.release_response)
+            completion.release_response(completion.response);
+        tail = (tail + 1U) & VGPU_RENDERER_QUEUE_MASK;
+    }
+}
+
 void vgpu_renderer_set_wake_frontend(void (*wake_frontend)(void))
 {
     __atomic_store_n(&wake_frontend_cb, wake_frontend, __ATOMIC_RELEASE);
@@ -124,6 +150,8 @@ bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion)
 
 void vgpu_renderer_reset_queues(uint32_t generation)
 {
+    vgpu_renderer_release_queued_requests();
+    vgpu_renderer_release_queued_completions();
     __atomic_store_n(&active_generation, generation, __ATOMIC_RELEASE);
     __atomic_store_n(&request_head, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&request_tail, 0, __ATOMIC_RELEASE);

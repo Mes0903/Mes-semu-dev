@@ -133,6 +133,25 @@ uint32_t virtio_gpu_write_ctrl_response(
     return sizeof(*response);
 }
 
+static uint32_t virtio_gpu_write_ctrl_response_payload(
+    virtio_gpu_state_t *vgpu,
+    const struct virtq_desc *response_desc,
+    const void *response,
+    size_t response_size)
+{
+    if (!response || response_size < sizeof(struct virtio_gpu_ctrl_hdr) ||
+        response_size > UINT32_MAX || response_desc->len < response_size)
+        return 0;
+
+    void *dst = virtio_gpu_mem_guest_to_host(vgpu, response_desc->addr,
+                                             (uint32_t) response_size);
+    if (!dst)
+        return 0;
+
+    memcpy(dst, response, response_size);
+    return (uint32_t) response_size;
+}
+
 static void virtio_gpu_push_used(virtio_gpu_state_t *vgpu,
                                  uint8_t queue_index,
                                  uint16_t buffer_idx,
@@ -178,11 +197,13 @@ static void virtio_gpu_clear_pending_ctrls(virtio_gpu_state_t *vgpu)
 #endif
 }
 
-bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
-                                    const struct virtio_gpu_ctrl_hdr *request,
-                                    const struct virtq_desc *response_desc,
-                                    uint32_t response_type,
-                                    uint32_t generation)
+bool virtio_gpu_defer_ctrl_response_token(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_ctrl_hdr *request,
+    const struct virtq_desc *response_desc,
+    uint32_t response_type,
+    uint32_t generation,
+    uint32_t token_id)
 {
     if (!request || !response_desc)
         return false;
@@ -207,6 +228,7 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
             .response_type = response_type,
             .request_type = request->type,
             .request_flags = request->flags,
+            .token_id = token_id,
             .fence_id = request->fence_id,
             .ctx_id = request->ctx_id,
             .ring_idx = request->ring_idx,
@@ -219,6 +241,16 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
             "%s(): no free pending ctrl slot for fence %" PRIu64 "\n",
             __func__, request->fence_id);
     return false;
+}
+
+bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
+                                    const struct virtio_gpu_ctrl_hdr *request,
+                                    const struct virtq_desc *response_desc,
+                                    uint32_t response_type,
+                                    uint32_t generation)
+{
+    return virtio_gpu_defer_ctrl_response_token(
+        vgpu, request, response_desc, response_type, generation, 0);
 }
 
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
@@ -250,11 +282,33 @@ bool virtio_gpu_cancel_ctrl_response(
         struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
         if (!pending->active || pending->generation != generation)
             continue;
+        if (pending->token_id)
+            continue;
         if (pending->request_type != request->type ||
             pending->request_flags != request->flags ||
             pending->fence_id != request->fence_id ||
             pending->ctx_id != request->ctx_id ||
             pending->ring_idx != request->ring_idx)
+            continue;
+
+        memset(pending, 0, sizeof(*pending));
+        return true;
+    }
+
+    return false;
+}
+
+bool virtio_gpu_cancel_ctrl_response_token(virtio_gpu_state_t *vgpu,
+                                           uint32_t generation,
+                                           uint32_t token_id)
+{
+    if (!vgpu->priv || !token_id)
+        return false;
+
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_CTRLS_MAX; i++) {
+        struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
+        if (!pending->active || pending->generation != generation ||
+            pending->token_id != token_id)
             continue;
 
         memset(pending, 0, sizeof(*pending));
@@ -277,6 +331,8 @@ static bool virtio_gpu_pending_ctrl_matches(
 
     bool pending_fenced =
         (pending->request_flags & VIRTIO_GPU_FLAG_FENCE) != 0;
+    if (!pending_fenced && pending->token_id)
+        return false;
     if (!pending_fenced)
         return !context_fence && fence_id == 0;
 
@@ -290,6 +346,29 @@ static bool virtio_gpu_pending_ctrl_matches(
         return true;
 
     return pending->ctx_id == ctx_id && pending->ring_idx == ring_idx;
+}
+
+static uint32_t virtio_gpu_finish_pending_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_pending_ctrl *done,
+    uint32_t response_type,
+    const void *response,
+    size_t response_size)
+{
+    struct virtio_gpu_ctrl_hdr request = {
+        .type = done->request_type,
+        .flags = done->request_flags,
+        .fence_id = done->fence_id,
+        .ctx_id = done->ctx_id,
+        .ring_idx = done->ring_idx,
+    };
+
+    if (response)
+        return virtio_gpu_write_ctrl_response_payload(
+            vgpu, &done->response_desc, response, response_size);
+
+    return virtio_gpu_write_ctrl_response(vgpu, &request, &done->response_desc,
+                                          response_type);
 }
 
 void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
@@ -314,21 +393,47 @@ void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
         struct virtio_gpu_pending_ctrl done = *pending;
         memset(pending, 0, sizeof(*pending));
 
-        struct virtio_gpu_ctrl_hdr request = {
-            .type = done.request_type,
-            .flags = done.request_flags,
-            .fence_id = done.fence_id,
-            .ctx_id = done.ctx_id,
-            .ring_idx = done.ring_idx,
-        };
-        uint32_t len = virtio_gpu_write_ctrl_response(
-            vgpu, &request, &done.response_desc, done.response_type);
+        uint32_t len = virtio_gpu_finish_pending_ctrl(
+            vgpu, &done, done.response_type, NULL, 0);
         if (!len) {
             virtio_gpu_set_fail(vgpu);
             continue;
         }
 
         virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
+    }
+}
+
+void virtio_gpu_complete_ctrl_response_token(virtio_gpu_state_t *vgpu,
+                                             uint32_t generation,
+                                             uint32_t token_id,
+                                             uint32_t response_type,
+                                             const void *response,
+                                             size_t response_size)
+{
+    if (!vgpu->priv || !token_id)
+        return;
+    if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+        return;
+
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_CTRLS_MAX; i++) {
+        struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
+        if (!pending->active || pending->generation != generation ||
+            pending->token_id != token_id)
+            continue;
+
+        struct virtio_gpu_pending_ctrl done = *pending;
+        memset(pending, 0, sizeof(*pending));
+
+        uint32_t len = virtio_gpu_finish_pending_ctrl(
+            vgpu, &done, response_type, response, response_size);
+        if (!len) {
+            virtio_gpu_set_fail(vgpu);
+            return;
+        }
+
+        virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
+        return;
     }
 }
 
@@ -344,20 +449,47 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
 }
 
 #if SEMU_HAS(VIRGL)
+static void virtio_gpu_release_renderer_completion(
+    struct vgpu_renderer_completion *completion)
+{
+    if (!completion->response)
+        return;
+    if (completion->release_response)
+        completion->release_response(completion->response);
+    else
+        free(completion->response);
+    completion->response = NULL;
+}
+
 static void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
 {
     struct vgpu_renderer_completion completion;
     while (vgpu_renderer_pop_completion(&completion)) {
         switch (completion.type) {
         case VGPU_RENDERER_DONE_CTRL:
+            if (completion.token.id) {
+                virtio_gpu_complete_ctrl_response_token(
+                    vgpu, completion.token.generation, completion.token.id,
+                    completion.response_type, completion.response,
+                    completion.response_size);
+            } else {
+                virtio_gpu_complete_ctrl_response(
+                    vgpu, completion.token.generation, completion.fence_id,
+                    completion.context_fence, completion.ctx_id,
+                    completion.ring_idx);
+            }
+            virtio_gpu_release_renderer_completion(&completion);
+            break;
         case VGPU_RENDERER_DONE_FENCE:
             virtio_gpu_complete_ctrl_response(
                 vgpu, completion.token.generation, completion.fence_id,
                 completion.context_fence, completion.ctx_id,
                 completion.ring_idx);
+            virtio_gpu_release_renderer_completion(&completion);
             break;
         case VGPU_RENDERER_DONE_FATAL:
             virtio_gpu_set_fail(vgpu);
+            virtio_gpu_release_renderer_completion(&completion);
             break;
         }
     }
@@ -905,9 +1037,6 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         return 0;
     }
 
-    if (g_virtio_gpu_backend.command_enter)
-        g_virtio_gpu_backend.command_enter(vgpu);
-
     int ret = 0;
 
     /* Process the command */
@@ -945,9 +1074,6 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         ret = -1;
         break;
     }
-
-    if (g_virtio_gpu_backend.command_leave)
-        g_virtio_gpu_backend.command_leave(vgpu);
 
     return ret;
 }
@@ -1361,12 +1487,6 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu)
     vgpu->priv = &virtio_gpu_data;
     if (g_virtio_gpu_backend.init)
         g_virtio_gpu_backend.init(vgpu);
-}
-
-void virtio_gpu_thread_enter(virtio_gpu_state_t *vgpu)
-{
-    if (g_virtio_gpu_backend.thread_enter)
-        g_virtio_gpu_backend.thread_enter(vgpu);
 }
 
 void virtio_gpu_poll(virtio_gpu_state_t *vgpu)

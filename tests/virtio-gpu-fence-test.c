@@ -11,7 +11,9 @@
 #define AVAIL_WORD 128U
 #define USED_WORD 160U
 #define REQ_ADDR 1024U
+#define REQ2_ADDR 1152U
 #define RESP_ADDR 2048U
+#define RESP2_ADDR 2176U
 
 #define CHECK(cond)                                                          \
     do {                                                                     \
@@ -24,6 +26,7 @@
 
 static uint8_t g_ram[TEST_RAM_SIZE];
 static bool g_defer_unfenced;
+static bool g_defer_tokenized;
 static bool g_complete_during_submit;
 static bool g_cancel_after_defer;
 static bool g_cancel_result;
@@ -70,6 +73,11 @@ static struct virtio_gpu_ctrl_hdr *response_hdr(void)
     return (struct virtio_gpu_ctrl_hdr *) &g_ram[RESP_ADDR];
 }
 
+static struct virtio_gpu_ctrl_hdr *response2_hdr(void)
+{
+    return (struct virtio_gpu_ctrl_hdr *) &g_ram[RESP2_ADDR];
+}
+
 static uint16_t used_idx(void)
 {
     return (uint16_t) (ram_words()[USED_WORD] >> 16);
@@ -104,6 +112,7 @@ static virtio_gpu_state_t fresh_vgpu(void)
     memset(g_ram, 0, sizeof(g_ram));
     memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
     g_defer_unfenced = false;
+    g_defer_tokenized = false;
     g_complete_during_submit = false;
     g_cancel_after_defer = false;
     g_cancel_result = false;
@@ -145,6 +154,30 @@ static void queue_one_submit(uint32_t flags,
     ram_words()[AVAIL_WORD + 1U] = 0;
 }
 
+static void queue_two_unfenced_submits(void)
+{
+    struct virtio_gpu_ctrl_hdr first = {
+        .type = VIRTIO_GPU_CMD_SUBMIT_3D,
+        .ctx_id = 101,
+    };
+    struct virtio_gpu_ctrl_hdr second = {
+        .type = VIRTIO_GPU_CMD_SUBMIT_3D,
+        .ctx_id = 202,
+    };
+
+    memcpy(&g_ram[REQ_ADDR], &first, sizeof(first));
+    memcpy(&g_ram[REQ2_ADDR], &second, sizeof(second));
+    write_desc(0, REQ_ADDR, sizeof(first), VIRTIO_DESC_F_NEXT, 1);
+    write_desc(1, RESP_ADDR, sizeof(struct virtio_gpu_ctrl_hdr),
+               VIRTIO_DESC_F_WRITE, 0);
+    write_desc(2, REQ2_ADDR, sizeof(second), VIRTIO_DESC_F_NEXT, 3);
+    write_desc(3, RESP2_ADDR, sizeof(struct virtio_gpu_ctrl_hdr),
+               VIRTIO_DESC_F_WRITE, 0);
+
+    ram_words()[AVAIL_WORD] = 2U << 16;
+    ram_words()[AVAIL_WORD + 1U] = 2U << 16;
+}
+
 static void fake_submit_3d(virtio_gpu_state_t *vgpu,
                            struct virtq_desc *vq_desc,
                            uint32_t *plen)
@@ -165,6 +198,14 @@ static void fake_submit_3d(virtio_gpu_state_t *vgpu,
     }
 
     uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
+    if (g_defer_tokenized &&
+        virtio_gpu_defer_ctrl_response_token(
+            vgpu, request, &vq_desc[resp_idx], VIRTIO_GPU_RESP_OK_NODATA,
+            generation, request->ctx_id)) {
+        *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
+        return;
+    }
+
     if ((g_defer_unfenced || (request->flags & VIRTIO_GPU_FLAG_FENCE)) &&
         virtio_gpu_defer_ctrl_response(vgpu, request, &vq_desc[resp_idx],
                                        VIRTIO_GPU_RESP_OK_NODATA,
@@ -289,6 +330,68 @@ static int test_unfenced_deferred_submit_completes_generically(void)
     return 0;
 }
 
+static int test_tokenized_unfenced_completions_complete_only_matching_ctrl(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    g_defer_tokenized = true;
+    queue_two_unfenced_submits();
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    CHECK(vgpu.queues[VIRTIO_GPU_CONTROLQ].last_avail == 2);
+    CHECK(used_idx() == 0);
+    CHECK(response_hdr()->type == 0);
+    CHECK(response2_hdr()->type == 0);
+
+    virtio_gpu_complete_ctrl_response_token(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 202,
+        VIRTIO_GPU_RESP_ERR_UNSPEC, NULL, 0);
+
+    CHECK(used_idx() == 1);
+    CHECK(used_elem_id(0) == 2);
+    CHECK(response_hdr()->type == 0);
+    CHECK(response2_hdr()->type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+
+    virtio_gpu_complete_ctrl_response_token(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 101,
+        VIRTIO_GPU_RESP_OK_NODATA, NULL, 0);
+
+    CHECK(used_idx() == 2);
+    CHECK(used_elem_id(1) == 0);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    return 0;
+}
+
+static int test_tokenized_cancel_drops_only_matching_ctrl(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    g_defer_tokenized = true;
+    queue_two_unfenced_submits();
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    CHECK(vgpu.queues[VIRTIO_GPU_CONTROLQ].last_avail == 2);
+    CHECK(used_idx() == 0);
+
+    CHECK(virtio_gpu_cancel_ctrl_response_token(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 202));
+
+    virtio_gpu_complete_ctrl_response_token(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 101,
+        VIRTIO_GPU_RESP_OK_NODATA, NULL, 0);
+    virtio_gpu_complete_ctrl_response_token(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 202,
+        VIRTIO_GPU_RESP_ERR_UNSPEC, NULL, 0);
+
+    CHECK(used_idx() == 1);
+    CHECK(used_elem_id(0) == 0);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response2_hdr()->type == 0);
+
+    return 0;
+}
+
 static int test_sync_completion_after_defer_is_not_lost(void)
 {
     virtio_gpu_state_t vgpu = fresh_vgpu();
@@ -380,6 +483,9 @@ static int test_num_capsets_config_read_uses_cached_device_state(void)
 int main(void)
 {
     CHECK(test_unfenced_deferred_submit_completes_generically() == 0);
+    CHECK(test_tokenized_unfenced_completions_complete_only_matching_ctrl() ==
+          0);
+    CHECK(test_tokenized_cancel_drops_only_matching_ctrl() == 0);
     CHECK(test_fenced_submit_completes_used_ring_after_fence() == 0);
     CHECK(test_context_fence_requires_matching_context_and_ring() == 0);
     CHECK(test_reset_drops_pending_fence_without_writing_stale_response() == 0);

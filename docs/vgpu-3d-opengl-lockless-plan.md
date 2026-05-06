@@ -806,7 +806,7 @@ link.
 scanout/flush, reset, and init execution are still synchronous backend calls
 under the temporary GL mutex until the full command decode/execute split lands.
 
-- [ ] **Step 1: Split decode from execute**
+- [x] **Step 1: Split decode from execute**
 
 In `virtio-gpu-virgl.c`, keep guest descriptor parsing on the emulator thread.
 For each renderer-backed command, copy guest-provided payload into a
@@ -834,7 +834,7 @@ Commands that must go through the GL owner:
 - renderer `POLL`
 - renderer `RESET`
 
-- [ ] **Step 2: Keep software-only commands synchronous**
+- [x] **Step 2: Keep software-only commands synchronous**
 
 Commands delegated to the software backend can stay synchronous while
 `ENABLE_VIRGL=1`:
@@ -844,7 +844,7 @@ Commands delegated to the software backend can stay synchronous while
 - `GET_EDID`
 - CPU cursor update/move payload creation
 
-- [ ] **Step 3: Drain renderer requests from the SDL loop**
+- [x] **Step 3: Drain renderer requests from the SDL loop**
 
 In `window_main_loop_sw()`, drain renderer requests before display rendering:
 
@@ -860,19 +860,19 @@ In `window_main_loop_sw()`, drain renderer requests before display rendering:
 `window_drain_renderer_queue()` must run on the SDL main thread and call the
 VirGL execute functions directly.
 
-- [ ] **Step 4: Return completions to the emulator thread**
+- [x] **Step 4: Return completions to the emulator thread**
 
 After each request completes, enqueue `struct vgpu_renderer_completion` through
 `vgpu_renderer_complete()` and wake the emulator thread using the existing
 backend wake pipe.
 
-- [ ] **Step 5: Drain renderer completions from emulator ticks**
+- [x] **Step 5: Drain renderer completions from emulator ticks**
 
 In `emu_tick_peripherals()`, before `virtio_gpu_poll(&emu->vgpu)`, drain all
 renderer completions and call `virtio_gpu_complete_ctrl_response()` for each
 matching token.
 
-- [ ] **Step 6: Cache `num_capsets` outside the MMIO config read path**
+- [x] **Step 6: Cache `num_capsets` outside the MMIO config read path**
 
 During renderer init and reset, the GL owner calls
 `virgl_renderer_get_cap_set()` for `VIRTIO_GPU_CAPSET_VIRGL` and
@@ -881,13 +881,13 @@ virtio-gpu state. `virtio_gpu_reg_read()` must answer
 `virtio_gpu_config.num_capsets` from that cache and must not call
 `virtio_gpu_backend_get_num_capsets()` or any virglrenderer API.
 
-- [ ] **Step 7: Move fence callbacks to the completion queue**
+- [x] **Step 7: Move fence callbacks to the completion queue**
 
 VirGL `write_fence` and `write_context_fence` callbacks must enqueue
 `VGPU_RENDERER_DONE_FENCE`. They must not write guest memory or used-ring state
 directly.
 
-- [ ] **Step 8: Add renderer poll/wakeup ownership**
+- [x] **Step 8: Add renderer poll/wakeup ownership**
 
 The GL owner must drive `virgl_renderer_poll()`.
 
@@ -899,7 +899,7 @@ The GL owner must drive `virgl_renderer_poll()`.
 - Every fence or controlq completion enqueued by the GL owner must call
   `g_window.window_wake_backend()` to unblock the emulator thread.
 
-- [ ] **Step 9: Remove backend lock hooks**
+- [x] **Step 9: Remove backend lock hooks**
 
 Remove these from `struct virtio_gpu_cmd_backend`:
 
@@ -912,14 +912,29 @@ virtio_gpu_backend_lifecycle_func command_leave;
 Remove `virtio_gpu_thread_enter()` and its call from `main.c`. The renderer no
 longer needs emulator-thread ctx0 handoff because the GL owner owns ctx0.
 
-- [ ] **Step 10: Keep a temporary compatibility commit boundary**
+- [x] **Step 10: Keep a temporary compatibility commit boundary**
 
 At the end of this phase, the old `vgpu_gl_lock()` may still exist if tests
 show a remaining path uses GL from both threads. If so, do not proceed to
 Phase 5 until the remaining path is listed in this plan with a concrete owner
 transfer.
 
-- [ ] **Step 11: Verify**
+Phase 4 leaves `vgpu_gl_lock()` only around SDL/window presentation helpers in
+`window-sw.c` and the matching declarations/stubs in `vgpu-gl.h` and VirGL unit
+tests. VirGL command execution, renderer reset, and renderer poll no longer use
+backend command/thread lock hooks. Phase 5 owns deletion of the remaining
+window-presentation mutex boundary.
+
+Additional review fixes completed in this phase:
+
+- Token-addressed async controlq completions and token-specific cancel prevent
+  unfenced renderer work from completing or cancelling the wrong descriptor.
+- Fence pending accounting is registered before `virgl_renderer_create_fence()`
+  so synchronous fence callbacks cannot leave a stale poll request pending.
+- Renderer queue reset releases queued request payloads and queued completion
+  responses so dropped async work does not leak host-owned memory.
+
+- [x] **Step 11: Verify**
 
 Run:
 
@@ -936,12 +951,31 @@ Expected: all renderer-backed VirGL commands complete through the async
 request/completion queues, and no guest-visible virtqueue write happens from
 the SDL main thread.
 
-- [ ] **Step 12: Commit**
+Verified during implementation:
 
 ```sh
-git add main.c window-sw.c vgpu-gl.h virtio-gpu.h virtio-gpu.c \
-    virtio-gpu-virgl.c tests/virtio-gpu-virgl-test.c \
-    tests/virtio-gpu-fence-test.c tests/vgpu-virgl-backend-build-test.sh
+make test-vgpu-renderer
+make test-vgpu-fence
+make test-vgpu-virgl
+make test-vgpu-renderer-owner
+make test-vgpu-opengl-scope
+make test-vgpu-display
+make test-vinput-event-coalesce
+make test-vgpu-chain
+make test-vgpu-desc
+make test-vgpu-virgl-backend-build
+make ENABLE_VIRGL=1 semu
+git diff --check
+```
+
+- [x] **Step 12: Commit**
+
+```sh
+git add main.c virtio-gpu.h virtio-gpu.c virtio-gpu-sw.c \
+    virtio-gpu-virgl.c vgpu-renderer.h vgpu-renderer.c \
+    tests/vgpu-renderer-queue-test.c tests/vgpu-renderer-owner-test.sh \
+    tests/virtio-gpu-virgl-test.c tests/virtio-gpu-fence-test.c \
+    docs/vgpu-3d-opengl-lockless-plan.md
 git commit -m "Move VirGL execution to the GL owner"
 ```
 

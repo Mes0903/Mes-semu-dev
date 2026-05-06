@@ -64,6 +64,11 @@ fi
 grep -Fq 'PRIV(vgpu)->num_capsets' <<<"${num_capsets_body}" ||
     fail "num_capsets config reads must return PRIV(vgpu)->num_capsets"
 
+if rg -n 'thread_enter|command_enter|command_leave|virtio_gpu_thread_enter' \
+    main.c virtio-gpu.h virtio-gpu.c virtio-gpu-virgl.c virtio-gpu-sw.c; then
+    fail "renderer ownership must not rely on backend command/thread lock hooks"
+fi
+
 main_loop_body="$(
     awk '
         /^static void window_main_loop_sw\(void\)/ {
