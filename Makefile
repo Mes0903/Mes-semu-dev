@@ -450,6 +450,10 @@ test-vgpu-virgl-image:
 test-vgpu-virgl-init-order:
 	$(Q)bash tests/vgpu-virgl-init-order-test.sh
 
+.PHONY: test-vgpu-opengl-scope
+test-vgpu-opengl-scope:
+	$(Q)bash tests/vgpu-opengl-scope-test.sh
+
 .PHONY: test-vgpu-virgl-backend-build
 test-vgpu-virgl-backend-build:
 	$(Q)bash tests/vgpu-virgl-backend-build-test.sh

@@ -63,6 +63,11 @@ $ pkg-config --exists virglrenderer epoxy gl egl
 ```
 
 If these packages are missing, keep using the default `ENABLE_VIRGL=0` build.
+The first 3D path is intentionally OpenGL/VirGL-only: it supports
+`VIRTIO_GPU_F_VIRGL`, VirGL/VirGL2 capsets, Xorg glamor, and GLX. It does not
+advertise or implement `VIRTIO_GPU_F_RESOURCE_BLOB`,
+`VIRTIO_GPU_F_CONTEXT_INIT`, Venus, Vulkan, native DRM contexts,
+host-visible SHM, or vhost-user-gpu.
 
 ## Build and Run
 
