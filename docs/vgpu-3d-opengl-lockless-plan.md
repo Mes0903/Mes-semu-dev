@@ -751,6 +751,61 @@ config reads return the cached value, and VirGL init/reset refresh the cache.
 **Remaining Phase 4 work:** the cache now exists, but renderer init/reset still
 run under the temporary GL mutex until the full GL-owner request path is moved.
 
+### Phase 4C: Move Renderer Poll to the GL Owner Queue
+
+**Goal:** Establish the request-drain side of the GL-owner boundary for the
+smallest renderer operation. Renderer polling should be requested by the
+emulator thread but executed by the SDL/main-thread GL owner.
+
+**Files:**
+
+- Modify: `vgpu-gl.h`
+- Modify: `virtio-gpu-virgl.c`
+- Modify: `window-sw.c`
+- Modify: `tests/vgpu-renderer-owner-test.sh`
+- Modify: `tests/virtio-gpu-virgl-test.c`
+
+- [x] **Step 1: Add the GL-owner execute hook**
+
+`vgpu_virgl_execute_renderer_request()` is the GL-owner entry point for
+renderer requests. This checkpoint supports `VGPU_RENDERER_REQ_POLL`; later
+Phase 4 work will add controlq command execution.
+
+- [x] **Step 2: Drain renderer requests before display work**
+
+`window_main_loop_sw()` now calls `window_drain_renderer_queue()` before
+`window_drain_display_queue()`, so renderer work reaches virglrenderer before
+the same SDL tick renders dependent scanout state.
+
+- [x] **Step 3: Enqueue poll requests instead of polling from the emulator**
+
+Fenced responses mark a pending renderer fence and enqueue
+`VGPU_RENDERER_REQ_POLL`; the backend `poll` hook only requests poll work while
+a renderer fence remains pending. `virgl_renderer_poll()` is called by the
+GL-owner execute hook, not by the emulator thread.
+
+- [x] **Step 4: Verify**
+
+Run:
+
+```sh
+make test-vgpu-renderer-owner
+make test-vgpu-virgl
+make test-vgpu-renderer
+make test-vgpu-fence
+make test-vgpu-display
+make test-vgpu-virgl-backend-build
+make ENABLE_VIRGL=1 semu
+```
+
+Expected: source gate confirms renderer queue drain order, fake VirGL tests
+confirm fenced submits enqueue poll requests, and both fake/real VirGL builds
+link.
+
+**Remaining Phase 4 work:** `CTX_*`, resource, transfer, submit, capset,
+scanout/flush, reset, and init execution are still synchronous backend calls
+under the temporary GL mutex until the full command decode/execute split lands.
+
 - [ ] **Step 1: Split decode from execute**
 
 In `virtio-gpu-virgl.c`, keep guest descriptor parsing on the emulator thread.

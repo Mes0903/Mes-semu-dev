@@ -40,6 +40,8 @@ struct vgpu_virgl_fence_state {
 
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
 static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
+static uint32_t g_vgpu_virgl_pending_fences;
+static bool g_vgpu_virgl_poll_request_pending;
 
 static uint32_t vgpu_virgl_count_capsets(void)
 {
@@ -67,9 +69,51 @@ static void vgpu_virgl_publish_capsets(virtio_gpu_state_t *vgpu)
     virtio_gpu_set_num_capsets(vgpu, vgpu_virgl_count_capsets());
 }
 
+static void vgpu_virgl_reset_poll_state(void)
+{
+    __atomic_store_n(&g_vgpu_virgl_pending_fences, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
+                     __ATOMIC_RELEASE);
+}
+
+static void vgpu_virgl_note_fence_created(void)
+{
+    __atomic_add_fetch(&g_vgpu_virgl_pending_fences, 1, __ATOMIC_RELEASE);
+}
+
+static void vgpu_virgl_note_fence_completed(void)
+{
+    uint32_t pending =
+        __atomic_load_n(&g_vgpu_virgl_pending_fences, __ATOMIC_ACQUIRE);
+    while (pending) {
+        if (__atomic_compare_exchange_n(&g_vgpu_virgl_pending_fences, &pending,
+                                        pending - 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return;
+    }
+}
+
+static void vgpu_virgl_request_poll(void)
+{
+    if (!__atomic_load_n(&g_vgpu_virgl_pending_fences, __ATOMIC_ACQUIRE))
+        return;
+
+    if (__atomic_exchange_n(&g_vgpu_virgl_poll_request_pending, true,
+                            __ATOMIC_ACQ_REL))
+        return;
+
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_POLL,
+    };
+    if (!vgpu_renderer_submit(&request))
+        __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
+                         __ATOMIC_RELEASE);
+}
+
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
     g_vgpu_virgl_fences.last_ctx0_fence = fence;
+    vgpu_virgl_note_fence_completed();
     if (!cookie)
         return;
 
@@ -94,6 +138,7 @@ static void vgpu_virgl_write_context_fence(void *cookie,
     g_vgpu_virgl_fences.last_context_ctx_id = ctx_id;
     g_vgpu_virgl_fences.last_context_ring_idx = ring_idx;
     g_vgpu_virgl_fences.last_context_fence = fence_id;
+    vgpu_virgl_note_fence_completed();
     if (!cookie)
         return;
 
@@ -194,14 +239,13 @@ static void vgpu_virgl_command_leave(virtio_gpu_state_t *vgpu)
 static void vgpu_virgl_poll(virtio_gpu_state_t *vgpu)
 {
     (void) vgpu;
-    vgpu_gl_lock();
-    virgl_renderer_poll();
-    vgpu_gl_unlock();
+    vgpu_virgl_request_poll();
 }
 
 static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
 {
     vgpu_gl_lock();
+    vgpu_virgl_reset_poll_state();
     memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
     /* Clear display generations before virglrenderer destroys GL resources.
      * This makes any queued GL scanout payload stale while the texture IDs it
@@ -336,17 +380,18 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
                                                    VIRTIO_GPU_RESP_ERR_UNSPEC);
             return;
         }
+        vgpu_virgl_note_fence_created();
 
         if (deferred) {
+            vgpu_virgl_request_poll();
             *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
             return;
         }
 
         *plen =
             virtio_gpu_write_ctrl_response(vgpu, request, response_desc, type);
-        if (*plen) {
-            virgl_renderer_poll();
-        }
+        if (*plen)
+            vgpu_virgl_request_poll();
         return;
     }
 
@@ -1141,6 +1186,27 @@ static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
 uint32_t virtio_gpu_backend_get_num_capsets(void)
 {
     return vgpu_virgl_count_capsets();
+}
+
+void vgpu_virgl_execute_renderer_request(
+    const struct vgpu_renderer_request *request)
+{
+    if (!request)
+        return;
+
+    switch (request->type) {
+    case VGPU_RENDERER_REQ_POLL:
+        virgl_renderer_poll();
+        __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
+                         __ATOMIC_RELEASE);
+        break;
+    default:
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): unsupported renderer request type %u\n",
+                __func__, request->type);
+        break;
+    }
 }
 
 static void vgpu_virgl_cmd_get_capset_info_handler(virtio_gpu_state_t *vgpu,

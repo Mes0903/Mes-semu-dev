@@ -63,3 +63,39 @@ fi
 
 grep -Fq 'PRIV(vgpu)->num_capsets' <<<"${num_capsets_body}" ||
     fail "num_capsets config reads must return PRIV(vgpu)->num_capsets"
+
+main_loop_body="$(
+    awk '
+        /^static void window_main_loop_sw\(void\)/ {
+            in_fn = 1
+        }
+        /^static / && in_fn &&
+            $0 !~ /^static void window_main_loop_sw\(void\)/ {
+            in_fn = 0
+        }
+        in_fn {
+            print
+        }
+    ' window-sw.c
+)"
+
+[ -n "${main_loop_body}" ] ||
+    fail "missing window_main_loop_sw implementation"
+
+renderer_drain_line="$(
+    awk 'index($0, "window_drain_renderer_queue();") { print NR; exit }' \
+        <<<"${main_loop_body}"
+)"
+display_drain_line="$(
+    awk 'index($0, "window_drain_display_queue();") { print NR; exit }' \
+        <<<"${main_loop_body}"
+)"
+
+[ -n "${renderer_drain_line}" ] ||
+    fail "SDL main loop must drain renderer requests"
+[ -n "${display_drain_line}" ] ||
+    fail "SDL main loop must still drain display requests"
+
+if [ "${renderer_drain_line}" -ge "${display_drain_line}" ]; then
+    fail "SDL main loop must drain renderer requests before display requests"
+fi

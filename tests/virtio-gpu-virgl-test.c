@@ -121,6 +121,8 @@ struct virgl_test_calls {
     int gl_lock_underflow_count;
     int renderer_complete_count;
     struct vgpu_renderer_completion last_renderer_completion;
+    int renderer_submit_count;
+    struct vgpu_renderer_request last_renderer_request;
 
     int undefined_count;
 };
@@ -310,6 +312,14 @@ bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
     if (completion)
         g_calls.last_renderer_completion = *completion;
     return completion != NULL;
+}
+
+bool vgpu_renderer_submit(const struct vgpu_renderer_request *request)
+{
+    g_calls.renderer_submit_count++;
+    if (request)
+        g_calls.last_renderer_request = *request;
+    return request != NULL;
 }
 
 enum virtio_gpu_desc_copy_result virtio_gpu_desc_copy_from_readable(
@@ -864,11 +874,25 @@ static int test_backend_reports_available_capsets(void)
     return 0;
 }
 
-static int test_backend_poll_calls_virgl_renderer_poll(void)
+static int test_backend_poll_without_pending_fence_does_not_poll_renderer(void)
 {
     virtio_gpu_state_t vgpu = fresh_vgpu();
 
     g_virtio_gpu_backend.poll(&vgpu);
+
+    CHECK(g_calls.poll_count == 0);
+    CHECK(g_calls.renderer_submit_count == 0);
+
+    return 0;
+}
+
+static int test_renderer_poll_request_executes_on_gl_owner(void)
+{
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_POLL,
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
 
     CHECK(g_calls.poll_count == 1);
 
@@ -925,7 +949,9 @@ static int test_fenced_submit_creates_renderer_fence_from_request_flags(void)
     CHECK(g_calls.create_fence_client_id == 123);
     CHECK(g_calls.create_fence_ctx_id == 0);
     CHECK(g_calls.context_create_fence_count == 0);
-    CHECK(g_calls.poll_count == 1);
+    CHECK(g_calls.poll_count == 0);
+    CHECK(g_calls.renderer_submit_count == 1);
+    CHECK(g_calls.last_renderer_request.type == VGPU_RENDERER_REQ_POLL);
     CHECK(plen == sizeof(struct virtio_gpu_ctrl_hdr));
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
     CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
@@ -990,7 +1016,9 @@ static int test_ring_idx_fence_uses_context_fence_api(void)
           VIRGL_RENDERER_FENCE_FLAG_MERGEABLE);
     CHECK(g_calls.context_create_fence_ring_idx == 3);
     CHECK(g_calls.context_create_fence_id == 0x123456789ULL);
-    CHECK(g_calls.poll_count == 1);
+    CHECK(g_calls.poll_count == 0);
+    CHECK(g_calls.renderer_submit_count == 1);
+    CHECK(g_calls.last_renderer_request.type == VGPU_RENDERER_REQ_POLL);
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
     CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
     CHECK(response_hdr()->fence_id == 0x123456789ULL);
@@ -1513,7 +1541,8 @@ int main(void)
     CHECK(test_renderer_init_calls_virgl_renderer_init() == 0);
     CHECK(test_renderer_init_detaches_and_thread_enter_binds_ctx0() == 0);
     CHECK(test_backend_reports_available_capsets() == 0);
-    CHECK(test_backend_poll_calls_virgl_renderer_poll() == 0);
+    CHECK(test_backend_poll_without_pending_fence_does_not_poll_renderer() == 0);
+    CHECK(test_renderer_poll_request_executes_on_gl_owner() == 0);
     CHECK(test_ctx_create_calls_renderer() == 0);
     CHECK(test_context_lifecycle_handlers_call_renderer() == 0);
     CHECK(test_ctx_create_rejects_context_init_until_feature_enabled() == 0);

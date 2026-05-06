@@ -830,6 +830,15 @@ static void window_drain_display_queue(void)
 }
 #endif
 
+#if SEMU_HAS(VIRGL)
+static void window_drain_renderer_queue(void)
+{
+    struct vgpu_renderer_request request;
+    while (vgpu_renderer_pop_request(&request))
+        vgpu_virgl_execute_renderer_request(&request);
+}
+#endif
+
 /* Main loop runs on the main thread */
 static void window_main_loop_sw(void)
 {
@@ -878,6 +887,9 @@ static void window_main_loop_sw(void)
         }
 #endif
 
+#if SEMU_HAS(VIRGL)
+        window_drain_renderer_queue();
+#endif
 #if SEMU_HAS(VIRTIOGPU)
         window_drain_display_queue();
 #endif
