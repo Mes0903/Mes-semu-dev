@@ -992,7 +992,7 @@ git commit -m "Move VirGL execution to the GL owner"
 - Modify: `virtio-gpu-virgl.c`
 - Modify: `tests/virtio-gpu-virgl-test.c`
 
-- [ ] **Step 1: Add the no-lock source gate**
+- [x] **Step 1: Add the no-lock source gate**
 
 Create `tests/vgpu-no-gl-lock-test.sh`:
 
@@ -1018,7 +1018,7 @@ if rg -n 'command_enter|command_leave|thread_enter|virtio_gpu_thread_enter' \
 fi
 ```
 
-- [ ] **Step 2: Add the Makefile target**
+- [x] **Step 2: Add the Makefile target**
 
 Add:
 
@@ -1028,7 +1028,7 @@ test-vgpu-no-gl-lock:
 	$(Q)bash tests/vgpu-no-gl-lock-test.sh
 ```
 
-- [ ] **Step 3: Remove lock declarations and definitions**
+- [x] **Step 3: Remove lock declarations and definitions**
 
 Delete from `vgpu-gl.h`:
 
@@ -1039,14 +1039,14 @@ void vgpu_gl_unlock(void);
 
 Delete the `pthread_mutex_t vgpu_gl_mutex` block from `window-sw.c`.
 
-- [ ] **Step 4: Remove remaining lock call sites**
+- [x] **Step 4: Remove remaining lock call sites**
 
 No code path may wrap `sdl_scanout_render_gl()`,
 `sdl_scanout_apply_gl_frame()`, `sdl_scanout_apply_gl_cursor_frame()`,
 `virgl_renderer_poll()`, or renderer reset with a mutex. These functions should
 already run on the GL owner after Phase 4.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -1063,7 +1063,20 @@ git diff --check
 
 Expected: no global GL lock references remain and all VirGL tests still pass.
 
-- [ ] **Step 6: Commit**
+Verified during implementation:
+
+```sh
+bash -n tests/vgpu-no-gl-lock-test.sh
+make test-vgpu-no-gl-lock
+make test-vgpu-renderer
+make test-vgpu-display
+make test-vgpu-virgl
+make test-vgpu-fence
+make ENABLE_VIRGL=1 semu
+git diff --check
+```
+
+- [x] **Step 6: Commit**
 
 ```sh
 git add Makefile window-sw.c vgpu-gl.h virtio-gpu-virgl.c virtio-gpu.c \

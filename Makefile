@@ -470,6 +470,10 @@ test-vgpu-opengl-scope:
 test-vgpu-renderer-owner:
 	$(Q)bash tests/vgpu-renderer-owner-test.sh
 
+.PHONY: test-vgpu-no-gl-lock
+test-vgpu-no-gl-lock:
+	$(Q)bash tests/vgpu-no-gl-lock-test.sh
+
 .PHONY: test-vgpu-virgl-backend-build
 test-vgpu-virgl-backend-build:
 	$(Q)bash tests/vgpu-virgl-backend-build-test.sh

@@ -1,7 +1,6 @@
 #include <SDL.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,20 +27,6 @@ static int wake_write_fd = -1;
 static bool sdl_initialized = false;
 static bool headless_mode = false;
 static bool should_exit = false;
-
-#if SEMU_HAS(VIRGL)
-static pthread_mutex_t vgpu_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-void vgpu_gl_lock(void)
-{
-    pthread_mutex_lock(&vgpu_gl_mutex);
-}
-
-void vgpu_gl_unlock(void)
-{
-    pthread_mutex_unlock(&vgpu_gl_mutex);
-}
-#endif
 
 #if SEMU_HAS(VIRTIOINPUT)
 static bool mouse_grabbed = false;
@@ -704,9 +689,7 @@ static void sdl_scanout_render(struct sdl_scanout_info *scanout)
 {
 #if SEMU_HAS(VIRGL)
     if (scanout->gl_context) {
-        vgpu_gl_lock();
         sdl_scanout_render_gl(scanout);
-        vgpu_gl_unlock();
         return;
     }
 #endif
@@ -770,10 +753,8 @@ static void window_drain_display_queue(void)
 #if SEMU_HAS(VIRGL)
             } else if (cmd.u.primary_set.payload->kind ==
                        VGPU_DISPLAY_PAYLOAD_GL_SCANOUT) {
-                vgpu_gl_lock();
                 dirty_scanouts[cmd.scanout_id] |= sdl_scanout_apply_gl_frame(
                     scanout, &cmd.u.primary_set.payload->gl);
-                vgpu_gl_unlock();
 #endif
             }
             break;
@@ -784,13 +765,11 @@ static void window_drain_display_queue(void)
              */
 #if SEMU_HAS(VIRGL)
             if (scanout->gl_context) {
-                vgpu_gl_lock();
                 dirty_scanouts[cmd.scanout_id] |=
                     sdl_scanout_apply_gl_cursor_frame(
                         scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
                         cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
                         cmd.u.cursor_set.hot_y);
-                vgpu_gl_unlock();
                 break;
             }
 #endif

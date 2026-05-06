@@ -112,13 +112,9 @@ struct virgl_test_calls {
     uint32_t submit_words[16];
 
     int force_ctx_0_count;
-    int force_ctx_0_lock_depth;
     int window_make_current_count;
     int window_make_current_null_count;
     virgl_renderer_gl_context window_make_current_last_ctx;
-    int gl_lock_depth;
-    int gl_lock_max_depth;
-    int gl_lock_underflow_count;
     int renderer_complete_count;
     struct vgpu_renderer_completion last_renderer_completion;
     int renderer_submit_count;
@@ -549,22 +545,6 @@ int vgpu_window_virgl_make_current(int scanout_idx,
     return 0;
 }
 
-void vgpu_gl_lock(void)
-{
-    g_calls.gl_lock_depth++;
-    if (g_calls.gl_lock_depth > g_calls.gl_lock_max_depth)
-        g_calls.gl_lock_max_depth = g_calls.gl_lock_depth;
-}
-
-void vgpu_gl_unlock(void)
-{
-    if (g_calls.gl_lock_depth <= 0) {
-        g_calls.gl_lock_underflow_count++;
-        return;
-    }
-    g_calls.gl_lock_depth--;
-}
-
 int virgl_renderer_init(void *cookie,
                         int flags,
                         struct virgl_renderer_callbacks *cb)
@@ -573,7 +553,7 @@ int virgl_renderer_init(void *cookie,
     g_calls.renderer_init_cookie = cookie;
     g_calls.renderer_init_flags = flags;
     g_calls.renderer_init_callback_version = cb ? cb->version : 0;
-    g_calls.renderer_init_lock_depth = g_calls.gl_lock_depth;
+    g_calls.renderer_init_lock_depth = 0;
     if (cb)
         g_renderer_callbacks = *cb;
     g_renderer_cookie = cookie;
@@ -801,7 +781,6 @@ int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
 void virgl_renderer_force_ctx_0(void)
 {
     g_calls.force_ctx_0_count++;
-    g_calls.force_ctx_0_lock_depth = g_calls.gl_lock_depth;
 }
 
 #include "../virtio-gpu-virgl.c"
@@ -936,8 +915,6 @@ static int test_renderer_init_calls_virgl_renderer_init(void)
           VIRGL_RENDERER_CALLBACKS_VERSION);
     CHECK(g_calls.renderer_init_lock_depth == 0);
     CHECK(g_vgpu_data.num_capsets == 2);
-    CHECK(g_calls.gl_lock_depth == 0);
-    CHECK(g_calls.gl_lock_underflow_count == 0);
 
     return 0;
 }
@@ -952,8 +929,6 @@ static int test_renderer_init_stays_on_gl_owner_without_backend_lock_hooks(void)
     CHECK(g_calls.window_make_current_null_count == 1);
     CHECK(g_calls.window_make_current_last_ctx == NULL);
     CHECK(g_calls.force_ctx_0_count == 0);
-    CHECK(g_calls.gl_lock_depth == 0);
-    CHECK(g_calls.gl_lock_underflow_count == 0);
 
     return 0;
 }
