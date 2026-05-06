@@ -251,12 +251,31 @@ uint32_t virtio_gpu_write_ctrl_response(
 bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
                                     const struct virtio_gpu_ctrl_hdr *request,
                                     const struct virtq_desc *response_desc,
-                                    uint32_t response_type)
+                                    uint32_t response_type,
+                                    uint32_t generation)
 {
     (void) vgpu;
     (void) request;
     (void) response_desc;
     (void) response_type;
+    (void) generation;
+    return false;
+}
+
+uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
+{
+    (void) vgpu;
+    return 0;
+}
+
+bool virtio_gpu_cancel_ctrl_response(
+    virtio_gpu_state_t *vgpu,
+    uint32_t generation,
+    const struct virtio_gpu_ctrl_hdr *request)
+{
+    (void) vgpu;
+    (void) generation;
+    (void) request;
     return false;
 }
 

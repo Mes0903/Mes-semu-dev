@@ -523,7 +523,7 @@ the emulator thread.
 - Modify: `virtio-gpu.c`
 - Modify: `tests/virtio-gpu-fence-test.c`
 
-- [ ] **Step 1: Rename pending fence records to pending ctrl records**
+- [x] **Step 1: Rename pending fence records to pending ctrl records**
 
 Replace `struct virtio_gpu_pending_fence` with:
 
@@ -543,7 +543,7 @@ struct virtio_gpu_pending_ctrl {
 };
 ```
 
-- [ ] **Step 2: Add generic defer API**
+- [x] **Step 2: Add generic defer API**
 
 Expose:
 
@@ -558,7 +558,7 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
 The API records queue index and descriptor id from the active dispatch context
 and returns false if there is no active dispatch or the pending table is full.
 
-- [ ] **Step 3: Add generic completion API**
+- [x] **Step 3: Add generic completion API**
 
 Expose:
 
@@ -575,7 +575,7 @@ For unfenced commands, callers pass `fence_id = 0` and
 `context_fence = false`. For fenced commands, the function matches the fence
 fields before writing the response and used-ring entry.
 
-- [ ] **Step 4: Register pending work before renderer execution can complete**
+- [x] **Step 4: Register pending work before renderer execution can complete**
 
 When dispatching a fenced renderer request, allocate and publish the pending
 record before the GL owner calls `virgl_renderer_create_fence()` or
@@ -584,13 +584,13 @@ pending record with `VIRTIO_GPU_RESP_ERR_UNSPEC` or cancel it before returning
 the error response. This prevents a synchronous or early fence callback from
 being lost.
 
-- [ ] **Step 5: Keep all guest writes on the emulator thread**
+- [x] **Step 5: Keep all guest writes on the emulator thread**
 
 Assert in comments and tests that `virtio_gpu_complete_ctrl_response()` is only
 called while draining renderer completions on the emulator thread. The GL owner
 must only enqueue `struct vgpu_renderer_completion`.
 
-- [ ] **Step 6: Extend tests**
+- [x] **Step 6: Extend tests**
 
 Add cases to `tests/virtio-gpu-fence-test.c`:
 
@@ -600,7 +600,7 @@ Add cases to `tests/virtio-gpu-fence-test.c`:
 - a fence completion produced before pending registration would have failed in
   the old order and is now handled by the token-first order
 
-- [ ] **Step 7: Verify**
+- [x] **Step 7: Verify**
 
 Run:
 
@@ -615,7 +615,7 @@ git diff --check
 Expected: frontend async completion tests pass and existing descriptor-chain
 tests still pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```sh
 git add virtio-gpu.h virtio-gpu.c tests/virtio-gpu-fence-test.c

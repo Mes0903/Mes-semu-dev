@@ -22,6 +22,10 @@
     } while (0)
 
 static uint8_t g_ram[TEST_RAM_SIZE];
+static bool g_defer_unfenced;
+static bool g_complete_during_submit;
+static bool g_cancel_after_defer;
+static bool g_cancel_result;
 
 static void fake_submit_3d(virtio_gpu_state_t *vgpu,
                            struct virtq_desc *vq_desc,
@@ -98,6 +102,10 @@ static virtio_gpu_state_t fresh_vgpu(void)
 {
     memset(g_ram, 0, sizeof(g_ram));
     memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
+    g_defer_unfenced = false;
+    g_complete_during_submit = false;
+    g_cancel_after_defer = false;
+    g_cancel_result = false;
 
     virtio_gpu_state_t vgpu = {0};
     vgpu.ram = ram_words();
@@ -155,9 +163,26 @@ static void fake_submit_3d(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    if ((request->flags & VIRTIO_GPU_FLAG_FENCE) &&
+    uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
+    if ((g_defer_unfenced || (request->flags & VIRTIO_GPU_FLAG_FENCE)) &&
         virtio_gpu_defer_ctrl_response(vgpu, request, &vq_desc[resp_idx],
-                                       VIRTIO_GPU_RESP_OK_NODATA)) {
+                                       VIRTIO_GPU_RESP_OK_NODATA,
+                                       generation)) {
+        if (g_complete_during_submit) {
+            bool context_fence =
+                (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
+            virtio_gpu_complete_ctrl_response(
+                vgpu, generation, request->fence_id, context_fence,
+                request->ctx_id, request->ring_idx);
+        }
+        if (g_cancel_after_defer) {
+            g_cancel_result =
+                virtio_gpu_cancel_ctrl_response(vgpu, generation, request);
+            *plen = virtio_gpu_write_ctrl_response(
+                vgpu, request, &vq_desc[resp_idx],
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+            return;
+        }
         *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
         return;
     }
@@ -178,7 +203,8 @@ static int test_fenced_submit_completes_used_ring_after_fence(void)
     CHECK(response_hdr()->type == 0);
     CHECK(vgpu.InterruptStatus == 0);
 
-    virtio_gpu_complete_fence(&vgpu, false, 0, 0, 7);
+    virtio_gpu_complete_ctrl_response(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 7, false, 0, 0);
 
     CHECK(used_idx() == 1);
     CHECK(used_elem_id(0) == 0);
@@ -200,11 +226,15 @@ static int test_context_fence_requires_matching_context_and_ring(void)
     virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
 
     CHECK(used_idx() == 0);
-    virtio_gpu_complete_fence(&vgpu, true, 11, 4, 0x123456789ULL);
+    virtio_gpu_complete_ctrl_response(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0x123456789ULL, true, 11,
+        4);
     CHECK(used_idx() == 0);
     CHECK(response_hdr()->type == 0);
 
-    virtio_gpu_complete_fence(&vgpu, true, 11, 3, 0x123456789ULL);
+    virtio_gpu_complete_ctrl_response(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0x123456789ULL, true, 11,
+        3);
 
     CHECK(used_idx() == 1);
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
@@ -222,18 +252,90 @@ static int test_reset_drops_pending_fence_without_writing_stale_response(void)
     virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
     CHECK(used_idx() == 0);
 
+    uint32_t stale_generation = virtio_gpu_ctrl_generation(&vgpu);
     virtio_gpu_update_status(&vgpu, 0);
-    virtio_gpu_complete_fence(&vgpu, false, 0, 0, 9);
+    virtio_gpu_complete_ctrl_response(&vgpu, stale_generation, 9, false, 0,
+                                      0);
 
     CHECK(response_hdr()->type == 0);
 
     return 0;
 }
 
+static int test_unfenced_deferred_submit_completes_generically(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    g_defer_unfenced = true;
+    queue_one_submit(0, 0, 0, 0);
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    CHECK(vgpu.queues[VIRTIO_GPU_CONTROLQ].last_avail == 1);
+    CHECK(used_idx() == 0);
+    CHECK(response_hdr()->type == 0);
+
+    virtio_gpu_complete_ctrl_response(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0, false, 0, 0);
+
+    CHECK(used_idx() == 1);
+    CHECK(used_elem_id(0) == 0);
+    CHECK(used_elem_len(0) == sizeof(struct virtio_gpu_ctrl_hdr));
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == 0);
+    CHECK(response_hdr()->fence_id == 0);
+    CHECK(vgpu.InterruptStatus == VIRTIO_INT__USED_RING);
+
+    return 0;
+}
+
+static int test_sync_completion_after_defer_is_not_lost(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    g_complete_during_submit = true;
+    queue_one_submit(VIRTIO_GPU_FLAG_FENCE, 12, 0, 0);
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    CHECK(vgpu.queues[VIRTIO_GPU_CONTROLQ].last_avail == 1);
+    CHECK(used_idx() == 1);
+    CHECK(used_elem_id(0) == 0);
+    CHECK(used_elem_len(0) == sizeof(struct virtio_gpu_ctrl_hdr));
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
+    CHECK(response_hdr()->fence_id == 12);
+
+    return 0;
+}
+
+static int test_deferred_ctrl_can_be_cancelled_before_error_response(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    g_cancel_after_defer = true;
+    queue_one_submit(VIRTIO_GPU_FLAG_FENCE, 13, 0, 0);
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    CHECK(g_cancel_result);
+    CHECK(vgpu.queues[VIRTIO_GPU_CONTROLQ].last_avail == 1);
+    CHECK(used_idx() == 1);
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
+    CHECK(response_hdr()->fence_id == 13);
+
+    virtio_gpu_complete_ctrl_response(
+        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 13, false, 0, 0);
+    CHECK(used_idx() == 1);
+
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_unfenced_deferred_submit_completes_generically() == 0);
     CHECK(test_fenced_submit_completes_used_ring_after_fence() == 0);
     CHECK(test_context_fence_requires_matching_context_and_ring() == 0);
     CHECK(test_reset_drops_pending_fence_without_writing_stale_response() == 0);
+    CHECK(test_sync_completion_after_defer_is_not_lost() == 0);
+    CHECK(test_deferred_ctrl_can_be_cancelled_before_error_response() == 0);
     return 0;
 }

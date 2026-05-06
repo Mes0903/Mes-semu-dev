@@ -162,35 +162,39 @@ static void virtio_gpu_push_used(virtio_gpu_state_t *vgpu,
         vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
 }
 
-static void virtio_gpu_clear_pending_fences(virtio_gpu_state_t *vgpu)
+static void virtio_gpu_clear_pending_ctrls(virtio_gpu_state_t *vgpu)
 {
     if (!vgpu->priv)
         return;
 
-    memset(PRIV(vgpu)->pending_fences, 0, sizeof(PRIV(vgpu)->pending_fences));
+    memset(PRIV(vgpu)->pending_ctrls, 0, sizeof(PRIV(vgpu)->pending_ctrls));
     memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
+    PRIV(vgpu)->ctrl_generation++;
 }
 
 bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
                                     const struct virtio_gpu_ctrl_hdr *request,
                                     const struct virtq_desc *response_desc,
-                                    uint32_t response_type)
+                                    uint32_t response_type,
+                                    uint32_t generation)
 {
-    if (!request || !response_desc || !(request->flags & VIRTIO_GPU_FLAG_FENCE))
+    if (!request || !response_desc)
         return false;
     if (response_desc->len < sizeof(struct virtio_gpu_ctrl_hdr))
         return false;
     if (!PRIV(vgpu)->dispatch.active)
         return false;
+    if (generation != PRIV(vgpu)->ctrl_generation)
+        return false;
 
-    for (size_t i = 0; i < VIRTIO_GPU_PENDING_FENCES_MAX; i++) {
-        struct virtio_gpu_pending_fence *pending =
-            &PRIV(vgpu)->pending_fences[i];
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_CTRLS_MAX; i++) {
+        struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
         if (pending->active)
             continue;
 
-        *pending = (struct virtio_gpu_pending_fence) {
+        *pending = (struct virtio_gpu_pending_ctrl) {
             .active = true,
+            .generation = generation,
             .queue_index = PRIV(vgpu)->dispatch.queue_index,
             .buffer_idx = PRIV(vgpu)->dispatch.buffer_idx,
             .response_desc = *response_desc,
@@ -206,18 +210,61 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
 
     fprintf(stderr,
             VIRTIO_GPU_LOG_PREFIX
-            "%s(): no free pending fence slot for fence %" PRIu64 "\n",
+            "%s(): no free pending ctrl slot for fence %" PRIu64 "\n",
             __func__, request->fence_id);
     return false;
 }
 
-static bool virtio_gpu_pending_fence_matches(
-    const struct virtio_gpu_pending_fence *pending,
+uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
+{
+    if (!vgpu->priv)
+        return 0;
+
+    return PRIV(vgpu)->ctrl_generation;
+}
+
+bool virtio_gpu_cancel_ctrl_response(
+    virtio_gpu_state_t *vgpu,
+    uint32_t generation,
+    const struct virtio_gpu_ctrl_hdr *request)
+{
+    if (!vgpu->priv || !request)
+        return false;
+
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_CTRLS_MAX; i++) {
+        struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
+        if (!pending->active || pending->generation != generation)
+            continue;
+        if (pending->request_type != request->type ||
+            pending->request_flags != request->flags ||
+            pending->fence_id != request->fence_id ||
+            pending->ctx_id != request->ctx_id ||
+            pending->ring_idx != request->ring_idx)
+            continue;
+
+        memset(pending, 0, sizeof(*pending));
+        return true;
+    }
+
+    return false;
+}
+
+static bool virtio_gpu_pending_ctrl_matches(
+    const struct virtio_gpu_pending_ctrl *pending,
+    uint32_t generation,
+    uint64_t fence_id,
     bool context_fence,
     uint32_t ctx_id,
-    uint32_t ring_idx,
-    uint64_t fence_id)
+    uint32_t ring_idx)
 {
+    if (pending->generation != generation)
+        return false;
+
+    bool pending_fenced =
+        (pending->request_flags & VIRTIO_GPU_FLAG_FENCE) != 0;
+    if (!pending_fenced)
+        return !context_fence && fence_id == 0;
+
     bool pending_context =
         (pending->request_flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
     if (pending_context != context_fence)
@@ -230,26 +277,26 @@ static bool virtio_gpu_pending_fence_matches(
     return pending->ctx_id == ctx_id && pending->ring_idx == ring_idx;
 }
 
-void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
-                               bool context_fence,
-                               uint32_t ctx_id,
-                               uint32_t ring_idx,
-                               uint64_t fence_id)
+void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
+                                       uint32_t generation,
+                                       uint64_t fence_id,
+                                       bool context_fence,
+                                       uint32_t ctx_id,
+                                       uint32_t ring_idx)
 {
     if (!vgpu->priv)
         return;
     if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
         return;
 
-    for (size_t i = 0; i < VIRTIO_GPU_PENDING_FENCES_MAX; i++) {
-        struct virtio_gpu_pending_fence *pending =
-            &PRIV(vgpu)->pending_fences[i];
+    for (size_t i = 0; i < VIRTIO_GPU_PENDING_CTRLS_MAX; i++) {
+        struct virtio_gpu_pending_ctrl *pending = &PRIV(vgpu)->pending_ctrls[i];
         if (!pending->active ||
-            !virtio_gpu_pending_fence_matches(pending, context_fence, ctx_id,
-                                              ring_idx, fence_id))
+            !virtio_gpu_pending_ctrl_matches(pending, generation, fence_id,
+                                             context_fence, ctx_id, ring_idx))
             continue;
 
-        struct virtio_gpu_pending_fence done = *pending;
+        struct virtio_gpu_pending_ctrl done = *pending;
         memset(pending, 0, sizeof(*pending));
 
         struct virtio_gpu_ctrl_hdr request = {
@@ -268,6 +315,17 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
 
         virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
     }
+}
+
+void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
+                               bool context_fence,
+                               uint32_t ctx_id,
+                               uint32_t ring_idx,
+                               uint64_t fence_id)
+{
+    virtio_gpu_complete_ctrl_response(
+        vgpu, virtio_gpu_ctrl_generation(vgpu), fence_id, context_fence,
+        ctx_id, ring_idx);
 }
 
 /* 'virtio_gpu' protocol handlers */
@@ -937,7 +995,7 @@ static void virtio_gpu_update_status(virtio_gpu_state_t *vgpu, uint32_t status)
     if (status)
         return;
 
-    virtio_gpu_clear_pending_fences(vgpu);
+    virtio_gpu_clear_pending_ctrls(vgpu);
 
     if (g_virtio_gpu_backend.reset)
         g_virtio_gpu_backend.reset(vgpu);

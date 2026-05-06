@@ -253,6 +253,10 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
 {
     if (type == VIRTIO_GPU_RESP_OK_NODATA &&
         (request->flags & VIRTIO_GPU_FLAG_FENCE)) {
+        uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
+        bool deferred = virtio_gpu_defer_ctrl_response(
+            vgpu, request, response_desc, type, generation);
+
         int ret;
         if (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
             ret = virgl_renderer_context_create_fence(
@@ -264,6 +268,8 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
         }
 
         if (ret) {
+            if (deferred)
+                virtio_gpu_cancel_ctrl_response(vgpu, generation, request);
             fprintf(stderr,
                     VIRTIO_GPU_LOG_PREFIX
                     "%s(): failed to create renderer fence %" PRIu64
@@ -274,8 +280,7 @@ static void vgpu_virgl_write_response(virtio_gpu_state_t *vgpu,
             return;
         }
 
-        if (virtio_gpu_defer_ctrl_response(vgpu, request, response_desc,
-                                           type)) {
+        if (deferred) {
             *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
             return;
         }
