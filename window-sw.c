@@ -709,6 +709,7 @@ static void sdl_scanout_render(struct sdl_scanout_info *scanout)
 static void window_drain_display_queue(void)
 {
     bool dirty_scanouts[VIRTIO_GPU_MAX_SCANOUTS] = {0};
+    bool cursor_dirty_scanouts[VIRTIO_GPU_MAX_SCANOUTS] = {0};
     struct vgpu_display_cmd cmd;
 
     /* Drain display bridge commands, update only SDL-owned state, then render
@@ -732,7 +733,7 @@ static void window_drain_display_queue(void)
             break;
         case VGPU_DISPLAY_CMD_CURSOR_CLEAR:
             sdl_scanout_clear_cursor(scanout);
-            dirty_scanouts[cmd.scanout_id] = true;
+            cursor_dirty_scanouts[cmd.scanout_id] = true;
             break;
         case VGPU_DISPLAY_CMD_PRIMARY_SET:
             /* Use '|=' to keep earlier dirty state for this scanout. A failed
@@ -765,7 +766,7 @@ static void window_drain_display_queue(void)
              */
 #if SEMU_HAS(VIRGL)
             if (scanout->gl_context) {
-                dirty_scanouts[cmd.scanout_id] |=
+                cursor_dirty_scanouts[cmd.scanout_id] |=
                     sdl_scanout_apply_gl_cursor_frame(
                         scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
                         cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
@@ -773,10 +774,11 @@ static void window_drain_display_queue(void)
                 break;
             }
 #endif
-            dirty_scanouts[cmd.scanout_id] |= sdl_scanout_apply_cursor_frame(
-                scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
-                cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
-                cmd.u.cursor_set.hot_y);
+            cursor_dirty_scanouts[cmd.scanout_id] |=
+                sdl_scanout_apply_cursor_frame(
+                    scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
+                    cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
+                    cmd.u.cursor_set.hot_y);
             break;
         case VGPU_DISPLAY_CMD_CURSOR_MOVE: {
             int old_cursor_x = scanout->cursor_rect.x;
@@ -793,7 +795,7 @@ static void window_drain_display_queue(void)
             if (scanout->gl_context && !scanout->gl_cursor_valid)
                 break;
 #endif
-            dirty_scanouts[cmd.scanout_id] = true;
+            cursor_dirty_scanouts[cmd.scanout_id] = true;
             break;
         }
         }
@@ -802,7 +804,8 @@ static void window_drain_display_queue(void)
     }
 
     for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
-        if (!dirty_scanouts[i] || !sdl_scanout_is_ready(&sdl_scanouts[i]))
+        if ((!dirty_scanouts[i] && !cursor_dirty_scanouts[i]) ||
+            !sdl_scanout_is_ready(&sdl_scanouts[i]))
             continue;
         sdl_scanout_render(&sdl_scanouts[i]);
     }

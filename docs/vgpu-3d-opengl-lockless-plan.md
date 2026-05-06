@@ -1098,13 +1098,13 @@ during stress testing.
 - Modify: `tests/vinput-event-coalesce-test.sh`
 - Modify: `.ci/test-virgl.sh`
 
-- [ ] **Step 1: Keep raw input delivery uncoalesced by default**
+- [x] **Step 1: Keep raw input delivery uncoalesced by default**
 
 Keep `virtio-input-event.c` publishing each SDL mouse motion and keep
 `virtio-input.c` forwarding each host motion to the guest. The existing
 `test-vinput-event-coalesce` gate should continue to reject input coalescing.
 
-- [ ] **Step 2: Batch presentation, not guest input**
+- [x] **Step 2: Batch presentation, not guest input**
 
 Optimize only the SDL/GL presentation side. The guest may receive every mouse
 motion, but the host window should render at most once per main-loop drain
@@ -1114,20 +1114,20 @@ In `window_drain_display_queue()`, keep the existing `dirty_scanouts[]` batching
 and add a local `cursor_dirty_scanouts[]` array so multiple cursor moves in the
 same drain batch produce one `SDL_GL_SwapWindow()`.
 
-- [ ] **Step 3: Add a cursor repaint regression test**
+- [x] **Step 3: Add a cursor repaint regression test**
 
 Extend `tests/vgpu-display-test.c` with a test that publishes three cursor
 moves and one cursor set, then verifies FIFO command order remains intact. This
 keeps event ordering visible while allowing the window backend to batch
 presentation.
 
-- [ ] **Step 4: Add a manual FPS note to the live smoke**
+- [x] **Step 4: Add a manual FPS note to the live smoke**
 
 When `.ci/test-virgl.sh` runs `glxgears`, save the first 40 lines of
 `/tmp/glxgears.log` as it does now. Manual testing should compare FPS while
 the mouse is idle and while moving quickly.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
@@ -1141,7 +1141,23 @@ make ENABLE_VIRGL=1 semu
 Expected: input coalescing remains disabled, cursor display ordering tests
 pass, `glxgears` still renders, and fast mouse movement no longer crashes.
 
-- [ ] **Step 6: Commit**
+Verified during implementation:
+
+```sh
+bash -n .ci/test-virgl.sh
+make test-vgpu-display
+make test-vinput-event-coalesce
+make ENABLE_VIRGL=1 semu
+xvfb-run -a .ci/test-virgl.sh
+git diff --check
+```
+
+Note: direct `.ci/test-virgl.sh` needs a host `DISPLAY` or `WAYLAND_DISPLAY`.
+This environment did not provide one, so the smoke was run through
+`xvfb-run -a`. Manual FPS comparison while moving the mouse quickly still needs
+a real visible display.
+
+- [x] **Step 6: Commit**
 
 ```sh
 git add window-sw.c vgpu-display.c tests/vgpu-display-test.c \

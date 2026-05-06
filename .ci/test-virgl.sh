@@ -171,6 +171,7 @@ MESSAGES=(
 
 if [ "${ret}" -eq 0 ]; then
     print_success "${MESSAGES[0]}"
+    printf 'NOTE: glxgears printed the first 40 lines of /tmp/glxgears.log; compare FPS while idle and while moving the mouse quickly during manual smoke.\n'
 else
     print_error "${MESSAGES[${ret}]:-FAIL: unknown VirGL smoke error (${ret})}"
 fi
