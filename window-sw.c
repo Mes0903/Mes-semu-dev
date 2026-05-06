@@ -886,6 +886,10 @@ static void window_main_loop_sw(void)
 
 static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 {
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_backend(window_wake_backend_sw);
+#endif
+
     if (headless) {
         headless_mode = true;
 #if SEMU_HAS(VIRTIOGPU)
@@ -1025,6 +1029,11 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 
 static void window_cleanup_sw(void)
 {
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_frontend(NULL);
+    vgpu_renderer_set_wake_backend(NULL);
+#endif
+
 #if SEMU_HAS(VIRTIOINPUT)
     if (sdl_initialized)
         window_set_mouse_grab_sw(false);

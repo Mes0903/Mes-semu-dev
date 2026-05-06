@@ -12,6 +12,7 @@ static uint32_t completion_head;
 static uint32_t completion_tail;
 
 static void (*wake_frontend_cb)(void);
+static void (*wake_backend_cb)(void);
 static uint32_t active_generation;
 
 static bool vgpu_renderer_request_queue_full(void)
@@ -31,6 +32,11 @@ static bool vgpu_renderer_completion_queue_full(void)
 void vgpu_renderer_set_wake_frontend(void (*wake_frontend)(void))
 {
     __atomic_store_n(&wake_frontend_cb, wake_frontend, __ATOMIC_RELEASE);
+}
+
+void vgpu_renderer_set_wake_backend(void (*wake_backend)(void))
+{
+    __atomic_store_n(&wake_backend_cb, wake_backend, __ATOMIC_RELEASE);
 }
 
 bool vgpu_renderer_submit(const struct vgpu_renderer_request *request)
@@ -82,6 +88,12 @@ bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
     __atomic_store_n(&completion_head,
                      (head + 1U) & VGPU_RENDERER_QUEUE_MASK,
                      __ATOMIC_RELEASE);
+
+    void (*wake_backend)(void) =
+        __atomic_load_n(&wake_backend_cb, __ATOMIC_ACQUIRE);
+    if (wake_backend)
+        wake_backend();
+
     return true;
 }
 

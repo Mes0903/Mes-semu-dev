@@ -48,6 +48,7 @@ struct vgpu_renderer_completion {
 };
 
 void vgpu_renderer_set_wake_frontend(void (*wake_frontend)(void));
+void vgpu_renderer_set_wake_backend(void (*wake_backend)(void));
 bool vgpu_renderer_submit(const struct vgpu_renderer_request *request);
 bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request);
 bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion);

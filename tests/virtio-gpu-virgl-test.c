@@ -6,6 +6,7 @@
 
 #include "../tests/fakes/virglrenderer.h"
 #include "../vgpu-display.h"
+#include "../vgpu-renderer.h"
 #include "../virtio-gpu.h"
 
 #define TEST_RAM_SIZE 4096U
@@ -118,6 +119,8 @@ struct virgl_test_calls {
     int gl_lock_depth;
     int gl_lock_max_depth;
     int gl_lock_underflow_count;
+    int renderer_complete_count;
+    struct vgpu_renderer_completion last_renderer_completion;
 
     int undefined_count;
 };
@@ -290,6 +293,14 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
     (void) ctx_id;
     (void) ring_idx;
     (void) fence_id;
+}
+
+bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
+{
+    g_calls.renderer_complete_count++;
+    if (completion)
+        g_calls.last_renderer_completion = *completion;
+    return completion != NULL;
 }
 
 enum virtio_gpu_desc_copy_result virtio_gpu_desc_copy_from_readable(
@@ -982,7 +993,18 @@ static int test_fence_callbacks_record_state_and_reset_clears_it(void)
     virtio_gpu_state_t vgpu = fresh_vgpu();
 
     vgpu_virgl_write_fence(&vgpu, 55);
+    CHECK(g_calls.renderer_complete_count == 1);
+    CHECK(g_calls.last_renderer_completion.type == VGPU_RENDERER_DONE_FENCE);
+    CHECK(g_calls.last_renderer_completion.context_fence == false);
+    CHECK(g_calls.last_renderer_completion.fence_id == 55);
+
     vgpu_virgl_write_context_fence(&vgpu, 77, 3, 0x123456789ULL);
+    CHECK(g_calls.renderer_complete_count == 2);
+    CHECK(g_calls.last_renderer_completion.type == VGPU_RENDERER_DONE_FENCE);
+    CHECK(g_calls.last_renderer_completion.context_fence == true);
+    CHECK(g_calls.last_renderer_completion.ctx_id == 77);
+    CHECK(g_calls.last_renderer_completion.ring_idx == 3);
+    CHECK(g_calls.last_renderer_completion.fence_id == 0x123456789ULL);
 
     CHECK(g_vgpu_virgl_fences.last_ctx0_fence == 55);
     CHECK(g_vgpu_virgl_fences.last_context_ctx_id == 77);

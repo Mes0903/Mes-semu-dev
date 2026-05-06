@@ -637,6 +637,72 @@ After this phase, the SDL main thread owns all OpenGL and virglrenderer calls.
 - Modify: `tests/virtio-gpu-virgl-test.c`
 - Modify: `tests/vgpu-virgl-backend-build-test.sh`
 
+### Phase 4A: Route Fence Completions Through the Emulator Thread
+
+**Goal:** Establish the completion side of the GL-owner boundary before moving
+full command execution. VirGL fence callbacks must be able to run on the GL
+owner without touching guest-visible virtqueue state.
+
+**Files:**
+
+- Create: `tests/vgpu-renderer-owner-test.sh`
+- Modify: `Makefile`
+- Modify: `vgpu-renderer.h`
+- Modify: `vgpu-renderer.c`
+- Modify: `virtio-gpu.c`
+- Modify: `virtio-gpu-virgl.c`
+- Modify: `window-sw.c`
+- Modify: `tests/vgpu-renderer-queue-test.c`
+- Modify: `tests/virtio-gpu-fence-test.c`
+- Modify: `tests/virtio-gpu-virgl-test.c`
+
+- [x] **Step 1: Add a source gate for fence callback ownership**
+
+`tests/vgpu-renderer-owner-test.sh` asserts that `write_fence` and
+`write_context_fence` callbacks enqueue `VGPU_RENDERER_DONE_FENCE` through
+`vgpu_renderer_complete()` and do not call `virtio_gpu_complete_fence()`
+directly.
+
+- [x] **Step 2: Wake the emulator thread for renderer completions**
+
+`vgpu_renderer_set_wake_backend()` wires renderer completions to the existing
+backend wake pipe. Stale-generation completions are rejected without waking the
+backend.
+
+- [x] **Step 3: Drain renderer completions from the emulator side**
+
+`virtio_gpu_poll()` drains `vgpu_renderer_pop_completion()` before calling the
+backend `poll` hook, then completes matching pending ctrlq responses through
+`virtio_gpu_complete_ctrl_response()`.
+
+- [x] **Step 4: Move VirGL fence callbacks to the completion queue**
+
+`vgpu_virgl_write_fence()` and `vgpu_virgl_write_context_fence()` now record
+debug fence state and enqueue renderer fence completions. The emulator thread
+remains the only writer of response descriptors, used rings, and interrupt
+state.
+
+- [x] **Step 5: Verify**
+
+Run:
+
+```sh
+bash -n tests/vgpu-renderer-owner-test.sh
+make test-vgpu-renderer-owner
+make test-vgpu-renderer
+make test-vgpu-fence
+make test-vgpu-virgl
+```
+
+Expected: callbacks publish completion queue records, renderer completions wake
+the backend, and fence completions only write the used ring after
+`virtio_gpu_poll()` drains the completion queue.
+
+**Remaining Phase 4 work:** command decode/execute split, SDL-loop request
+drain, capset cache ownership, renderer poll-fd integration, reset ownership,
+and removal of backend command/thread lock hooks are still tracked by the
+unchecked Phase 4 steps below.
+
 - [ ] **Step 1: Split decode from execute**
 
 In `virtio-gpu-virgl.c`, keep guest descriptor parsing on the emulator thread.

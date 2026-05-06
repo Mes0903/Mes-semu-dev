@@ -13,6 +13,9 @@
 #include "riscv_private.h"
 #include "utils.h"
 #include "virtio-gpu.h"
+#if SEMU_HAS(VIRGL)
+#include "vgpu-renderer.h"
+#endif
 #include "virtio.h"
 
 #define VIRTIO_GPU_CMD_TRACE_ENABLED 0
@@ -170,6 +173,9 @@ static void virtio_gpu_clear_pending_ctrls(virtio_gpu_state_t *vgpu)
     memset(PRIV(vgpu)->pending_ctrls, 0, sizeof(PRIV(vgpu)->pending_ctrls));
     memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
     PRIV(vgpu)->ctrl_generation++;
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_reset_queues(PRIV(vgpu)->ctrl_generation);
+#endif
 }
 
 bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
@@ -327,6 +333,27 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
         vgpu, virtio_gpu_ctrl_generation(vgpu), fence_id, context_fence,
         ctx_id, ring_idx);
 }
+
+#if SEMU_HAS(VIRGL)
+static void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
+{
+    struct vgpu_renderer_completion completion;
+    while (vgpu_renderer_pop_completion(&completion)) {
+        switch (completion.type) {
+        case VGPU_RENDERER_DONE_CTRL:
+        case VGPU_RENDERER_DONE_FENCE:
+            virtio_gpu_complete_ctrl_response(
+                vgpu, completion.token.generation, completion.fence_id,
+                completion.context_fence, completion.ctx_id,
+                completion.ring_idx);
+            break;
+        case VGPU_RENDERER_DONE_FATAL:
+            virtio_gpu_set_fail(vgpu);
+            break;
+        }
+    }
+}
+#endif
 
 /* 'virtio_gpu' protocol handlers */
 void virtio_gpu_get_display_info_handler(virtio_gpu_state_t *vgpu,
@@ -1335,6 +1362,9 @@ void virtio_gpu_thread_enter(virtio_gpu_state_t *vgpu)
 
 void virtio_gpu_poll(virtio_gpu_state_t *vgpu)
 {
+#if SEMU_HAS(VIRGL)
+    virtio_gpu_drain_renderer_completions(vgpu);
+#endif
     if (g_virtio_gpu_backend.poll)
         g_virtio_gpu_backend.poll(vgpu);
 }

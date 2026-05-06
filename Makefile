@@ -426,10 +426,11 @@ $(VGPU_VIRGL_TEST): tests/virtio-gpu-virgl-test.c virtio-gpu-virgl.c virtio-gpu.
 test-vgpu-fence: $(VGPU_FENCE_TEST)
 	$(Q)./$<
 
-$(VGPU_FENCE_TEST): tests/virtio-gpu-fence-test.c virtio-gpu.c virtio-gpu.h
+$(VGPU_FENCE_TEST): tests/virtio-gpu-fence-test.c virtio-gpu.c virtio-gpu.h vgpu-renderer.c vgpu-renderer.h
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
-	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $<
+	    -DSEMU_FEATURE_VIRTIOGPU=1 -DSEMU_FEATURE_VIRGL=1 -o $@ $< \
+	    vgpu-renderer.c
 
 .PHONY: test-vgpu-chain
 test-vgpu-chain: $(VGPU_CHAIN_TEST)
@@ -464,6 +465,10 @@ test-vgpu-virgl-init-order:
 .PHONY: test-vgpu-opengl-scope
 test-vgpu-opengl-scope:
 	$(Q)bash tests/vgpu-opengl-scope-test.sh
+
+.PHONY: test-vgpu-renderer-owner
+test-vgpu-renderer-owner:
+	$(Q)bash tests/vgpu-renderer-owner-test.sh
 
 .PHONY: test-vgpu-virgl-backend-build
 test-vgpu-virgl-backend-build:

@@ -11,6 +11,7 @@
 #include "device.h"
 #include "vgpu-display.h"
 #include "vgpu-gl.h"
+#include "vgpu-renderer.h"
 #include "virtio-gpu.h"
 #include "virtio.h"
 
@@ -43,8 +44,20 @@ static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
     g_vgpu_virgl_fences.last_ctx0_fence = fence;
-    if (cookie)
-        virtio_gpu_complete_fence(cookie, false, 0, 0, fence);
+    if (!cookie)
+        return;
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_FENCE,
+        .token = {.generation = virtio_gpu_ctrl_generation(cookie)},
+        .context_fence = false,
+        .fence_id = fence,
+    };
+    if (!vgpu_renderer_complete(&completion))
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): dropped renderer fence completion %" PRIu32 "\n",
+                __func__, fence);
 }
 
 static void vgpu_virgl_write_context_fence(void *cookie,
@@ -55,8 +68,23 @@ static void vgpu_virgl_write_context_fence(void *cookie,
     g_vgpu_virgl_fences.last_context_ctx_id = ctx_id;
     g_vgpu_virgl_fences.last_context_ring_idx = ring_idx;
     g_vgpu_virgl_fences.last_context_fence = fence_id;
-    if (cookie)
-        virtio_gpu_complete_fence(cookie, true, ctx_id, ring_idx, fence_id);
+    if (!cookie)
+        return;
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_FENCE,
+        .token = {.generation = virtio_gpu_ctrl_generation(cookie)},
+        .context_fence = true,
+        .ctx_id = ctx_id,
+        .ring_idx = ring_idx,
+        .fence_id = fence_id,
+    };
+    if (!vgpu_renderer_complete(&completion))
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): dropped renderer context fence completion %" PRIu64
+                "\n",
+                __func__, fence_id);
 }
 
 static virgl_renderer_gl_context vgpu_virgl_create_context(

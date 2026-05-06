@@ -13,10 +13,16 @@
     } while (0)
 
 static int wake_count;
+static int backend_wake_count;
 
 static void test_wake_frontend(void)
 {
     wake_count++;
+}
+
+static void test_wake_backend(void)
+{
+    backend_wake_count++;
 }
 
 static struct vgpu_renderer_request test_request(uint32_t id)
@@ -88,6 +94,23 @@ static int test_completion_fifo_ordering(void)
     return 0;
 }
 
+static int test_completion_wakes_backend(void)
+{
+    vgpu_renderer_reset_queues(1);
+    backend_wake_count = 0;
+    vgpu_renderer_set_wake_backend(test_wake_backend);
+
+    struct vgpu_renderer_completion current = test_completion(22, 1);
+    struct vgpu_renderer_completion stale = test_completion(23, 0);
+    CHECK(vgpu_renderer_complete(&current));
+    CHECK(backend_wake_count == 1);
+    CHECK(!vgpu_renderer_complete(&stale));
+    CHECK(backend_wake_count == 1);
+
+    vgpu_renderer_set_wake_backend(NULL);
+    return 0;
+}
+
 static int test_full_queue_rejects_newest_request(void)
 {
     vgpu_renderer_reset_queues(1);
@@ -138,6 +161,7 @@ int main(void)
 {
     CHECK(test_request_fifo_ordering() == 0);
     CHECK(test_completion_fifo_ordering() == 0);
+    CHECK(test_completion_wakes_backend() == 0);
     CHECK(test_full_queue_rejects_newest_request() == 0);
     CHECK(test_reset_generation_filters_stale_completions() == 0);
     return 0;

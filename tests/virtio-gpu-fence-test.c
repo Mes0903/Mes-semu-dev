@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../vgpu-renderer.h"
 #include "../virtio-gpu.h"
 
 #define TEST_RAM_SIZE 4096U
@@ -329,6 +330,36 @@ static int test_deferred_ctrl_can_be_cancelled_before_error_response(void)
     return 0;
 }
 
+static int test_renderer_fence_completion_drains_from_gpu_poll(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    uint32_t generation = virtio_gpu_ctrl_generation(&vgpu);
+    vgpu_renderer_reset_queues(generation);
+    queue_one_submit(VIRTIO_GPU_FLAG_FENCE, 14, 0, 0);
+
+    virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_FENCE,
+        .token = {.id = 1, .generation = generation},
+        .context_fence = false,
+        .fence_id = 14,
+    };
+    CHECK(vgpu_renderer_complete(&completion));
+    CHECK(used_idx() == 0);
+
+    virtio_gpu_poll(&vgpu);
+
+    CHECK(used_idx() == 1);
+    CHECK(used_elem_id(0) == 0);
+    CHECK(used_elem_len(0) == sizeof(struct virtio_gpu_ctrl_hdr));
+    CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
+    CHECK(response_hdr()->fence_id == 14);
+
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_unfenced_deferred_submit_completes_generically() == 0);
@@ -337,5 +368,6 @@ int main(void)
     CHECK(test_reset_drops_pending_fence_without_writing_stale_response() == 0);
     CHECK(test_sync_completion_after_defer_is_not_lost() == 0);
     CHECK(test_deferred_ctrl_can_be_cancelled_before_error_response() == 0);
+    CHECK(test_renderer_fence_completion_drains_from_gpu_poll() == 0);
     return 0;
 }
