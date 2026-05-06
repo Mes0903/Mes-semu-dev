@@ -40,6 +40,10 @@ struct window_backend {
      * after queuing work such as input events or shutdown requests.
      */
     void (*window_wake_backend)(void);
+    /* Best-effort wakeup hook for the frontend/main thread. The emulator uses
+     * this after queuing renderer-owner work that must run from the SDL loop.
+     */
+    void (*window_wake_frontend)(void);
 #if SEMU_HAS(VIRTIOINPUT)
     /* Switch the backend between normal host-pointer mode and grabbed
      * relative-pointer mode. Must be called from the main thread because it

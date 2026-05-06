@@ -234,6 +234,7 @@ ifeq ($(call has, VIRTIOGPU), 1)
     ifeq ($(call has, VIRGL), 1)
         OBJS_EXTRA += virtio-gpu-sw.o
         OBJS_EXTRA += virtio-gpu-virgl.o
+        OBJS_EXTRA += vgpu-renderer.o
     else
         OBJS_EXTRA += virtio-gpu-sw.o
     endif
@@ -394,6 +395,7 @@ VGPU_DISPLAY_TEST := tests/vgpu-display-test
 VGPU_VIRGL_TEST := tests/virtio-gpu-virgl-test
 VGPU_FENCE_TEST := tests/virtio-gpu-fence-test
 VGPU_CHAIN_TEST := tests/virtio-gpu-chain-test
+VGPU_RENDERER_TEST := tests/vgpu-renderer-queue-test
 .PHONY: test-vgpu-desc
 test-vgpu-desc: $(VGPU_DESC_TEST)
 	$(Q)./$<
@@ -438,6 +440,15 @@ $(VGPU_CHAIN_TEST): tests/virtio-gpu-chain-test.c virtio-gpu.c virtio-gpu-desc.c
 	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
 	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $<
 
+.PHONY: test-vgpu-renderer
+test-vgpu-renderer: $(VGPU_RENDERER_TEST)
+	$(Q)./$<
+
+$(VGPU_RENDERER_TEST): tests/vgpu-renderer-queue-test.c vgpu-renderer.c vgpu-renderer.h virtio-gpu.h
+	$(VECHO) "  CC\t$@\n"
+	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
+	    -DSEMU_FEATURE_VIRGL=1 -Itests/fakes -o $@ $< vgpu-renderer.c
+
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:
 	$(Q)bash tests/vgpu-virgl-gate-test.sh
@@ -480,6 +491,7 @@ clean:
 	$(Q)$(RM) $(VGPU_VIRGL_TEST)
 	$(Q)$(RM) $(VGPU_FENCE_TEST)
 	$(Q)$(RM) $(VGPU_CHAIN_TEST)
+	$(Q)$(RM) $(VGPU_RENDERER_TEST)
 	$(Q)$(MAKE) -C mini-gdbstub clean
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \

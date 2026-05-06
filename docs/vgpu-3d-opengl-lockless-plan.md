@@ -338,7 +338,7 @@ virglrenderer execution yet.
 - Modify: `window.h`
 - Modify: `window-sw.c`
 
-- [ ] **Step 1: Add renderer queue types**
+- [x] **Step 1: Add renderer queue types**
 
 Create `vgpu-renderer.h` with these ownership rules:
 
@@ -400,7 +400,7 @@ bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion);
 void vgpu_renderer_reset_queues(uint32_t generation);
 ```
 
-- [ ] **Step 2: Implement bounded SPSC queues**
+- [x] **Step 2: Implement bounded SPSC queues**
 
 Create `vgpu-renderer.c` with two fixed-size queues:
 
@@ -427,7 +427,7 @@ Use the same acquire/release pattern as `vgpu-display.c` and
 `__ATOMIC_RELEASE`; consumer loads `head` with `__ATOMIC_ACQUIRE`, copies the
 entry, then stores `tail` with `__ATOMIC_RELEASE`.
 
-- [ ] **Step 3: Add queue unit tests**
+- [x] **Step 3: Add queue unit tests**
 
 Create `tests/vgpu-renderer-queue-test.c` with tests for:
 
@@ -437,7 +437,7 @@ Create `tests/vgpu-renderer-queue-test.c` with tests for:
 - `vgpu_renderer_reset_queues(new_generation)` drops stale completions whose
   token generation does not match
 
-- [ ] **Step 4: Add Makefile target**
+- [x] **Step 4: Add Makefile target**
 
 Add:
 
@@ -454,7 +454,7 @@ $(VGPU_RENDERER_TEST): tests/vgpu-renderer-queue-test.c vgpu-renderer.c vgpu-ren
 	    -DSEMU_FEATURE_VIRGL=1 -Itests/fakes -o $@ $< vgpu-renderer.c
 ```
 
-- [ ] **Step 5: Add main-thread wake hook**
+- [x] **Step 5: Add main-thread wake hook**
 
 Extend `struct window_backend` in `window.h`:
 
@@ -477,7 +477,7 @@ static void window_wake_frontend_sw(void)
 }
 ```
 
-- [ ] **Step 6: Wire the wake hook**
+- [x] **Step 6: Wire the wake hook**
 
 During window initialization, call:
 
@@ -488,7 +488,7 @@ vgpu_renderer_set_wake_frontend(window_wake_frontend_sw);
 The emulator thread will use this to wake the SDL loop after submitting GL
 owner work.
 
-- [ ] **Step 7: Verify**
+- [x] **Step 7: Verify**
 
 Run:
 
@@ -503,7 +503,7 @@ git diff --check
 Expected: queue tests pass, existing display/input queue tests still pass, and
 the VirGL build still links.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```sh
 git add Makefile window.h window-sw.c vgpu-renderer.h vgpu-renderer.c \

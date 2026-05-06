@@ -11,6 +11,7 @@
 #if SEMU_HAS(VIRGL)
 #include <epoxy/gl.h>
 #include "vgpu-gl.h"
+#include "vgpu-renderer.h"
 #endif
 #if SEMU_HAS(VIRTIOGPU)
 #include "vgpu-display.h"
@@ -107,6 +108,16 @@ static void window_wake_backend_sw(void)
         ssize_t bytes_written = write(wake_write_fd, &byte, 1);
         (void) bytes_written;
     }
+}
+
+static void window_wake_frontend_sw(void)
+{
+    if (!sdl_initialized || headless_mode)
+        return;
+
+    SDL_Event event = {0};
+    event.type = SDL_USEREVENT;
+    SDL_PushEvent(&event);
 }
 
 static void window_shutdown_sw(void)
@@ -895,6 +906,9 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         return;
     }
     sdl_initialized = true;
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_frontend(window_wake_frontend_sw);
+#endif
 
 #if SEMU_HAS(VIRTIOGPU)
     /* The current machine setup registers exactly one scanout before calling
@@ -1109,6 +1123,7 @@ const struct window_backend g_window = {
     .window_is_closed = window_is_closed_sw,
     .window_set_wake_fd = window_set_wake_fd_sw,
     .window_wake_backend = window_wake_backend_sw,
+    .window_wake_frontend = window_wake_frontend_sw,
 #if SEMU_HAS(VIRTIOINPUT)
     .window_set_mouse_grab = window_set_mouse_grab_sw,
     .window_is_mouse_grabbed = window_is_mouse_grabbed_sw,
