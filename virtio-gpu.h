@@ -84,6 +84,7 @@ typedef struct {
     struct virtio_gpu_dispatch_state dispatch;
     uint32_t ctrl_generation;
     uint32_t num_scanouts;
+    uint32_t num_capsets;
 } virtio_gpu_data_t;
 
 PACKED(struct virtio_gpu_config {
@@ -441,6 +442,8 @@ bool virtio_gpu_cancel_ctrl_response(
     uint32_t generation,
     const struct virtio_gpu_ctrl_hdr *request);
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu);
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
+                                uint32_t num_capsets);
 void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
                                        uint32_t generation,
                                        uint64_t fence_id,

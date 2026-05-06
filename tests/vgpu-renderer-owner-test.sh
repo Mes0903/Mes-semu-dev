@@ -39,3 +39,27 @@ grep -Fq 'VGPU_RENDERER_DONE_FENCE' <<<"${callback_body}" ||
 
 grep -Fq 'vgpu_renderer_complete' <<<"${callback_body}" ||
     fail "VirGL fence callbacks must publish through the renderer completion queue"
+
+num_capsets_body="$(
+    awk '
+        /case offsetof\(struct virtio_gpu_config, num_capsets\):/ {
+            in_case = 1
+        }
+        in_case {
+            print
+        }
+        in_case && /return true;/ {
+            exit
+        }
+    ' virtio-gpu.c
+)"
+
+[ -n "${num_capsets_body}" ] ||
+    fail "missing virtio-gpu num_capsets config read case"
+
+if grep -Fq 'virtio_gpu_backend_get_num_capsets' <<<"${num_capsets_body}"; then
+    fail "num_capsets config reads must use the emulator-owned cache, not the backend"
+fi
+
+grep -Fq 'PRIV(vgpu)->num_capsets' <<<"${num_capsets_body}" ||
+    fail "num_capsets config reads must return PRIV(vgpu)->num_capsets"

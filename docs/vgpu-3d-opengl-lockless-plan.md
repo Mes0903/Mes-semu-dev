@@ -703,6 +703,54 @@ drain, capset cache ownership, renderer poll-fd integration, reset ownership,
 and removal of backend command/thread lock hooks are still tracked by the
 unchecked Phase 4 steps below.
 
+### Phase 4B: Cache `num_capsets` Outside MMIO Config Reads
+
+**Goal:** Remove the last direct virglrenderer call from the MMIO config read
+path. The emulator thread should answer `virtio_gpu_config.num_capsets` from
+guest-visible device state, not by calling backend or renderer APIs while the
+guest reads config space.
+
+**Files:**
+
+- Modify: `virtio-gpu.h`
+- Modify: `virtio-gpu.c`
+- Modify: `virtio-gpu-virgl.c`
+- Modify: `tests/vgpu-renderer-owner-test.sh`
+- Modify: `tests/virtio-gpu-fence-test.c`
+- Modify: `tests/virtio-gpu-virgl-test.c`
+
+- [x] **Step 1: Add cache state and setter**
+
+`virtio_gpu_data_t` now stores `num_capsets`, and
+`virtio_gpu_set_num_capsets()` is the backend-facing publication API.
+
+- [x] **Step 2: Read config from cache**
+
+The `virtio_gpu_config.num_capsets` MMIO read case returns
+`PRIV(vgpu)->num_capsets`; it no longer calls
+`virtio_gpu_backend_get_num_capsets()` or any virglrenderer API.
+
+- [x] **Step 3: Publish VirGL capset count during renderer init/reset**
+
+The VirGL backend counts VirGL/VirGL2 capsets after renderer init and reset,
+then publishes the result into the emulator-owned virtio-gpu state.
+
+- [x] **Step 4: Verify**
+
+Run:
+
+```sh
+make test-vgpu-renderer-owner
+make test-vgpu-fence
+make test-vgpu-virgl
+```
+
+Expected: source gate rejects backend calls from the config read path, MMIO
+config reads return the cached value, and VirGL init/reset refresh the cache.
+
+**Remaining Phase 4 work:** the cache now exists, but renderer init/reset still
+run under the temporary GL mutex until the full GL-owner request path is moved.
+
 - [ ] **Step 1: Split decode from execute**
 
 In `virtio-gpu-virgl.c`, keep guest descriptor parsing on the emulator thread.

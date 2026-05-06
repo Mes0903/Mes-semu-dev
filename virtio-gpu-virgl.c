@@ -41,6 +41,32 @@ struct vgpu_virgl_fence_state {
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
 static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 
+static uint32_t vgpu_virgl_count_capsets(void)
+{
+    uint32_t count = 0;
+    uint32_t max_version = 0;
+    uint32_t max_size = 0;
+
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL, &max_version,
+                               &max_size);
+    if (max_version && max_size)
+        count++;
+
+    max_version = 0;
+    max_size = 0;
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_version,
+                               &max_size);
+    if (max_version && max_size)
+        count++;
+
+    return count;
+}
+
+static void vgpu_virgl_publish_capsets(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_set_num_capsets(vgpu, vgpu_virgl_count_capsets());
+}
+
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
     g_vgpu_virgl_fences.last_ctx0_fence = fence;
@@ -134,6 +160,8 @@ static void vgpu_virgl_init(virtio_gpu_state_t *vgpu)
         exit(EXIT_FAILURE);
     }
 
+    vgpu_virgl_publish_capsets(vgpu);
+
     /* virglrenderer initializes ctx0 on the caller's thread, but semu runs
      * guest GPU commands on the emulator thread once the SDL main loop starts.
      * Drop the init-thread current context; thread_enter will rebind ctx0 on
@@ -182,6 +210,7 @@ static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
     if (g_virtio_gpu_sw_backend.reset)
         g_virtio_gpu_sw_backend.reset(vgpu);
     virgl_renderer_reset();
+    vgpu_virgl_publish_capsets(vgpu);
     /* The renderer destroys all contexts/resources on reset. Mirror that in
      * semu's ownership registry after the renderer reset completes.
      */
@@ -1111,23 +1140,7 @@ static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
 
 uint32_t virtio_gpu_backend_get_num_capsets(void)
 {
-    uint32_t count = 0;
-    uint32_t max_version = 0;
-    uint32_t max_size = 0;
-
-    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL, &max_version,
-                               &max_size);
-    if (max_version && max_size)
-        count++;
-
-    max_version = 0;
-    max_size = 0;
-    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_version,
-                               &max_size);
-    if (max_version && max_size)
-        count++;
-
-    return count;
+    return vgpu_virgl_count_capsets();
 }
 
 static void vgpu_virgl_cmd_get_capset_info_handler(virtio_gpu_state_t *vgpu,

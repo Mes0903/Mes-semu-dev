@@ -360,6 +360,23 @@ static int test_renderer_fence_completion_drains_from_gpu_poll(void)
     return 0;
 }
 
+static int test_num_capsets_config_read_uses_cached_device_state(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    uint32_t value = 0;
+
+    virtio_gpu_set_num_capsets(&vgpu, 5);
+
+    CHECK(virtio_gpu_reg_read(
+        &vgpu, VIRTIO_Config +
+                   offsetof(struct virtio_gpu_config, num_capsets) /
+                       sizeof(uint32_t),
+        &value));
+    CHECK(value == 5);
+
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_unfenced_deferred_submit_completes_generically() == 0);
@@ -369,5 +386,6 @@ int main(void)
     CHECK(test_sync_completion_after_defer_is_not_lost() == 0);
     CHECK(test_deferred_ctrl_can_be_cancelled_before_error_response() == 0);
     CHECK(test_renderer_fence_completion_drains_from_gpu_poll() == 0);
+    CHECK(test_num_capsets_config_read_uses_cached_device_state() == 0);
     return 0;
 }

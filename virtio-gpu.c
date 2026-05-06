@@ -229,6 +229,15 @@ uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
     return PRIV(vgpu)->ctrl_generation;
 }
 
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
+                                uint32_t num_capsets)
+{
+    if (!vgpu->priv)
+        return;
+
+    PRIV(vgpu)->num_capsets = num_capsets;
+}
+
 bool virtio_gpu_cancel_ctrl_response(
     virtio_gpu_state_t *vgpu,
     uint32_t generation,
@@ -1116,7 +1125,7 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
             return true;
         }
         case offsetof(struct virtio_gpu_config, num_capsets): {
-            *value = virtio_gpu_backend_get_num_capsets();
+            *value = PRIV(vgpu)->num_capsets;
             return true;
         }
         default:

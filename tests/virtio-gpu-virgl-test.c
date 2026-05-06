@@ -271,6 +271,15 @@ uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
     return 0;
 }
 
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
+                                uint32_t num_capsets)
+{
+    if (!vgpu || !vgpu->priv)
+        return;
+
+    ((virtio_gpu_data_t *) vgpu->priv)->num_capsets = num_capsets;
+}
+
 bool virtio_gpu_cancel_ctrl_response(
     virtio_gpu_state_t *vgpu,
     uint32_t generation,
@@ -812,6 +821,7 @@ static int test_renderer_init_calls_virgl_renderer_init(void)
     CHECK(g_calls.renderer_init_callback_version ==
           VIRGL_RENDERER_CALLBACKS_VERSION);
     CHECK(g_calls.renderer_init_lock_depth > 0);
+    CHECK(g_vgpu_data.num_capsets == 2);
     CHECK(g_calls.gl_lock_depth == 0);
     CHECK(g_calls.gl_lock_underflow_count == 0);
 
@@ -1251,6 +1261,7 @@ static int test_reset_clears_scanout_before_renderer_reset(void)
     g_vgpu_data.scanouts[0].src_y = 6;
     g_vgpu_data.scanouts[0].src_w = 640;
     g_vgpu_data.scanouts[0].src_h = 480;
+    g_vgpu_data.num_capsets = 99;
     memset(&g_calls, 0, sizeof(g_calls));
     g_publish_primary_clear_count = 0;
     g_publish_cursor_clear_count = 0;
@@ -1268,6 +1279,7 @@ static int test_reset_clears_scanout_before_renderer_reset(void)
     CHECK(g_vgpu_data.scanouts[0].src_y == 0);
     CHECK(g_vgpu_data.scanouts[0].src_w == 0);
     CHECK(g_vgpu_data.scanouts[0].src_h == 0);
+    CHECK(g_vgpu_data.num_capsets == 2);
 
     return 0;
 }
