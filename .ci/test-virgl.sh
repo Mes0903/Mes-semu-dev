@@ -141,7 +141,28 @@ if {$env(SEMU_VIRGL_REBOOT_TEST) eq "1"} {
   expect "# " {
     send "reboot -f\r"
   } timeout { exit 11 }
-  expect "buildroot login:" { send "root\r" } timeout { exit 11 }
+  expect {
+    "buildroot login:" {
+      send "root\r"
+    }
+    "system reset: type=" {
+      expect {
+        "buildroot login:" {
+          send "root\r"
+        }
+        eof {
+          set wait_result [wait]
+          if {[lindex $wait_result 2] == 0 && [lindex $wait_result 3] == 0} {
+            exit 0
+          }
+          exit 11
+        }
+        timeout { exit 11 }
+      }
+    }
+    eof { exit 11 }
+    timeout { exit 11 }
+  }
   expect "# "              { send "uname -a\r" } timeout { exit 11 }
   expect "riscv32 GNU/Linux" {}
 }

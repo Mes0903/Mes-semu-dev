@@ -52,7 +52,7 @@ For macOS, use the following command:
 $ brew install e2fsprogs
 ```
 
-The experimental virtio-gpu VirGL path is optional and disabled by default. On
+The virtio-gpu VirGL path is optional and disabled by default. On
 Debian/Ubuntu hosts, install the development packages below before building with
 `ENABLE_VIRGL=1`:
 
@@ -68,6 +68,13 @@ The first 3D path is intentionally OpenGL/VirGL-only: it supports
 advertise or implement `VIRTIO_GPU_F_RESOURCE_BLOB`,
 `VIRTIO_GPU_F_CONTEXT_INIT`, Venus, Vulkan, native DRM contexts,
 host-visible SHM, or vhost-user-gpu.
+
+The OpenGL path follows the same lockless ownership model as the 2D display and
+input queues. The emulator thread owns guest-visible virtio-gpu state, the SDL
+main thread owns window state, and the SDL main thread is also the only
+virglrenderer/OpenGL owner. Renderer requests and completions cross that
+boundary through bounded queues and wakeups; there is no global GL mutex in the
+VirGL path.
 
 ## Build and Run
 
@@ -134,7 +141,7 @@ project and can be listed in the guest with:
 # ls /usr/local/bin/df_*
 ```
 
-To smoke-test the experimental VirGL 3D path, rebuild the guest test tools
+To smoke-test the VirGL 3D path, rebuild the guest test tools
 image with the Mesa VirGL gallium driver and run the visible SDL/OpenGL path:
 
 ```shell
@@ -147,18 +154,28 @@ The VirGL smoke script is intentionally not part of headless CI. It requires a
 host display because `semu` must create an SDL OpenGL window. The script checks
 the host SDL/VirGL build dependencies, starts guest `Xorg :0` when needed, then
 checks that the guest image contains `/usr/lib/dri/virtio_gpu_dri.so`, checks
-`/dev/dri/card0`, `/dev/dri/renderD128`, `glxinfo -B`, and runs a short
-`glxgears` test. The VirGL guest image also enables `libepoxy` so Xorg builds
-the `glamoregl` module; without Xorg glamor, GLX can fall back to
-`swrast`/`softpipe` even when the kernel virtio-gpu driver negotiated VirGL. If
-`glxinfo -B` reports `softpipe`, the test tools image is usually stale; rebuild
-it with `scripts/build-image.sh --virgl` so Mesa and Xorg are rebuilt with the
-VirGL/glamor path. After that basic path passes, an optional reboot/reset check
-can be run with:
+`/dev/dri/card0`, `/dev/dri/renderD128`, verifies that `glxinfo -B` reports a
+VirGL renderer, and runs a short `glxgears` test. The VirGL guest image also
+enables `libepoxy` so Xorg builds the `glamoregl` module; without Xorg glamor,
+GLX can fall back to `swrast`/`softpipe` even when the kernel virtio-gpu driver
+negotiated VirGL. If `glxinfo -B` reports `softpipe`, the test tools image is
+usually stale; rebuild it with `scripts/build-image.sh --virgl` so Mesa and
+Xorg are rebuilt with the VirGL/glamor path. After that basic path passes, an
+optional reset check can be run with:
 
 ```shell
 $ SEMU_VIRGL_REBOOT_TEST=1 .ci/test-virgl.sh
 ```
+
+Current semu SBI reset handling exits the host process cleanly after the guest
+prints `reboot: Restarting system`, so the optional reset check accepts that
+clean exit. If semu later implements an in-process warm reboot, the same check
+also accepts a return to the guest login prompt.
+
+For performance checks, compare the `glxgears` FPS reported by the smoke script
+while the mouse is idle and while moving it quickly. `xvfb-run -a
+.ci/test-virgl.sh` is useful for automated GL plumbing checks, but the
+five-minute fast-mouse stress still needs a real visible host display.
 
 For interactive VirGL crashes that make the whole VM exit, collect host-side
 evidence before reproducing the issue:
