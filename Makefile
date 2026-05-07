@@ -448,7 +448,8 @@ test-vgpu-renderer: $(VGPU_RENDERER_TEST)
 $(VGPU_RENDERER_TEST): tests/vgpu-renderer-queue-test.c vgpu-renderer.c vgpu-renderer.h virtio-gpu.h
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
-	    -DSEMU_FEATURE_VIRGL=1 -Itests/fakes -o $@ $< vgpu-renderer.c
+	    -DSEMU_FEATURE_VIRGL=1 -Itests/fakes -pthread -o $@ $< \
+	    vgpu-renderer.c
 
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:

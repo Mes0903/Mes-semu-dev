@@ -1717,6 +1717,113 @@ Expected classification:
   interpreting normal mouse motion in an unexpected way and the next
   investigation should move into the guest X input path.
 
+## Phase 12: Renderer MPSC Queue Lost Poll Fix
+
+Status: implemented in the working tree; needs a manual long-running visible
+stress pass to confirm the original freeze is gone.
+
+### Trigger
+
+With X still alive, running two `glmark2` instances and moving the mouse for a
+few minutes could freeze visible rendering. Pressing Ctrl-C in the guest serial
+did not stop host-side `gdb`; sending SIGINT to the host semu PID produced the
+capture in:
+
+```text
+vgpu-crash-logs/20260507-172416/
+```
+
+### Evidence
+
+The progress log showed the frontend loop was alive while VirGL progress was
+stuck:
+
+- `stage=handle-events`, with `sdl_events` and `renderer_drains` still rising.
+- `renderer_reqs`, `display_cmds`, and `renders` stopped changing.
+- `virgl pending_fences=57106 poll_pending=1 poll=312994/312993`.
+- `renderer submitted=424649 popped=424648 req_q=0`.
+- `virtio pending_ctrls=343`.
+
+The gdb backtrace matched that state: the main thread was in SDL event polling,
+and the emulator thread was still in `vm_step_many()`. There was no host crash
+or blocking GL call on the main thread.
+
+### Root Cause
+
+`vgpu-renderer.c` implemented the request and completion queues as if each ring
+had one producer. That was false:
+
+- the emulator thread submits renderer control work;
+- the SDL/GL owner submits poll work after creating a successful renderer
+  fence;
+- fence callbacks can submit completions.
+
+Two concurrent producers could both read the same ring `head`, write the same
+slot, and store the same next `head`. One submit appeared successful in debug
+counters but became unreachable to the consumer. If the lost request was
+`VGPU_RENDERER_REQ_POLL`, `g_vgpu_virgl_poll_request_pending` stayed true
+forever. Future fence creation then refused to enqueue another poll request,
+so fence retirement and display updates stopped even though both semu threads
+remained alive.
+
+### Fix
+
+Change the renderer request and completion rings to multi-producer,
+single-consumer lockless queues:
+
+- use monotonic `uint64_t` head/tail counters to avoid modulo ABA;
+- producers reserve a slot with CAS;
+- producers publish the slot with a per-slot ready byte after copying payload;
+- the single consumer only pops FIFO slots whose ready byte is visible.
+
+This keeps the intended lockless GL-owner boundary while preventing producer
+overwrite/lost-submit races.
+
+### Regression Coverage
+
+Added concurrent producer tests to `tests/vgpu-renderer-queue-test.c`:
+
+- request producers submit 384 total requests from 16 threads, then verify every
+  unique request is popped once;
+- completion producers do the same through `vgpu_renderer_complete()`.
+
+The request test failed before the fix:
+
+```text
+tests/vgpu-renderer-queue-test.c:258: check failed: popped == CONCURRENT_REQUESTS_TOTAL
+```
+
+### Verification
+
+```sh
+make test-vgpu-renderer
+make test-vgpu-fence test-vgpu-virgl
+make ENABLE_VIRGL=1 semu
+```
+
+### Manual Retest Gate
+
+Run:
+
+```sh
+scripts/run-vgpu-crash-debug.sh
+```
+
+Guest:
+
+```sh
+root
+startx
+```
+
+Then start two `glmark2` instances, move the mouse aggressively for at least
+three minutes, and stop the run if the picture freezes. Expected after this fix:
+
+- `poll_pending` should not stay at `1` with `poll=submitted/executed+1`;
+- `renderer submitted` and `popped` should not remain mismatched while
+  `req_q=0`;
+- `pending_fences` should continue to move instead of permanently backing up.
+
 ## Remaining Future Work Outside This Plan
 
 - Venus/Vulkan.

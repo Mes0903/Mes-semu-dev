@@ -1,5 +1,7 @@
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "../vgpu-renderer.h"
 
@@ -18,6 +20,17 @@ static int released_payload_count;
 static void *last_released_payload;
 static int released_response_count;
 static void *last_released_response;
+
+#define CONCURRENT_PRODUCERS 16U
+#define CONCURRENT_REQUESTS_PER_PRODUCER 24U
+#define CONCURRENT_REQUESTS_TOTAL \
+    (CONCURRENT_PRODUCERS * CONCURRENT_REQUESTS_PER_PRODUCER)
+
+struct submit_worker {
+    pthread_barrier_t *barrier;
+    uint32_t base_id;
+    int failed;
+};
 
 static void test_wake_frontend(void)
 {
@@ -60,6 +73,36 @@ static void release_response(void *response)
 {
     released_response_count++;
     last_released_response = response;
+}
+
+static void *submit_worker_main(void *arg)
+{
+    struct submit_worker *worker = arg;
+
+    pthread_barrier_wait(worker->barrier);
+    for (uint32_t i = 0; i < CONCURRENT_REQUESTS_PER_PRODUCER; i++) {
+        struct vgpu_renderer_request request =
+            test_request(worker->base_id + i);
+        if (!vgpu_renderer_submit(&request))
+            worker->failed++;
+    }
+
+    return NULL;
+}
+
+static void *complete_worker_main(void *arg)
+{
+    struct submit_worker *worker = arg;
+
+    pthread_barrier_wait(worker->barrier);
+    for (uint32_t i = 0; i < CONCURRENT_REQUESTS_PER_PRODUCER; i++) {
+        struct vgpu_renderer_completion completion =
+            test_completion(worker->base_id + i, 1);
+        if (!vgpu_renderer_complete(&completion))
+            worker->failed++;
+    }
+
+    return NULL;
 }
 
 static int test_request_fifo_ordering(void)
@@ -176,6 +219,94 @@ static int test_request_queue_accepts_full_virtqueue_burst(void)
     return 0;
 }
 
+static int test_concurrent_request_submitters_do_not_lose_requests(void)
+{
+    vgpu_renderer_reset_queues(1);
+
+    pthread_t threads[CONCURRENT_PRODUCERS];
+    struct submit_worker workers[CONCURRENT_PRODUCERS];
+    pthread_barrier_t barrier;
+    CHECK(pthread_barrier_init(&barrier, NULL, CONCURRENT_PRODUCERS) == 0);
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++) {
+        workers[i] = (struct submit_worker) {
+            .barrier = &barrier,
+            .base_id = i * CONCURRENT_REQUESTS_PER_PRODUCER,
+        };
+        CHECK(pthread_create(&threads[i], NULL, submit_worker_main,
+                             &workers[i]) == 0);
+    }
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++)
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    pthread_barrier_destroy(&barrier);
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++)
+        CHECK(workers[i].failed == 0);
+
+    bool seen[CONCURRENT_REQUESTS_TOTAL];
+    memset(seen, 0, sizeof(seen));
+
+    uint32_t popped = 0;
+    struct vgpu_renderer_request out;
+    while (vgpu_renderer_pop_request(&out)) {
+        CHECK(out.token.id < CONCURRENT_REQUESTS_TOTAL);
+        CHECK(!seen[out.token.id]);
+        seen[out.token.id] = true;
+        popped++;
+    }
+
+    CHECK(popped == CONCURRENT_REQUESTS_TOTAL);
+    for (uint32_t i = 0; i < CONCURRENT_REQUESTS_TOTAL; i++)
+        CHECK(seen[i]);
+
+    return 0;
+}
+
+static int test_concurrent_completion_submitters_do_not_lose_completions(void)
+{
+    vgpu_renderer_reset_queues(1);
+
+    pthread_t threads[CONCURRENT_PRODUCERS];
+    struct submit_worker workers[CONCURRENT_PRODUCERS];
+    pthread_barrier_t barrier;
+    CHECK(pthread_barrier_init(&barrier, NULL, CONCURRENT_PRODUCERS) == 0);
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++) {
+        workers[i] = (struct submit_worker) {
+            .barrier = &barrier,
+            .base_id = i * CONCURRENT_REQUESTS_PER_PRODUCER,
+        };
+        CHECK(pthread_create(&threads[i], NULL, complete_worker_main,
+                             &workers[i]) == 0);
+    }
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++)
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    pthread_barrier_destroy(&barrier);
+
+    for (uint32_t i = 0; i < CONCURRENT_PRODUCERS; i++)
+        CHECK(workers[i].failed == 0);
+
+    bool seen[CONCURRENT_REQUESTS_TOTAL];
+    memset(seen, 0, sizeof(seen));
+
+    uint32_t popped = 0;
+    struct vgpu_renderer_completion out;
+    while (vgpu_renderer_pop_completion(&out)) {
+        CHECK(out.token.id < CONCURRENT_REQUESTS_TOTAL);
+        CHECK(!seen[out.token.id]);
+        seen[out.token.id] = true;
+        popped++;
+    }
+
+    CHECK(popped == CONCURRENT_REQUESTS_TOTAL);
+    for (uint32_t i = 0; i < CONCURRENT_REQUESTS_TOTAL; i++)
+        CHECK(seen[i]);
+
+    return 0;
+}
+
 static int test_reset_generation_filters_stale_completions(void)
 {
     vgpu_renderer_reset_queues(7);
@@ -288,6 +419,8 @@ int main(void)
     CHECK(test_completion_wakes_backend() == 0);
     CHECK(test_full_queue_rejects_newest_request() == 0);
     CHECK(test_request_queue_accepts_full_virtqueue_burst() == 0);
+    CHECK(test_concurrent_request_submitters_do_not_lose_requests() == 0);
+    CHECK(test_concurrent_completion_submitters_do_not_lose_completions() == 0);
     CHECK(test_reset_generation_filters_stale_completions() == 0);
     CHECK(test_reset_releases_queued_request_payloads() == 0);
     CHECK(test_reset_releases_queued_completion_responses() == 0);
