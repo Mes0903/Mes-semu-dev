@@ -69,6 +69,15 @@ static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
 static uint32_t g_vgpu_virgl_pending_fences;
 static bool g_vgpu_virgl_poll_request_pending;
 static uint32_t g_vgpu_virgl_next_token;
+static uint64_t g_vgpu_virgl_debug_poll_requests_submitted;
+static uint64_t g_vgpu_virgl_debug_poll_requests_dropped;
+static uint64_t g_vgpu_virgl_debug_poll_requests_executed;
+static uint64_t g_vgpu_virgl_debug_fences_created;
+static uint64_t g_vgpu_virgl_debug_fences_completed;
+static uint64_t g_vgpu_virgl_debug_ctrl_requests_started;
+static uint64_t g_vgpu_virgl_debug_ctrl_requests_completed;
+static uint64_t g_vgpu_virgl_debug_scanouts_published;
+static uint64_t g_vgpu_virgl_debug_scanouts_dropped;
 
 static uint32_t vgpu_virgl_count_capsets(void)
 {
@@ -103,19 +112,33 @@ static void vgpu_virgl_reset_poll_state(void)
                      __ATOMIC_RELEASE);
 }
 
+static void vgpu_virgl_reset_fence_state(void)
+{
+    __atomic_store_n(&g_vgpu_virgl_fences.last_ctx0_fence, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_ctx_id, 0,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_ring_idx, 0,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_fence, 0,
+                     __ATOMIC_RELEASE);
+}
+
 static void vgpu_virgl_note_fence_created(void)
 {
     __atomic_add_fetch(&g_vgpu_virgl_pending_fences, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_vgpu_virgl_debug_fences_created, 1, __ATOMIC_RELAXED);
 }
 
 static void vgpu_virgl_note_fence_completed(void)
 {
+    __atomic_add_fetch(&g_vgpu_virgl_debug_fences_completed, 1,
+                       __ATOMIC_RELAXED);
     uint32_t pending =
         __atomic_load_n(&g_vgpu_virgl_pending_fences, __ATOMIC_ACQUIRE);
     while (pending) {
         if (__atomic_compare_exchange_n(&g_vgpu_virgl_pending_fences, &pending,
-                                        pending - 1, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                                        pending - 1, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
             return;
     }
 }
@@ -132,17 +155,24 @@ static void vgpu_virgl_request_poll(void)
     struct vgpu_renderer_request request = {
         .type = VGPU_RENDERER_REQ_POLL,
     };
-    if (!vgpu_renderer_submit(&request))
+    if (!vgpu_renderer_submit(&request)) {
+        __atomic_add_fetch(&g_vgpu_virgl_debug_poll_requests_dropped, 1,
+                           __ATOMIC_RELAXED);
         __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
                          __ATOMIC_RELEASE);
+        return;
+    }
+
+    __atomic_add_fetch(&g_vgpu_virgl_debug_poll_requests_submitted, 1,
+                       __ATOMIC_RELAXED);
 }
 
 static uint32_t vgpu_virgl_next_token(void)
 {
     uint32_t token =
         __atomic_add_fetch(&g_vgpu_virgl_next_token, 1, __ATOMIC_RELAXED);
-    return token ? token :
-                   __atomic_add_fetch(&g_vgpu_virgl_next_token, 1,
+    return token ? token
+                 : __atomic_add_fetch(&g_vgpu_virgl_next_token, 1,
                                       __ATOMIC_RELAXED);
 }
 
@@ -163,7 +193,8 @@ static void vgpu_virgl_release_ctrl_payload(void *payload)
 
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
-    g_vgpu_virgl_fences.last_ctx0_fence = fence;
+    __atomic_store_n(&g_vgpu_virgl_fences.last_ctx0_fence, fence,
+                     __ATOMIC_RELEASE);
     vgpu_virgl_note_fence_completed();
     if (!cookie)
         return;
@@ -186,9 +217,12 @@ static void vgpu_virgl_write_context_fence(void *cookie,
                                            uint32_t ring_idx,
                                            uint64_t fence_id)
 {
-    g_vgpu_virgl_fences.last_context_ctx_id = ctx_id;
-    g_vgpu_virgl_fences.last_context_ring_idx = ring_idx;
-    g_vgpu_virgl_fences.last_context_fence = fence_id;
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_ctx_id, ctx_id,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_ring_idx, ring_idx,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vgpu_virgl_fences.last_context_fence, fence_id,
+                     __ATOMIC_RELEASE);
     vgpu_virgl_note_fence_completed();
     if (!cookie)
         return;
@@ -204,8 +238,7 @@ static void vgpu_virgl_write_context_fence(void *cookie,
     if (!vgpu_renderer_complete(&completion))
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
-                "%s(): dropped renderer context fence completion %" PRIu64
-                "\n",
+                "%s(): dropped renderer context fence completion %" PRIu64 "\n",
                 __func__, fence_id);
 }
 
@@ -276,8 +309,7 @@ static void vgpu_virgl_delegate_reset(virtio_gpu_state_t *vgpu)
     };
     if (!vgpu_renderer_submit(&request))
         fprintf(stderr,
-                VIRTIO_GPU_LOG_PREFIX
-                "%s(): dropped renderer reset request\n",
+                VIRTIO_GPU_LOG_PREFIX "%s(): dropped renderer reset request\n",
                 __func__);
 }
 
@@ -386,6 +418,10 @@ static void vgpu_virgl_complete_ctrl_work(
                 work->hdr.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
                 work->hdr.ring_idx, work->hdr.fence_id);
         } else {
+            /* virgl_renderer_create_fence() does not switch contexts; it
+             * expects ctx0 to already be current before calling glFenceSync().
+             */
+            virgl_renderer_force_ctx_0();
             ret = virgl_renderer_create_fence(
                 (int) (uint32_t) work->hdr.fence_id, 0);
         }
@@ -415,18 +451,17 @@ static void vgpu_virgl_complete_ctrl_work(
         free(response);
 }
 
-static bool vgpu_virgl_submit_ctrl_work(
-    virtio_gpu_state_t *vgpu,
-    const struct virtq_desc *response_desc,
-    struct vgpu_virgl_ctrl_work *work,
-    uint32_t response_type,
-    uint32_t *plen)
+static bool vgpu_virgl_submit_ctrl_work(virtio_gpu_state_t *vgpu,
+                                        const struct virtq_desc *response_desc,
+                                        struct vgpu_virgl_ctrl_work *work,
+                                        uint32_t response_type,
+                                        uint32_t *plen)
 {
     uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
     uint32_t token = vgpu_virgl_next_token();
-    if (!virtio_gpu_defer_ctrl_response_token(
-            vgpu, &work->hdr, response_desc, response_type, generation,
-            token)) {
+    if (!virtio_gpu_defer_ctrl_response_token(vgpu, &work->hdr, response_desc,
+                                              response_type, generation,
+                                              token)) {
         struct virtio_gpu_ctrl_hdr hdr = work->hdr;
         vgpu_virgl_free_ctrl_work(work);
         *plen = virtio_gpu_write_ctrl_response(vgpu, &hdr, response_desc,
@@ -682,8 +717,7 @@ static void vgpu_virgl_cmd_resource_create_3d_handler(
     work->hdr = request->hdr;
     work->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
     work->cmd.resource_create_3d = *request;
-    work->cmd.resource_create_3d.hdr.type =
-        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    work->cmd.resource_create_3d.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
     if (!vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
                                      VIRTIO_GPU_RESP_OK_NODATA, plen))
         vgpu_virgl_remove_resource(request->resource_id);
@@ -956,8 +990,7 @@ static void vgpu_virgl_cmd_transfer_to_host_2d_handler(
     work->hdr = request->hdr;
     work->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     work->cmd.transfer_to_host_2d = *request;
-    work->cmd.transfer_to_host_2d.hdr.type =
-        VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    work->cmd.transfer_to_host_2d.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     vgpu_virgl_submit_ctrl_work(vgpu, response_desc, work,
                                 VIRTIO_GPU_RESP_OK_NODATA, plen);
 }
@@ -1101,20 +1134,30 @@ static bool vgpu_virgl_publish_gl_scanout(
     uint32_t resource_id,
     const struct virtio_gpu_scanout_info *scanout)
 {
-    if (!vgpu_display_can_publish())
+    if (!vgpu_display_can_publish()) {
+        __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_dropped, 1,
+                           __ATOMIC_RELAXED);
         return true;
+    }
 
     struct virgl_renderer_resource_info info = {0};
     int ret = virgl_renderer_resource_get_info((int) resource_id, &info);
-    if (ret)
+    if (ret) {
+        __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_dropped, 1,
+                           __ATOMIC_RELAXED);
         return false;
+    }
 
     struct vgpu_display_payload *payload =
         vgpu_virgl_create_gl_payload(resource_id, scanout, &info);
-    if (!payload)
+    if (!payload) {
+        __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_dropped, 1,
+                           __ATOMIC_RELAXED);
         return false;
-    virgl_renderer_force_ctx_0();
+    }
     vgpu_display_publish_primary_set(scanout_id, payload);
+    __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_published, 1,
+                       __ATOMIC_RELAXED);
     return true;
 }
 
@@ -1316,6 +1359,15 @@ static void vgpu_virgl_execute_ctrl_request(
     void *response = NULL;
     size_t response_size = 0;
 
+    __atomic_add_fetch(&g_vgpu_virgl_debug_ctrl_requests_started, 1,
+                       __ATOMIC_RELAXED);
+
+    /* SDL presentation can detach the real current GL context behind
+     * virglrenderer's cached current_ctx/current_hw_ctx. Reset to ctx0 before
+     * every renderer command so virglrenderer performs the needed switch.
+     */
+    virgl_renderer_force_ctx_0();
+
     switch (request->command_type) {
     case VIRTIO_GPU_CMD_CTX_CREATE: {
         const struct virtio_gpu_ctx_create *cmd = &work->cmd.ctx_create;
@@ -1329,14 +1381,12 @@ static void vgpu_virgl_execute_ctrl_request(
         virgl_renderer_context_destroy(work->cmd.ctx_destroy.hdr.ctx_id);
         break;
     case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
-        virgl_renderer_ctx_attach_resource(
-            work->cmd.ctx_resource.hdr.ctx_id,
-            work->cmd.ctx_resource.resource_id);
+        virgl_renderer_ctx_attach_resource(work->cmd.ctx_resource.hdr.ctx_id,
+                                           work->cmd.ctx_resource.resource_id);
         break;
     case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
-        virgl_renderer_ctx_detach_resource(
-            work->cmd.ctx_resource.hdr.ctx_id,
-            work->cmd.ctx_resource.resource_id);
+        virgl_renderer_ctx_detach_resource(work->cmd.ctx_resource.hdr.ctx_id,
+                                           work->cmd.ctx_resource.resource_id);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
         const struct virtio_gpu_resource_create_3d *cmd =
@@ -1425,8 +1475,7 @@ static void vgpu_virgl_execute_ctrl_request(
         struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&cmd->box);
         int ret = virgl_renderer_transfer_write_iov(
             cmd->resource_id, cmd->hdr.ctx_id, (int) cmd->level, cmd->stride,
-            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL,
-            0);
+            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL, 0);
         response_type =
             ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
         break;
@@ -1436,8 +1485,7 @@ static void vgpu_virgl_execute_ctrl_request(
         struct vgpu_virgl_box box = vgpu_virgl_box_from_virtio(&cmd->box);
         int ret = virgl_renderer_transfer_read_iov(
             cmd->resource_id, cmd->hdr.ctx_id, cmd->level, cmd->stride,
-            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL,
-            0);
+            cmd->layer_stride, (struct virgl_box *) &box, cmd->offset, NULL, 0);
         response_type =
             ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
         break;
@@ -1445,8 +1493,7 @@ static void vgpu_virgl_execute_ctrl_request(
     case VIRTIO_GPU_CMD_SUBMIT_3D: {
         const struct virtio_gpu_cmd_submit *cmd = &work->cmd.submit_3d;
         int ret = virgl_renderer_submit_cmd(
-            work->data, cmd->hdr.ctx_id,
-            (int) (cmd->size / sizeof(uint32_t)));
+            work->data, cmd->hdr.ctx_id, (int) (cmd->size / sizeof(uint32_t)));
         response_type =
             ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
         break;
@@ -1469,8 +1516,8 @@ static void vgpu_virgl_execute_ctrl_request(
         }
 
         struct virgl_renderer_resource_info info = {0};
-        int ret = virgl_renderer_resource_get_info((int) cmd->resource_id,
-                                                   &info);
+        int ret =
+            virgl_renderer_resource_get_info((int) cmd->resource_id, &info);
         if (ret) {
             response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
             break;
@@ -1495,8 +1542,12 @@ static void vgpu_virgl_execute_ctrl_request(
                 response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
                 break;
             }
-            virgl_renderer_force_ctx_0();
             vgpu_display_publish_primary_set(cmd->scanout_id, payload);
+            __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_published, 1,
+                               __ATOMIC_RELAXED);
+        } else {
+            __atomic_add_fetch(&g_vgpu_virgl_debug_scanouts_dropped, 1,
+                               __ATOMIC_RELAXED);
         }
         break;
     }
@@ -1509,8 +1560,7 @@ static void vgpu_virgl_execute_ctrl_request(
                 scanout->primary_resource_id != cmd->resource_id)
                 continue;
 
-            if (!vgpu_virgl_publish_gl_scanout(i, cmd->resource_id,
-                                               scanout)) {
+            if (!vgpu_virgl_publish_gl_scanout(i, cmd->resource_id, scanout)) {
                 response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
                 break;
             }
@@ -1534,8 +1584,7 @@ static void vgpu_virgl_execute_ctrl_request(
         if (out->capset_id) {
             uint32_t max_version = 0;
             uint32_t max_size = 0;
-            virgl_renderer_get_cap_set(out->capset_id, &max_version,
-                                       &max_size);
+            virgl_renderer_get_cap_set(out->capset_id, &max_version, &max_size);
             out->capset_max_version = max_version;
             out->capset_max_size = max_size;
         }
@@ -1586,6 +1635,8 @@ static void vgpu_virgl_execute_ctrl_request(
 
     vgpu_virgl_complete_ctrl_work(request, work, response_type, response,
                                   response_size);
+    __atomic_add_fetch(&g_vgpu_virgl_debug_ctrl_requests_completed, 1,
+                       __ATOMIC_RELAXED);
 }
 
 void vgpu_virgl_execute_renderer_request(
@@ -1598,7 +1649,7 @@ void vgpu_virgl_execute_renderer_request(
     case VGPU_RENDERER_REQ_RESET: {
         virtio_gpu_state_t *vgpu = request->payload;
         vgpu_virgl_reset_poll_state();
-        memset(&g_vgpu_virgl_fences, 0, sizeof(g_vgpu_virgl_fences));
+        vgpu_virgl_reset_fence_state();
         if (g_virtio_gpu_sw_backend.reset)
             g_virtio_gpu_sw_backend.reset(vgpu);
         virgl_renderer_reset();
@@ -1612,6 +1663,8 @@ void vgpu_virgl_execute_renderer_request(
     }
     case VGPU_RENDERER_REQ_POLL:
         virgl_renderer_poll();
+        __atomic_add_fetch(&g_vgpu_virgl_debug_poll_requests_executed, 1,
+                           __ATOMIC_RELAXED);
         __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
                          __ATOMIC_RELEASE);
         break;
@@ -1628,6 +1681,45 @@ void vgpu_virgl_execute_renderer_request(
                 __func__, request->type);
         break;
     }
+}
+
+void vgpu_virgl_debug_snapshot(struct vgpu_virgl_debug_stats *stats)
+{
+    if (!stats)
+        return;
+
+    *stats = (struct vgpu_virgl_debug_stats) {
+        .pending_fences =
+            __atomic_load_n(&g_vgpu_virgl_pending_fences, __ATOMIC_ACQUIRE),
+        .poll_request_pending = __atomic_load_n(
+            &g_vgpu_virgl_poll_request_pending, __ATOMIC_ACQUIRE),
+        .poll_requests_submitted = __atomic_load_n(
+            &g_vgpu_virgl_debug_poll_requests_submitted, __ATOMIC_RELAXED),
+        .poll_requests_dropped = __atomic_load_n(
+            &g_vgpu_virgl_debug_poll_requests_dropped, __ATOMIC_RELAXED),
+        .poll_requests_executed = __atomic_load_n(
+            &g_vgpu_virgl_debug_poll_requests_executed, __ATOMIC_RELAXED),
+        .fences_created = __atomic_load_n(&g_vgpu_virgl_debug_fences_created,
+                                          __ATOMIC_RELAXED),
+        .fences_completed = __atomic_load_n(
+            &g_vgpu_virgl_debug_fences_completed, __ATOMIC_RELAXED),
+        .ctrl_requests_started = __atomic_load_n(
+            &g_vgpu_virgl_debug_ctrl_requests_started, __ATOMIC_RELAXED),
+        .ctrl_requests_completed = __atomic_load_n(
+            &g_vgpu_virgl_debug_ctrl_requests_completed, __ATOMIC_RELAXED),
+        .scanouts_published = __atomic_load_n(
+            &g_vgpu_virgl_debug_scanouts_published, __ATOMIC_RELAXED),
+        .scanouts_dropped = __atomic_load_n(
+            &g_vgpu_virgl_debug_scanouts_dropped, __ATOMIC_RELAXED),
+        .last_ctx0_fence = __atomic_load_n(&g_vgpu_virgl_fences.last_ctx0_fence,
+                                           __ATOMIC_RELAXED),
+        .last_context_ctx_id = __atomic_load_n(
+            &g_vgpu_virgl_fences.last_context_ctx_id, __ATOMIC_RELAXED),
+        .last_context_ring_idx = __atomic_load_n(
+            &g_vgpu_virgl_fences.last_context_ring_idx, __ATOMIC_RELAXED),
+        .last_context_fence = __atomic_load_n(
+            &g_vgpu_virgl_fences.last_context_fence, __ATOMIC_RELAXED),
+    };
 }
 
 static void vgpu_virgl_cmd_get_capset_info_handler(virtio_gpu_state_t *vgpu,

@@ -55,11 +55,57 @@ struct vinput_cmd {
     } u;
 };
 
+struct vinput_host_debug_stats {
+    uint32_t keyboard_queue_depth;
+    uint32_t mouse_queue_depth;
+    bool wake_pending;
+    uint64_t keyboard_cmds_pushed;
+    uint64_t keyboard_cmds_dropped;
+    uint64_t keyboard_cmds_popped;
+    uint64_t mouse_cmds_pushed;
+    uint64_t mouse_cmds_dropped;
+    uint64_t mouse_cmds_popped;
+    uint64_t sdl_keydown;
+    uint64_t sdl_keyup;
+    uint64_t sdl_mouse_button_down;
+    uint64_t sdl_mouse_button_up;
+    uint64_t sdl_mouse_motion_observed;
+    uint64_t sdl_mouse_motion_published;
+    uint64_t sdl_mouse_wheel_observed;
+    uint64_t sdl_mouse_wheel_published;
+    int32_t last_motion_dx;
+    int32_t last_motion_dy;
+    int32_t last_wheel_dx;
+    int32_t last_wheel_dy;
+};
+
+struct virtio_input_debug_stats {
+    uint64_t keyboard_keys;
+    uint64_t keyboard_pageup_keys;
+    uint64_t mouse_buttons;
+    uint64_t mouse_motion_batches;
+    uint64_t mouse_scroll_batches;
+    uint64_t mouse_rel_x;
+    uint64_t mouse_rel_y;
+    uint64_t mouse_rel_hwheel;
+    uint64_t mouse_rel_wheel;
+    uint64_t keyboard_eventq_writes;
+    uint64_t mouse_eventq_writes;
+    uint64_t keyboard_eventq_drops;
+    uint64_t mouse_eventq_drops;
+    uint16_t last_keyboard_code;
+    uint32_t last_keyboard_value;
+    uint16_t last_mouse_rel_code;
+    int32_t last_mouse_rel_value;
+};
+
 /* Poll and translate pending SDL events on the main thread. Returns true if a
  * quit/close request was observed, which tells the caller to shut down the
  * frontend loop.
  */
 bool vinput_handle_events(void);
+void vinput_debug_snapshot(struct vinput_host_debug_stats *stats);
+void virtio_input_debug_snapshot(struct virtio_input_debug_stats *stats);
 
 /* Pop one translated backend input event from the per-device queue. Called by
  * the emulator thread while draining work that arrived from the SDL/main

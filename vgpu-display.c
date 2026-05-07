@@ -40,6 +40,21 @@ static uint32_t vgpu_display_cmd_tail;
 
 static bool vgpu_display_unavailable;
 
+static uint64_t debug_primary_clears;
+static uint64_t debug_cursor_clears;
+static uint64_t debug_primary_sets_published;
+static uint64_t debug_cursor_sets_published;
+static uint64_t debug_cursor_moves_published;
+static uint64_t debug_cmds_queued;
+static uint64_t debug_cmds_dropped;
+static uint64_t debug_cmds_popped;
+static uint64_t debug_stale_cmds_dropped;
+
+static uint32_t vgpu_display_queue_depth(uint32_t head, uint32_t tail)
+{
+    return (head - tail) & VGPU_DISPLAY_CMD_QUEUE_MASK;
+}
+
 static bool vgpu_display_is_cmd_stale(const struct vgpu_display_cmd *cmd)
 {
     switch (cmd->type) {
@@ -82,6 +97,7 @@ static bool vgpu_display_pop_pending_clear_cmd(
             .scanout_id = i,
             .generation = generation,
         };
+        __atomic_add_fetch(&debug_cmds_popped, 1, __ATOMIC_RELAXED);
         return true;
     }
 
@@ -104,6 +120,7 @@ void vgpu_display_publish_primary_clear(uint32_t scanout_id)
 
     __atomic_add_fetch(&vgpu_display_primary_clear[scanout_id].generation, 1U,
                        __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&debug_primary_clears, 1, __ATOMIC_RELAXED);
 }
 
 void vgpu_display_publish_cursor_clear(uint32_t scanout_id)
@@ -113,6 +130,7 @@ void vgpu_display_publish_cursor_clear(uint32_t scanout_id)
 
     __atomic_add_fetch(&vgpu_display_cursor_clear[scanout_id].generation, 1U,
                        __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&debug_cursor_clears, 1, __ATOMIC_RELAXED);
 }
 
 static bool vgpu_display_is_cmd_queue_full(void)
@@ -134,12 +152,14 @@ static bool vgpu_display_push_cmd(struct vgpu_display_cmd *cmd)
      * execution on the emulator thread. Clear commands do not use this queue.
      */
     if (next == tail) {
+        __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         vgpu_display_release_cmd(cmd);
         return false;
     }
 
     vgpu_display_cmd_queue[head] = *cmd;
     __atomic_store_n(&vgpu_display_cmd_head, next, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&debug_cmds_queued, 1, __ATOMIC_RELAXED);
     return true;
 }
 
@@ -191,10 +211,13 @@ bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd)
         /* Pop the command and check if it is still valid. */
         if (!vgpu_display_pop_queued_cmd(cmd))
             return false;
-        if (!vgpu_display_is_cmd_stale(cmd))
+        if (!vgpu_display_is_cmd_stale(cmd)) {
+            __atomic_add_fetch(&debug_cmds_popped, 1, __ATOMIC_RELAXED);
             return true;
+        }
 
         /* Drop invalid command and continue. */
+        __atomic_add_fetch(&debug_stale_cmds_dropped, 1, __ATOMIC_RELAXED);
         vgpu_display_release_cmd(cmd);
     }
 }
@@ -224,10 +247,46 @@ bool vgpu_display_can_publish(void)
            !vgpu_display_is_cmd_queue_full();
 }
 
+void vgpu_display_debug_snapshot(struct vgpu_display_debug_stats *stats)
+{
+    if (!stats)
+        return;
+
+    uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
+
+    *stats = (struct vgpu_display_debug_stats) {
+        .scanout_count =
+            __atomic_load_n(&vgpu_display_scanout_count, __ATOMIC_ACQUIRE),
+        .queue_head = head,
+        .queue_tail = tail,
+        .queue_depth = vgpu_display_queue_depth(head, tail),
+        .unavailable =
+            __atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE),
+        .primary_clears =
+            __atomic_load_n(&debug_primary_clears, __ATOMIC_RELAXED),
+        .cursor_clears =
+            __atomic_load_n(&debug_cursor_clears, __ATOMIC_RELAXED),
+        .primary_sets_published =
+            __atomic_load_n(&debug_primary_sets_published, __ATOMIC_RELAXED),
+        .cursor_sets_published =
+            __atomic_load_n(&debug_cursor_sets_published, __ATOMIC_RELAXED),
+        .cursor_moves_published =
+            __atomic_load_n(&debug_cursor_moves_published, __ATOMIC_RELAXED),
+        .cmds_queued = __atomic_load_n(&debug_cmds_queued, __ATOMIC_RELAXED),
+        .cmds_dropped = __atomic_load_n(&debug_cmds_dropped, __ATOMIC_RELAXED),
+        .cmds_popped = __atomic_load_n(&debug_cmds_popped, __ATOMIC_RELAXED),
+        .stale_cmds_dropped =
+            __atomic_load_n(&debug_stale_cmds_dropped, __ATOMIC_RELAXED),
+    };
+}
+
 void vgpu_display_publish_primary_set(uint32_t scanout_id,
                                       struct vgpu_display_payload *payload)
 {
+    __atomic_add_fetch(&debug_primary_sets_published, 1, __ATOMIC_RELAXED);
     if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE)) {
+        __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         free(payload);
         return;
     }
@@ -250,12 +309,15 @@ void vgpu_display_publish_cursor_set(uint32_t scanout_id,
                                      uint32_t hot_x,
                                      uint32_t hot_y)
 {
+    __atomic_add_fetch(&debug_cursor_sets_published, 1, __ATOMIC_RELAXED);
     if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE)) {
+        __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         free(payload);
         return;
     }
 
     if (vgpu_display_is_cmd_queue_full()) {
+        __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         free(payload);
         return;
     }
@@ -280,6 +342,7 @@ void vgpu_display_publish_cursor_set(uint32_t scanout_id,
 
 void vgpu_display_publish_cursor_move(uint32_t scanout_id, int32_t x, int32_t y)
 {
+    __atomic_add_fetch(&debug_cursor_moves_published, 1, __ATOMIC_RELAXED);
     if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE))
         return;
 

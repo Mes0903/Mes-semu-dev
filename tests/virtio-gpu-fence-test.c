@@ -199,17 +199,16 @@ static void fake_submit_3d(virtio_gpu_state_t *vgpu,
 
     uint32_t generation = virtio_gpu_ctrl_generation(vgpu);
     if (g_defer_tokenized &&
-        virtio_gpu_defer_ctrl_response_token(
-            vgpu, request, &vq_desc[resp_idx], VIRTIO_GPU_RESP_OK_NODATA,
-            generation, request->ctx_id)) {
+        virtio_gpu_defer_ctrl_response_token(vgpu, request, &vq_desc[resp_idx],
+                                             VIRTIO_GPU_RESP_OK_NODATA,
+                                             generation, request->ctx_id)) {
         *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
         return;
     }
 
     if ((g_defer_unfenced || (request->flags & VIRTIO_GPU_FLAG_FENCE)) &&
         virtio_gpu_defer_ctrl_response(vgpu, request, &vq_desc[resp_idx],
-                                       VIRTIO_GPU_RESP_OK_NODATA,
-                                       generation)) {
+                                       VIRTIO_GPU_RESP_OK_NODATA, generation)) {
         if (g_complete_during_submit) {
             bool context_fence =
                 (request->flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
@@ -221,8 +220,7 @@ static void fake_submit_3d(virtio_gpu_state_t *vgpu,
             g_cancel_result =
                 virtio_gpu_cancel_ctrl_response(vgpu, generation, request);
             *plen = virtio_gpu_write_ctrl_response(
-                vgpu, request, &vq_desc[resp_idx],
-                VIRTIO_GPU_RESP_ERR_UNSPEC);
+                vgpu, request, &vq_desc[resp_idx], VIRTIO_GPU_RESP_ERR_UNSPEC);
             return;
         }
         *plen = VIRTIO_GPU_RESPONSE_DEFERRED;
@@ -245,8 +243,8 @@ static int test_fenced_submit_completes_used_ring_after_fence(void)
     CHECK(response_hdr()->type == 0);
     CHECK(vgpu.InterruptStatus == 0);
 
-    virtio_gpu_complete_ctrl_response(
-        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 7, false, 0, 0);
+    virtio_gpu_complete_ctrl_response(&vgpu, virtio_gpu_ctrl_generation(&vgpu),
+                                      7, false, 0, 0);
 
     CHECK(used_idx() == 1);
     CHECK(used_elem_id(0) == 0);
@@ -268,15 +266,13 @@ static int test_context_fence_requires_matching_context_and_ring(void)
     virtio_gpu_queue_notify_handler(&vgpu, VIRTIO_GPU_CONTROLQ);
 
     CHECK(used_idx() == 0);
-    virtio_gpu_complete_ctrl_response(
-        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0x123456789ULL, true, 11,
-        4);
+    virtio_gpu_complete_ctrl_response(&vgpu, virtio_gpu_ctrl_generation(&vgpu),
+                                      0x123456789ULL, true, 11, 4);
     CHECK(used_idx() == 0);
     CHECK(response_hdr()->type == 0);
 
-    virtio_gpu_complete_ctrl_response(
-        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0x123456789ULL, true, 11,
-        3);
+    virtio_gpu_complete_ctrl_response(&vgpu, virtio_gpu_ctrl_generation(&vgpu),
+                                      0x123456789ULL, true, 11, 3);
 
     CHECK(used_idx() == 1);
     CHECK(response_hdr()->type == VIRTIO_GPU_RESP_OK_NODATA);
@@ -296,8 +292,7 @@ static int test_reset_drops_pending_fence_without_writing_stale_response(void)
 
     uint32_t stale_generation = virtio_gpu_ctrl_generation(&vgpu);
     virtio_gpu_update_status(&vgpu, 0);
-    virtio_gpu_complete_ctrl_response(&vgpu, stale_generation, 9, false, 0,
-                                      0);
+    virtio_gpu_complete_ctrl_response(&vgpu, stale_generation, 9, false, 0, 0);
 
     CHECK(response_hdr()->type == 0);
 
@@ -316,8 +311,8 @@ static int test_unfenced_deferred_submit_completes_generically(void)
     CHECK(used_idx() == 0);
     CHECK(response_hdr()->type == 0);
 
-    virtio_gpu_complete_ctrl_response(
-        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 0, false, 0, 0);
+    virtio_gpu_complete_ctrl_response(&vgpu, virtio_gpu_ctrl_generation(&vgpu),
+                                      0, false, 0, 0);
 
     CHECK(used_idx() == 1);
     CHECK(used_elem_id(0) == 0);
@@ -426,8 +421,8 @@ static int test_deferred_ctrl_can_be_cancelled_before_error_response(void)
     CHECK(response_hdr()->flags == VIRTIO_GPU_FLAG_FENCE);
     CHECK(response_hdr()->fence_id == 13);
 
-    virtio_gpu_complete_ctrl_response(
-        &vgpu, virtio_gpu_ctrl_generation(&vgpu), 13, false, 0, 0);
+    virtio_gpu_complete_ctrl_response(&vgpu, virtio_gpu_ctrl_generation(&vgpu),
+                                      13, false, 0, 0);
     CHECK(used_idx() == 1);
 
     return 0;
@@ -471,12 +466,18 @@ static int test_num_capsets_config_read_uses_cached_device_state(void)
     virtio_gpu_set_num_capsets(&vgpu, 5);
 
     CHECK(virtio_gpu_reg_read(
-        &vgpu, VIRTIO_Config +
-                   offsetof(struct virtio_gpu_config, num_capsets) /
-                       sizeof(uint32_t),
+        &vgpu,
+        VIRTIO_Config +
+            offsetof(struct virtio_gpu_config, num_capsets) / sizeof(uint32_t),
         &value));
     CHECK(value == 5);
 
+    return 0;
+}
+
+static int test_pending_ctrl_capacity_covers_full_virtqueue(void)
+{
+    CHECK(VIRTIO_GPU_PENDING_CTRLS_MAX >= VIRTIO_GPU_QUEUE_NUM_MAX);
     return 0;
 }
 
@@ -493,5 +494,6 @@ int main(void)
     CHECK(test_deferred_ctrl_can_be_cancelled_before_error_response() == 0);
     CHECK(test_renderer_fence_completion_drains_from_gpu_poll() == 0);
     CHECK(test_num_capsets_config_read_uses_cached_device_state() == 0);
+    CHECK(test_pending_ctrl_capacity_covers_full_virtqueue() == 0);
     return 0;
 }

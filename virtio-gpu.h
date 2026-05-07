@@ -15,10 +15,10 @@
 #define VIRTIO_GPU_LOG_PREFIX "[SEMU VGPU] "
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_RESPONSE_DEFERRED UINT32_MAX
-#define VIRTIO_GPU_PENDING_CTRLS_MAX 256
+#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
+#define VIRTIO_GPU_PENDING_CTRLS_MAX VIRTIO_GPU_QUEUE_NUM_MAX
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 #define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
-#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
 /* Feature masks exposed in DeviceFeaturesSel 0. Linux UAPI names these as bit
  * numbers; semu stores the selected 32-bit feature word, so keep masks here.
@@ -87,6 +87,16 @@ typedef struct {
     uint32_t num_scanouts;
     uint32_t num_capsets;
 } virtio_gpu_data_t;
+
+struct virtio_gpu_debug_stats {
+    uint32_t ctrl_generation;
+    uint32_t pending_ctrls_active;
+    bool dispatch_active;
+    uint64_t ctrl_responses_deferred;
+    uint64_t ctrl_responses_defer_dropped;
+    uint64_t ctrl_responses_completed;
+    uint64_t ctrl_token_responses_completed;
+};
 
 PACKED(struct virtio_gpu_config {
     uint32_t events_read;
@@ -440,16 +450,14 @@ bool virtio_gpu_defer_ctrl_response_token(
     uint32_t response_type,
     uint32_t generation,
     uint32_t token_id);
-bool virtio_gpu_cancel_ctrl_response(
-    virtio_gpu_state_t *vgpu,
-    uint32_t generation,
-    const struct virtio_gpu_ctrl_hdr *request);
+bool virtio_gpu_cancel_ctrl_response(virtio_gpu_state_t *vgpu,
+                                     uint32_t generation,
+                                     const struct virtio_gpu_ctrl_hdr *request);
 bool virtio_gpu_cancel_ctrl_response_token(virtio_gpu_state_t *vgpu,
                                            uint32_t generation,
                                            uint32_t token_id);
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu);
-void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
-                                uint32_t num_capsets);
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
 void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
                                        uint32_t generation,
                                        uint64_t fence_id,
@@ -467,6 +475,7 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
                                uint32_t ctx_id,
                                uint32_t ring_idx,
                                uint64_t fence_id);
+void virtio_gpu_debug_snapshot(struct virtio_gpu_debug_stats *stats);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
 

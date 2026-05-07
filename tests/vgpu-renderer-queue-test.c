@@ -132,20 +132,40 @@ static int test_full_queue_rejects_newest_request(void)
     vgpu_renderer_reset_queues(1);
 
     uint32_t accepted = 0;
-    for (uint32_t i = 0; i < 1024; i++) {
+    for (uint32_t i = 0; i < VIRTIO_GPU_QUEUE_NUM_MAX * 4U; i++) {
         struct vgpu_renderer_request request = test_request(i);
         if (!vgpu_renderer_submit(&request))
             break;
         accepted++;
     }
 
-    CHECK(accepted > 0);
-    CHECK(accepted < 1024);
+    CHECK(accepted >= VIRTIO_GPU_QUEUE_NUM_MAX);
+    CHECK(accepted < VIRTIO_GPU_QUEUE_NUM_MAX * 4U);
 
     struct vgpu_renderer_request rejected = test_request(accepted);
     CHECK(!vgpu_renderer_submit(&rejected));
 
     for (uint32_t i = 0; i < accepted; i++) {
+        struct vgpu_renderer_request out;
+        CHECK(vgpu_renderer_pop_request(&out));
+        CHECK(out.token.id == i);
+    }
+
+    struct vgpu_renderer_request out;
+    CHECK(!vgpu_renderer_pop_request(&out));
+    return 0;
+}
+
+static int test_request_queue_accepts_full_virtqueue_burst(void)
+{
+    vgpu_renderer_reset_queues(1);
+
+    for (uint32_t i = 0; i < VIRTIO_GPU_QUEUE_NUM_MAX; i++) {
+        struct vgpu_renderer_request request = test_request(i);
+        CHECK(vgpu_renderer_submit(&request));
+    }
+
+    for (uint32_t i = 0; i < VIRTIO_GPU_QUEUE_NUM_MAX; i++) {
         struct vgpu_renderer_request out;
         CHECK(vgpu_renderer_pop_request(&out));
         CHECK(out.token.id == i);
@@ -215,14 +235,62 @@ static int test_reset_releases_queued_completion_responses(void)
     return 0;
 }
 
+static int test_debug_snapshot_tracks_queue_progress(void)
+{
+    vgpu_renderer_reset_queues(50);
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.active_generation == 50);
+    CHECK(stats.request_depth == 0);
+    CHECK(stats.completion_depth == 0);
+
+    struct vgpu_renderer_request request = test_request(60);
+    CHECK(vgpu_renderer_submit(&request));
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.request_depth == 1);
+    CHECK(stats.requests_submitted >= 1);
+
+    struct vgpu_renderer_request out_request;
+    CHECK(vgpu_renderer_pop_request(&out_request));
+    vgpu_renderer_debug_note_execute_begin(&out_request);
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.request_depth == 0);
+    CHECK(stats.requests_popped >= 1);
+    CHECK(stats.execute_started == stats.execute_finished + 1);
+    CHECK(stats.current_request_type == VGPU_RENDERER_REQ_CTRL);
+    CHECK(stats.current_command_type == VIRTIO_GPU_CMD_SUBMIT_3D);
+    CHECK(stats.current_token_id == 60);
+
+    vgpu_renderer_debug_note_execute_end();
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.execute_started == stats.execute_finished);
+    CHECK(stats.current_execute_seq == 0);
+
+    struct vgpu_renderer_completion completion = test_completion(61, 50);
+    CHECK(vgpu_renderer_complete(&completion));
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.completion_depth == 1);
+    CHECK(stats.completions_submitted >= 1);
+
+    struct vgpu_renderer_completion out_completion;
+    CHECK(vgpu_renderer_pop_completion(&out_completion));
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.completion_depth == 0);
+    CHECK(stats.completions_popped >= 1);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_request_fifo_ordering() == 0);
     CHECK(test_completion_fifo_ordering() == 0);
     CHECK(test_completion_wakes_backend() == 0);
     CHECK(test_full_queue_rejects_newest_request() == 0);
+    CHECK(test_request_queue_accepts_full_virtqueue_burst() == 0);
     CHECK(test_reset_generation_filters_stale_completions() == 0);
     CHECK(test_reset_releases_queued_request_payloads() == 0);
     CHECK(test_reset_releases_queued_completion_responses() == 0);
+    CHECK(test_debug_snapshot_tracks_queue_progress() == 0);
     return 0;
 }

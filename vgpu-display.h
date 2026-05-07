@@ -85,6 +85,23 @@ struct vgpu_display_cmd {
     } u;
 };
 
+struct vgpu_display_debug_stats {
+    uint32_t scanout_count;
+    uint32_t queue_head;
+    uint32_t queue_tail;
+    uint32_t queue_depth;
+    bool unavailable;
+    uint64_t primary_clears;
+    uint64_t cursor_clears;
+    uint64_t primary_sets_published;
+    uint64_t cursor_sets_published;
+    uint64_t cursor_moves_published;
+    uint64_t cmds_queued;
+    uint64_t cmds_dropped;
+    uint64_t cmds_popped;
+    uint64_t stale_cmds_dropped;
+};
+
 void vgpu_display_set_scanout_count(uint32_t scanout_count);
 void vgpu_display_publish_primary_clear(uint32_t scanout_id);
 void vgpu_display_publish_cursor_clear(uint32_t scanout_id);
@@ -93,6 +110,7 @@ void vgpu_display_release_cmd(struct vgpu_display_cmd *cmd);
 bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd);
 void vgpu_display_set_unavailable(void);
 bool vgpu_display_can_publish(void);
+void vgpu_display_debug_snapshot(struct vgpu_display_debug_stats *stats);
 void vgpu_display_publish_primary_set(uint32_t scanout_id,
                                       struct vgpu_display_payload *payload);
 void vgpu_display_publish_cursor_set(uint32_t scanout_id,

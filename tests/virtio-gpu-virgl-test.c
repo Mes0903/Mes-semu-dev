@@ -109,6 +109,7 @@ struct virgl_test_calls {
     int submit_count;
     int submit_ctx_id;
     int submit_ndw;
+    int submit_force_ctx_0_count;
     uint32_t submit_words[16];
 
     int force_ctx_0_count;
@@ -308,8 +309,7 @@ uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
     return 0;
 }
 
-void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
-                                uint32_t num_capsets)
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets)
 {
     if (!vgpu || !vgpu->priv)
         return;
@@ -317,10 +317,9 @@ void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
     ((virtio_gpu_data_t *) vgpu->priv)->num_capsets = num_capsets;
 }
 
-bool virtio_gpu_cancel_ctrl_response(
-    virtio_gpu_state_t *vgpu,
-    uint32_t generation,
-    const struct virtio_gpu_ctrl_hdr *request)
+bool virtio_gpu_cancel_ctrl_response(virtio_gpu_state_t *vgpu,
+                                     uint32_t generation,
+                                     const struct virtio_gpu_ctrl_hdr *request)
 {
     (void) vgpu;
     (void) generation;
@@ -774,6 +773,7 @@ int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
     g_calls.submit_count++;
     g_calls.submit_ctx_id = ctx_id;
     g_calls.submit_ndw = ndw;
+    g_calls.submit_force_ctx_0_count = g_calls.force_ctx_0_count;
     memcpy(g_calls.submit_words, buffer, (size_t) ndw * sizeof(uint32_t));
     return 0;
 }
@@ -987,6 +987,7 @@ static int test_submit_3d_copies_payload_to_renderer(void)
     CHECK(g_calls.submit_count == 1);
     CHECK(g_calls.submit_ctx_id == 7);
     CHECK(g_calls.submit_ndw == 4);
+    CHECK(g_calls.submit_force_ctx_0_count == 1);
     CHECK(memcmp(g_calls.submit_words, commands, sizeof(commands)) == 0);
     CHECK(g_calls.undefined_count == 0);
     CHECK(ctrl_response_len_or_deferred(plen));
@@ -1022,6 +1023,31 @@ static int test_fenced_submit_creates_renderer_fence_from_request_flags(void)
     CHECK(g_calls.last_renderer_request.type == VGPU_RENDERER_REQ_POLL);
     CHECK(ctrl_response_len_or_deferred(plen));
     CHECK(response_hdr()->type == 0);
+
+    return 0;
+}
+
+static int test_ctx0_fence_forces_ctx0_current_before_create(void)
+{
+    virtio_gpu_state_t vgpu = fresh_vgpu();
+    struct virtio_gpu_cmd_submit request = {
+        .hdr = {.flags = VIRTIO_GPU_FLAG_FENCE, .fence_id = 321, .ctx_id = 7},
+        .size = 16,
+    };
+    uint32_t commands[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+    memcpy(&g_ram[REQ_ADDR], &request, sizeof(request));
+    memcpy(&g_ram[PAYLOAD_ADDR], commands, sizeof(commands));
+
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC];
+    init_desc_with_payload(desc, sizeof(request), sizeof(commands));
+    uint32_t plen = 0;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &plen);
+
+    CHECK(g_calls.submit_count == 1);
+    CHECK(g_calls.force_ctx_0_count == 2);
+    CHECK(g_calls.create_fence_count == 1);
+    CHECK(g_calls.context_create_fence_count == 0);
 
     return 0;
 }
@@ -1643,7 +1669,8 @@ int main(void)
     CHECK(test_renderer_init_stays_on_gl_owner_without_backend_lock_hooks() ==
           0);
     CHECK(test_backend_reports_available_capsets() == 0);
-    CHECK(test_backend_poll_without_pending_fence_does_not_poll_renderer() == 0);
+    CHECK(test_backend_poll_without_pending_fence_does_not_poll_renderer() ==
+          0);
     CHECK(test_renderer_poll_request_executes_on_gl_owner() == 0);
     CHECK(test_ctx_create_calls_renderer() == 0);
     CHECK(test_context_lifecycle_handlers_call_renderer() == 0);
@@ -1658,6 +1685,7 @@ int main(void)
     CHECK(test_resource_flush_republishes_bound_gl_payload() == 0);
     CHECK(test_submit_3d_copies_payload_to_renderer() == 0);
     CHECK(test_fenced_submit_creates_renderer_fence_from_request_flags() == 0);
+    CHECK(test_ctx0_fence_forces_ctx0_current_before_create() == 0);
     CHECK(test_synchronous_fence_callback_does_not_leave_poll_pending() == 0);
     CHECK(test_descriptor_write_flag_does_not_create_renderer_fence() == 0);
     CHECK(test_ring_idx_fence_uses_context_fence_api() == 0);

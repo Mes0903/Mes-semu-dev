@@ -116,6 +116,21 @@ static const char *vinput_dev_name[VINPUT_DEV_CNT] = {
     VINPUT_KEYBOARD_NAME,
     VINPUT_MOUSE_NAME,
 };
+static uint64_t vinput_debug_keyboard_keys;
+static uint64_t vinput_debug_keyboard_pageup_keys;
+static uint64_t vinput_debug_mouse_buttons;
+static uint64_t vinput_debug_mouse_motion_batches;
+static uint64_t vinput_debug_mouse_scroll_batches;
+static uint64_t vinput_debug_mouse_rel_x;
+static uint64_t vinput_debug_mouse_rel_y;
+static uint64_t vinput_debug_mouse_rel_hwheel;
+static uint64_t vinput_debug_mouse_rel_wheel;
+static uint64_t vinput_debug_eventq_writes[VINPUT_DEV_CNT];
+static uint64_t vinput_debug_eventq_drops[VINPUT_DEV_CNT];
+static uint16_t vinput_debug_last_keyboard_code;
+static uint32_t vinput_debug_last_keyboard_value;
+static uint16_t vinput_debug_last_mouse_rel_code;
+static int32_t vinput_debug_last_mouse_rel_value;
 
 static inline void vinput_bitmap_set_bit(uint8_t *map, unsigned long bit)
 {
@@ -365,6 +380,8 @@ static void virtio_input_update_eventq(int dev_id,
 
     /* No buffers available - drop event or handle later */
     if (queue->last_avail == new_avail) {
+        __atomic_add_fetch(&vinput_debug_eventq_drops[dev_id], 1,
+                           __ATOMIC_RELAXED);
 #if SEMU_INPUT_DEBUG
         fprintf(stderr, VINPUT_DEBUG_PREFIX "drop dev=%d (no guest buffers)\n",
                 dev_id);
@@ -376,6 +393,9 @@ static void virtio_input_update_eventq(int dev_id,
     /* Try to write events to used ring */
     bool wrote_events =
         virtio_input_desc_handler(vinput, input_ev, ev_cnt, queue);
+    if (wrote_events)
+        __atomic_add_fetch(&vinput_debug_eventq_writes[dev_id], ev_cnt,
+                           __ATOMIC_RELAXED);
 
     /* Send interrupt only if we actually wrote events, unless
      * VIRTQ_AVAIL_F_NO_INTERRUPT is set
@@ -386,6 +406,15 @@ static void virtio_input_update_eventq(int dev_id,
 
 static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
 {
+    __atomic_add_fetch(&vinput_debug_keyboard_keys, 1, __ATOMIC_RELAXED);
+    if (key == SEMU_KEY_PAGEUP)
+        __atomic_add_fetch(&vinput_debug_keyboard_pageup_keys, 1,
+                           __ATOMIC_RELAXED);
+    __atomic_store_n(&vinput_debug_last_keyboard_code, (uint16_t) key,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vinput_debug_last_keyboard_value, ev_value,
+                     __ATOMIC_RELAXED);
+
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "key code=%u value=%u\n", key,
             ev_value);
@@ -403,6 +432,7 @@ static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
 static void virtio_input_update_mouse_button_state(uint32_t button,
                                                    bool pressed)
 {
+    __atomic_add_fetch(&vinput_debug_mouse_buttons, 1, __ATOMIC_RELAXED);
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "button code=%u pressed=%u\n", button,
             pressed);
@@ -418,18 +448,31 @@ static void virtio_input_update_mouse_button_state(uint32_t button,
 
 static void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
 {
+    __atomic_add_fetch(&vinput_debug_mouse_motion_batches, 1, __ATOMIC_RELAXED);
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "motion dx=%d dy=%d\n", dx, dy);
 #endif
     struct virtio_input_event input_ev[3];
     uint32_t ev_cnt = 0;
 
-    if (dx)
+    if (dx) {
+        __atomic_add_fetch(&vinput_debug_mouse_rel_x, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_code, SEMU_REL_X,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_value, dx,
+                         __ATOMIC_RELAXED);
         input_ev[ev_cnt++] = (struct virtio_input_event) {
             .type = SEMU_EV_REL, .code = SEMU_REL_X, .value = (uint32_t) dx};
-    if (dy)
+    }
+    if (dy) {
+        __atomic_add_fetch(&vinput_debug_mouse_rel_y, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_code, SEMU_REL_Y,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_value, dy,
+                         __ATOMIC_RELAXED);
         input_ev[ev_cnt++] = (struct virtio_input_event) {
             .type = SEMU_EV_REL, .code = SEMU_REL_Y, .value = (uint32_t) dy};
+    }
     if (!ev_cnt)
         return;
 
@@ -441,6 +484,7 @@ static void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
 
 static void virtio_input_update_scroll(int32_t dx, int32_t dy)
 {
+    __atomic_add_fetch(&vinput_debug_mouse_scroll_batches, 1, __ATOMIC_RELAXED);
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "scroll dx=%d dy=%d\n", dx, dy);
 #endif
@@ -450,16 +494,28 @@ static void virtio_input_update_scroll(int32_t dx, int32_t dy)
     struct virtio_input_event input_ev[3];
     uint32_t ev_cnt = 0;
 
-    if (dx)
+    if (dx) {
+        __atomic_add_fetch(&vinput_debug_mouse_rel_hwheel, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_code, SEMU_REL_HWHEEL,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_value, dx,
+                         __ATOMIC_RELAXED);
         input_ev[ev_cnt++] =
             (struct virtio_input_event) {.type = SEMU_EV_REL,
                                          .code = SEMU_REL_HWHEEL,
                                          .value = (uint32_t) dx};
-    if (dy)
+    }
+    if (dy) {
+        __atomic_add_fetch(&vinput_debug_mouse_rel_wheel, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_code, SEMU_REL_WHEEL,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&vinput_debug_last_mouse_rel_value, dy,
+                         __ATOMIC_RELAXED);
         input_ev[ev_cnt++] =
             (struct virtio_input_event) {.type = SEMU_EV_REL,
                                          .code = SEMU_REL_WHEEL,
                                          .value = (uint32_t) dy};
+    }
     if (!ev_cnt)
         return;
 
@@ -515,6 +571,49 @@ void virtio_input_drain_host_events(void)
         if (vinput_rearm_cmd_wake())
             break;
     }
+}
+
+void virtio_input_debug_snapshot(struct virtio_input_debug_stats *stats)
+{
+    if (!stats)
+        return;
+
+    *stats = (struct virtio_input_debug_stats) {
+        .keyboard_keys =
+            __atomic_load_n(&vinput_debug_keyboard_keys, __ATOMIC_RELAXED),
+        .keyboard_pageup_keys = __atomic_load_n(
+            &vinput_debug_keyboard_pageup_keys, __ATOMIC_RELAXED),
+        .mouse_buttons =
+            __atomic_load_n(&vinput_debug_mouse_buttons, __ATOMIC_RELAXED),
+        .mouse_motion_batches = __atomic_load_n(
+            &vinput_debug_mouse_motion_batches, __ATOMIC_RELAXED),
+        .mouse_scroll_batches = __atomic_load_n(
+            &vinput_debug_mouse_scroll_batches, __ATOMIC_RELAXED),
+        .mouse_rel_x =
+            __atomic_load_n(&vinput_debug_mouse_rel_x, __ATOMIC_RELAXED),
+        .mouse_rel_y =
+            __atomic_load_n(&vinput_debug_mouse_rel_y, __ATOMIC_RELAXED),
+        .mouse_rel_hwheel =
+            __atomic_load_n(&vinput_debug_mouse_rel_hwheel, __ATOMIC_RELAXED),
+        .mouse_rel_wheel =
+            __atomic_load_n(&vinput_debug_mouse_rel_wheel, __ATOMIC_RELAXED),
+        .keyboard_eventq_writes = __atomic_load_n(
+            &vinput_debug_eventq_writes[VINPUT_KEYBOARD_ID], __ATOMIC_RELAXED),
+        .mouse_eventq_writes = __atomic_load_n(
+            &vinput_debug_eventq_writes[VINPUT_MOUSE_ID], __ATOMIC_RELAXED),
+        .keyboard_eventq_drops = __atomic_load_n(
+            &vinput_debug_eventq_drops[VINPUT_KEYBOARD_ID], __ATOMIC_RELAXED),
+        .mouse_eventq_drops = __atomic_load_n(
+            &vinput_debug_eventq_drops[VINPUT_MOUSE_ID], __ATOMIC_RELAXED),
+        .last_keyboard_code =
+            __atomic_load_n(&vinput_debug_last_keyboard_code, __ATOMIC_RELAXED),
+        .last_keyboard_value = __atomic_load_n(
+            &vinput_debug_last_keyboard_value, __ATOMIC_RELAXED),
+        .last_mouse_rel_code = __atomic_load_n(
+            &vinput_debug_last_mouse_rel_code, __ATOMIC_RELAXED),
+        .last_mouse_rel_value = __atomic_load_n(
+            &vinput_debug_last_mouse_rel_value, __ATOMIC_RELAXED),
+    };
 }
 
 static void virtio_input_properties(int dev_id)

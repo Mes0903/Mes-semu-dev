@@ -62,6 +62,13 @@
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
+static uint32_t debug_ctrl_generation;
+static uint32_t debug_pending_ctrls_active;
+static bool debug_dispatch_active;
+static uint64_t debug_ctrl_responses_deferred;
+static uint64_t debug_ctrl_responses_defer_dropped;
+static uint64_t debug_ctrl_responses_completed;
+static uint64_t debug_ctrl_token_responses_completed;
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu)
 {
@@ -192,6 +199,10 @@ static void virtio_gpu_clear_pending_ctrls(virtio_gpu_state_t *vgpu)
     memset(PRIV(vgpu)->pending_ctrls, 0, sizeof(PRIV(vgpu)->pending_ctrls));
     memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
     PRIV(vgpu)->ctrl_generation++;
+    __atomic_store_n(&debug_ctrl_generation, PRIV(vgpu)->ctrl_generation,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&debug_pending_ctrls_active, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&debug_dispatch_active, false, __ATOMIC_RELEASE);
 #if SEMU_HAS(VIRGL)
     vgpu_renderer_reset_queues(PRIV(vgpu)->ctrl_generation);
 #endif
@@ -233,9 +244,13 @@ bool virtio_gpu_defer_ctrl_response_token(
             .ctx_id = request->ctx_id,
             .ring_idx = request->ring_idx,
         };
+        __atomic_add_fetch(&debug_pending_ctrls_active, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&debug_ctrl_responses_deferred, 1, __ATOMIC_RELAXED);
         return true;
     }
 
+    __atomic_add_fetch(&debug_ctrl_responses_defer_dropped, 1,
+                       __ATOMIC_RELAXED);
     fprintf(stderr,
             VIRTIO_GPU_LOG_PREFIX
             "%s(): no free pending ctrl slot for fence %" PRIu64 "\n",
@@ -249,8 +264,8 @@ bool virtio_gpu_defer_ctrl_response(virtio_gpu_state_t *vgpu,
                                     uint32_t response_type,
                                     uint32_t generation)
 {
-    return virtio_gpu_defer_ctrl_response_token(
-        vgpu, request, response_desc, response_type, generation, 0);
+    return virtio_gpu_defer_ctrl_response_token(vgpu, request, response_desc,
+                                                response_type, generation, 0);
 }
 
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
@@ -261,8 +276,7 @@ uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu)
     return PRIV(vgpu)->ctrl_generation;
 }
 
-void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
-                                uint32_t num_capsets)
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets)
 {
     if (!vgpu->priv)
         return;
@@ -270,10 +284,9 @@ void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu,
     PRIV(vgpu)->num_capsets = num_capsets;
 }
 
-bool virtio_gpu_cancel_ctrl_response(
-    virtio_gpu_state_t *vgpu,
-    uint32_t generation,
-    const struct virtio_gpu_ctrl_hdr *request)
+bool virtio_gpu_cancel_ctrl_response(virtio_gpu_state_t *vgpu,
+                                     uint32_t generation,
+                                     const struct virtio_gpu_ctrl_hdr *request)
 {
     if (!vgpu->priv || !request)
         return false;
@@ -292,6 +305,7 @@ bool virtio_gpu_cancel_ctrl_response(
             continue;
 
         memset(pending, 0, sizeof(*pending));
+        __atomic_sub_fetch(&debug_pending_ctrls_active, 1, __ATOMIC_RELEASE);
         return true;
     }
 
@@ -312,6 +326,7 @@ bool virtio_gpu_cancel_ctrl_response_token(virtio_gpu_state_t *vgpu,
             continue;
 
         memset(pending, 0, sizeof(*pending));
+        __atomic_sub_fetch(&debug_pending_ctrls_active, 1, __ATOMIC_RELEASE);
         return true;
     }
 
@@ -329,8 +344,7 @@ static bool virtio_gpu_pending_ctrl_matches(
     if (pending->generation != generation)
         return false;
 
-    bool pending_fenced =
-        (pending->request_flags & VIRTIO_GPU_FLAG_FENCE) != 0;
+    bool pending_fenced = (pending->request_flags & VIRTIO_GPU_FLAG_FENCE) != 0;
     if (!pending_fenced && pending->token_id)
         return false;
     if (!pending_fenced)
@@ -392,6 +406,7 @@ void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
 
         struct virtio_gpu_pending_ctrl done = *pending;
         memset(pending, 0, sizeof(*pending));
+        __atomic_sub_fetch(&debug_pending_ctrls_active, 1, __ATOMIC_RELEASE);
 
         uint32_t len = virtio_gpu_finish_pending_ctrl(
             vgpu, &done, done.response_type, NULL, 0);
@@ -401,6 +416,8 @@ void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
         }
 
         virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
+        __atomic_add_fetch(&debug_ctrl_responses_completed, 1,
+                           __ATOMIC_RELAXED);
     }
 }
 
@@ -424,6 +441,7 @@ void virtio_gpu_complete_ctrl_response_token(virtio_gpu_state_t *vgpu,
 
         struct virtio_gpu_pending_ctrl done = *pending;
         memset(pending, 0, sizeof(*pending));
+        __atomic_sub_fetch(&debug_pending_ctrls_active, 1, __ATOMIC_RELEASE);
 
         uint32_t len = virtio_gpu_finish_pending_ctrl(
             vgpu, &done, response_type, response, response_size);
@@ -433,6 +451,8 @@ void virtio_gpu_complete_ctrl_response_token(virtio_gpu_state_t *vgpu,
         }
 
         virtio_gpu_push_used(vgpu, done.queue_index, done.buffer_idx, len);
+        __atomic_add_fetch(&debug_ctrl_token_responses_completed, 1,
+                           __ATOMIC_RELAXED);
         return;
     }
 }
@@ -443,9 +463,32 @@ void virtio_gpu_complete_fence(virtio_gpu_state_t *vgpu,
                                uint32_t ring_idx,
                                uint64_t fence_id)
 {
-    virtio_gpu_complete_ctrl_response(
-        vgpu, virtio_gpu_ctrl_generation(vgpu), fence_id, context_fence,
-        ctx_id, ring_idx);
+    virtio_gpu_complete_ctrl_response(vgpu, virtio_gpu_ctrl_generation(vgpu),
+                                      fence_id, context_fence, ctx_id,
+                                      ring_idx);
+}
+
+void virtio_gpu_debug_snapshot(struct virtio_gpu_debug_stats *stats)
+{
+    if (!stats)
+        return;
+
+    *stats = (struct virtio_gpu_debug_stats) {
+        .ctrl_generation =
+            __atomic_load_n(&debug_ctrl_generation, __ATOMIC_ACQUIRE),
+        .pending_ctrls_active =
+            __atomic_load_n(&debug_pending_ctrls_active, __ATOMIC_ACQUIRE),
+        .dispatch_active =
+            __atomic_load_n(&debug_dispatch_active, __ATOMIC_ACQUIRE),
+        .ctrl_responses_deferred =
+            __atomic_load_n(&debug_ctrl_responses_deferred, __ATOMIC_RELAXED),
+        .ctrl_responses_defer_dropped = __atomic_load_n(
+            &debug_ctrl_responses_defer_dropped, __ATOMIC_RELAXED),
+        .ctrl_responses_completed =
+            __atomic_load_n(&debug_ctrl_responses_completed, __ATOMIC_RELAXED),
+        .ctrl_token_responses_completed = __atomic_load_n(
+            &debug_ctrl_token_responses_completed, __ATOMIC_RELAXED),
+    };
 }
 
 #if SEMU_HAS(VIRGL)
@@ -1128,9 +1171,11 @@ static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
             .queue_index = (uint8_t) index,
             .buffer_idx = buffer_idx,
         };
+        __atomic_store_n(&debug_dispatch_active, true, __ATOMIC_RELEASE);
         int result =
             virtio_gpu_desc_handler(vgpu, queue, index, buffer_idx, &len);
         memset(&PRIV(vgpu)->dispatch, 0, sizeof(PRIV(vgpu)->dispatch));
+        __atomic_store_n(&debug_dispatch_active, false, __ATOMIC_RELEASE);
         if (result != 0)
             return;
 

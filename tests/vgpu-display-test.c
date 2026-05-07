@@ -102,10 +102,36 @@ static int test_cursor_moves_before_set_keep_fifo_order(void)
     return 0;
 }
 
+static int test_debug_snapshot_tracks_display_queue_progress(void)
+{
+    struct vgpu_display_debug_stats stats;
+    vgpu_display_debug_snapshot(&stats);
+    uint64_t queued_before = stats.cmds_queued;
+    uint64_t popped_before = stats.cmds_popped;
+    uint64_t moves_before = stats.cursor_moves_published;
+
+    vgpu_display_publish_cursor_move(0, 11, 22);
+    vgpu_display_debug_snapshot(&stats);
+    CHECK(stats.queue_depth == 1);
+    CHECK(stats.cmds_queued == queued_before + 1);
+    CHECK(stats.cursor_moves_published == moves_before + 1);
+
+    struct vgpu_display_cmd cmd;
+    CHECK(vgpu_display_pop_cmd(&cmd));
+    CHECK(cmd.type == VGPU_DISPLAY_CMD_CURSOR_MOVE);
+    vgpu_display_release_cmd(&cmd);
+
+    vgpu_display_debug_snapshot(&stats);
+    CHECK(stats.queue_depth == 0);
+    CHECK(stats.cmds_popped == popped_before + 1);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_cursor_moves_are_queued_in_order() == 0);
     CHECK(test_cursor_set_keeps_chronological_order_after_move() == 0);
     CHECK(test_cursor_moves_before_set_keep_fifo_order() == 0);
+    CHECK(test_debug_snapshot_tracks_display_queue_progress() == 0);
     return 0;
 }

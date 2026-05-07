@@ -39,6 +39,29 @@ static struct vinput_cmd_queue vinput_cmd_queues[VINPUT_DEV_CNT];
  */
 static bool vinput_cmd_wake_pending;
 
+static uint64_t vinput_debug_cmds_pushed[VINPUT_DEV_CNT];
+static uint64_t vinput_debug_cmds_dropped[VINPUT_DEV_CNT];
+static uint64_t vinput_debug_cmds_popped[VINPUT_DEV_CNT];
+static uint64_t vinput_debug_sdl_keydown;
+static uint64_t vinput_debug_sdl_keyup;
+static uint64_t vinput_debug_sdl_mouse_button_down;
+static uint64_t vinput_debug_sdl_mouse_button_up;
+static uint64_t vinput_debug_sdl_mouse_motion_observed;
+static uint64_t vinput_debug_sdl_mouse_motion_published;
+static uint64_t vinput_debug_sdl_mouse_wheel_observed;
+static uint64_t vinput_debug_sdl_mouse_wheel_published;
+static int32_t vinput_debug_last_motion_dx;
+static int32_t vinput_debug_last_motion_dy;
+static int32_t vinput_debug_last_wheel_dx;
+static int32_t vinput_debug_last_wheel_dy;
+
+static uint32_t vinput_queue_depth(const struct vinput_cmd_queue *queue)
+{
+    uint32_t head = __atomic_load_n(&queue->head, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&queue->tail, __ATOMIC_ACQUIRE);
+    return (head - tail) & VINPUT_CMD_QUEUE_MASK;
+}
+
 static struct vinput_key_map_entry vinput_key_map[] = {
     /* Keyboard */
     DEF_KEY_MAP(SDL_SCANCODE_ESCAPE, SEMU_KEY_ESC),
@@ -154,11 +177,15 @@ static bool vinput_push_cmd(int dev_id, const struct vinput_cmd *event)
      * which means a sustained overflow can lose a release edge. We keep that
      * tradeoff explicit here rather than synthesizing corrective events.
      */
-    if (next == tail)
+    if (next == tail) {
+        __atomic_add_fetch(&vinput_debug_cmds_dropped[dev_id], 1,
+                           __ATOMIC_RELAXED);
         return false;
+    }
 
     queue->entries[head] = *event;
     __atomic_store_n(&queue->head, next, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&vinput_debug_cmds_pushed[dev_id], 1, __ATOMIC_RELAXED);
 
     /* Coalesce wakeups across a whole drain batch. The producer only writes to
      * the wake pipe when transitioning wake_pending false -> true and the
@@ -232,8 +259,59 @@ bool vinput_pop_cmd(int dev_id, struct vinput_cmd *event)
     *event = queue->entries[tail];
     tail = (tail + 1U) & VINPUT_CMD_QUEUE_MASK;
     __atomic_store_n(&queue->tail, tail, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&vinput_debug_cmds_popped[dev_id], 1, __ATOMIC_RELAXED);
 
     return true;
+}
+
+void vinput_debug_snapshot(struct vinput_host_debug_stats *stats)
+{
+    if (!stats)
+        return;
+
+    *stats = (struct vinput_host_debug_stats) {
+        .keyboard_queue_depth =
+            vinput_queue_depth(&vinput_cmd_queues[VINPUT_KEYBOARD_ID]),
+        .mouse_queue_depth =
+            vinput_queue_depth(&vinput_cmd_queues[VINPUT_MOUSE_ID]),
+        .wake_pending =
+            __atomic_load_n(&vinput_cmd_wake_pending, __ATOMIC_ACQUIRE),
+        .keyboard_cmds_pushed = __atomic_load_n(
+            &vinput_debug_cmds_pushed[VINPUT_KEYBOARD_ID], __ATOMIC_RELAXED),
+        .keyboard_cmds_dropped = __atomic_load_n(
+            &vinput_debug_cmds_dropped[VINPUT_KEYBOARD_ID], __ATOMIC_RELAXED),
+        .keyboard_cmds_popped = __atomic_load_n(
+            &vinput_debug_cmds_popped[VINPUT_KEYBOARD_ID], __ATOMIC_RELAXED),
+        .mouse_cmds_pushed = __atomic_load_n(
+            &vinput_debug_cmds_pushed[VINPUT_MOUSE_ID], __ATOMIC_RELAXED),
+        .mouse_cmds_dropped = __atomic_load_n(
+            &vinput_debug_cmds_dropped[VINPUT_MOUSE_ID], __ATOMIC_RELAXED),
+        .mouse_cmds_popped = __atomic_load_n(
+            &vinput_debug_cmds_popped[VINPUT_MOUSE_ID], __ATOMIC_RELAXED),
+        .sdl_keydown =
+            __atomic_load_n(&vinput_debug_sdl_keydown, __ATOMIC_RELAXED),
+        .sdl_keyup = __atomic_load_n(&vinput_debug_sdl_keyup, __ATOMIC_RELAXED),
+        .sdl_mouse_button_down = __atomic_load_n(
+            &vinput_debug_sdl_mouse_button_down, __ATOMIC_RELAXED),
+        .sdl_mouse_button_up = __atomic_load_n(
+            &vinput_debug_sdl_mouse_button_up, __ATOMIC_RELAXED),
+        .sdl_mouse_motion_observed = __atomic_load_n(
+            &vinput_debug_sdl_mouse_motion_observed, __ATOMIC_RELAXED),
+        .sdl_mouse_motion_published = __atomic_load_n(
+            &vinput_debug_sdl_mouse_motion_published, __ATOMIC_RELAXED),
+        .sdl_mouse_wheel_observed = __atomic_load_n(
+            &vinput_debug_sdl_mouse_wheel_observed, __ATOMIC_RELAXED),
+        .sdl_mouse_wheel_published = __atomic_load_n(
+            &vinput_debug_sdl_mouse_wheel_published, __ATOMIC_RELAXED),
+        .last_motion_dx =
+            __atomic_load_n(&vinput_debug_last_motion_dx, __ATOMIC_RELAXED),
+        .last_motion_dy =
+            __atomic_load_n(&vinput_debug_last_motion_dy, __ATOMIC_RELAXED),
+        .last_wheel_dx =
+            __atomic_load_n(&vinput_debug_last_wheel_dx, __ATOMIC_RELAXED),
+        .last_wheel_dy =
+            __atomic_load_n(&vinput_debug_last_wheel_dy, __ATOMIC_RELAXED),
+    };
 }
 
 bool vinput_rearm_cmd_wake(void)
@@ -258,6 +336,11 @@ bool vinput_may_have_pending_cmds(void)
 
 static void vinput_publish_mouse_motion(int dx, int dy)
 {
+    __atomic_store_n(&vinput_debug_last_motion_dx, dx, __ATOMIC_RELAXED);
+    __atomic_store_n(&vinput_debug_last_motion_dy, dy, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&vinput_debug_sdl_mouse_motion_published, 1,
+                       __ATOMIC_RELAXED);
+
     struct vinput_cmd event = {
         .type = VINPUT_CMD_MOUSE_MOTION,
         .u.mouse_motion = {.dx = dx, .dy = dy},
@@ -318,6 +401,7 @@ bool vinput_handle_events(void)
                 g_window.window_set_mouse_grab(false);
             break;
         case SDL_KEYDOWN:
+            __atomic_add_fetch(&vinput_debug_sdl_keydown, 1, __ATOMIC_RELAXED);
             if (g_window.window_is_mouse_grabbed() &&
                 e.key.keysym.scancode == SDL_SCANCODE_G &&
                 (e.key.keysym.mod & KMOD_CTRL) &&
@@ -340,6 +424,7 @@ bool vinput_handle_events(void)
             }
             break;
         case SDL_KEYUP:
+            __atomic_add_fetch(&vinput_debug_sdl_keyup, 1, __ATOMIC_RELAXED);
             linux_key = vinput_sdl_scancode_to_linux_key(e.key.keysym.scancode);
             if (linux_key >= 0) {
                 struct vinput_cmd event = {
@@ -350,6 +435,8 @@ bool vinput_handle_events(void)
             }
             break;
         case SDL_MOUSEBUTTONDOWN:
+            __atomic_add_fetch(&vinput_debug_sdl_mouse_button_down, 1,
+                               __ATOMIC_RELAXED);
             g_window.window_set_mouse_grab(true);
             linux_key = vinput_sdl_button_to_linux_key(e.button.button);
             if (linux_key >= 0) {
@@ -362,6 +449,8 @@ bool vinput_handle_events(void)
             }
             break;
         case SDL_MOUSEBUTTONUP:
+            __atomic_add_fetch(&vinput_debug_sdl_mouse_button_up, 1,
+                               __ATOMIC_RELAXED);
             linux_key = vinput_sdl_button_to_linux_key(e.button.button);
             if (linux_key >= 0) {
                 struct vinput_cmd event = {
@@ -373,12 +462,16 @@ bool vinput_handle_events(void)
             }
             break;
         case SDL_MOUSEMOTION: {
+            __atomic_add_fetch(&vinput_debug_sdl_mouse_motion_observed, 1,
+                               __ATOMIC_RELAXED);
             if (!g_window.window_is_mouse_grabbed() ||
                 (e.motion.xrel == 0 && e.motion.yrel == 0))
                 break;
             vinput_publish_mouse_motion(e.motion.xrel, e.motion.yrel);
         } break;
         case SDL_MOUSEWHEEL: {
+            __atomic_add_fetch(&vinput_debug_sdl_mouse_wheel_observed, 1,
+                               __ATOMIC_RELAXED);
             int dx = e.wheel.x;
             int dy = e.wheel.y;
             /* SDL_MOUSEWHEEL_FLIPPED means natural/reversed scrolling —
@@ -388,6 +481,10 @@ bool vinput_handle_events(void)
                 dx = -dx;
                 dy = -dy;
             }
+            __atomic_store_n(&vinput_debug_last_wheel_dx, dx, __ATOMIC_RELAXED);
+            __atomic_store_n(&vinput_debug_last_wheel_dy, dy, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&vinput_debug_sdl_mouse_wheel_published, 1,
+                               __ATOMIC_RELAXED);
             struct vinput_cmd event = {
                 .type = VINPUT_CMD_MOUSE_WHEEL,
                 .u.mouse_wheel = {.dx = dx, .dy = dy},

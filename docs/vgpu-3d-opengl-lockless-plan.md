@@ -1331,6 +1331,368 @@ Note: `/home/mes/MesRepo/dev-docs/MesDevLog/semu-vgpu-3D/README.md` is outside
 the Mes-semu git repository in this workspace. It was updated as a local
 documentation file but cannot be included in the Mes-semu commit.
 
+## Phase 8: ctx0 Fence Current-context Regression
+
+Status: implemented in the working tree. The single-Xorg visible SDL retest
+passed with the manual `DISPLAY=:0 ...` commands. The separate `startx` /
+multi-Xorg path is tracked in Phase 9.
+
+### Trigger
+
+During 2026-05-07 manual visible VirGL testing, the stable trigger was:
+
+```sh
+DISPLAY=:0 twm >/tmp/twm.log 2>&1 &
+DISPLAY=:0 xterm >/tmp/xterm.log 2>&1 &
+DISPLAY=:0 glxgears
+```
+
+Then open additional `xterm` windows while `glxgears` is running. The failure
+showed:
+
+```text
+Failed to create fence sync object
+vrend_check_no_error: context error reported 1 "Xorg" Unknown 1282
+context 1 failed to dispatch COPY_TRANSFER3D: 22
+vrend_decode_ctx_submit_cmd: context error reported 1 "Xorg" Illegal command buffer 917549
+```
+
+`917549` is `0xe002d`: a VirGL command buffer entry with size `0xe` and command
+`0x2d`, i.e. `VIRGL_CCMD_COPY_TRANSFER3D`.
+
+### Root Cause
+
+`virgl_renderer_create_fence()` creates a legacy ctx0 fence, but virglrenderer
+does not make ctx0 current before calling `glFenceSync()`. After the lockless GL
+owner work, SDL presentation can detach the GL context from the calling thread,
+so a fenced ctx0 submit can try to create a GL fence with no current context.
+
+That explains the leading `Failed to create fence sync object` message. The
+following `GL_INVALID_OPERATION` / `COPY_TRANSFER3D` report is consistent with a
+stale or downstream GL error observed during the next Xorg transfer command.
+
+### Fix
+
+Before calling `virgl_renderer_create_fence()` for a non-ring-index fence,
+explicitly force ctx0 current:
+
+```c
+virgl_renderer_force_ctx_0();
+ret = virgl_renderer_create_fence((int) (uint32_t) work->hdr.fence_id, 0);
+```
+
+Context/ring-index fences continue to use `virgl_renderer_context_create_fence()`
+without changing that path.
+
+### Regression Coverage
+
+Added `test_ctx0_fence_forces_ctx0_current_before_create()` to
+`tests/virtio-gpu-virgl-test.c`. The test submits a fenced legacy ctx0 command
+and requires:
+
+- `submit_cmd()` is called once.
+- `virgl_renderer_force_ctx_0()` is called before the legacy fence.
+- `virgl_renderer_create_fence()` is used.
+- `virgl_renderer_context_create_fence()` is not used.
+
+Fresh verification after the fix:
+
+```sh
+make test-vgpu-virgl test-vgpu-fence test-vgpu-no-gl-lock test-vgpu-opengl-scope
+make ENABLE_VIRGL=1 semu
+git diff --check
+xvfb-run -a .ci/test-virgl.sh
+```
+
+Additional headless stress also passed by running guest Xorg with `glxgears` and
+opening three `xterm` windows under Xvfb. This does not replace the real visible
+SDL test because Xvfb does not cover actual mouse capture, host window handling,
+or the user's compositor/driver path.
+
+### Manual Retest Gate
+
+Rebuild has already produced a VirGL-enabled `semu`. Retest on the visible host
+display with:
+
+```sh
+scripts/run-vgpu-crash-debug.sh
+```
+
+Guest:
+
+```sh
+root
+DISPLAY=:0 twm >/tmp/twm.log 2>&1 &
+DISPLAY=:0 xterm >/tmp/xterm1.log 2>&1 &
+DISPLAY=:0 glxgears >/tmp/glxgears.log 2>&1 &
+```
+
+Then open more xterms from the same guest shell while `glxgears` is still
+running:
+
+```sh
+DISPLAY=:0 xterm >/tmp/xterm2.log 2>&1 &
+DISPLAY=:0 xterm >/tmp/xterm3.log 2>&1 &
+```
+
+Expected: no `Failed to create fence sync object`, no `COPY_TRANSFER3D`, no
+`Illegal command buffer`, and the visible SDL window keeps repainting.
+
+## Phase 9: startx Multi-Xorg Burst Queue Regression
+
+Status: implemented in the working tree. This fixed the pending-slot/resource
+ordering failure that appeared in automated `startx` testing, but a later
+visible twm-menu xterm test still exposed Phase 10.
+
+### Trigger
+
+The test-tools image starts `Xorg :0` during guest boot. Running `startx` from
+the shell starts a second server, `Xorg :1`, and generates a much larger burst
+of VirGL control commands than the single-Xorg smoke path.
+
+The failing `startx` path showed:
+
+```text
+vrend_check_no_error: context error reported 2 "X" Unknown 1282
+context 2 failed to dispatch COPY_TRANSFER3D: 22
+vrend_decode_ctx_submit_cmd: context error reported 2 "X" Illegal command buffer 917549
+```
+
+The automated reproduction exposed the earlier host-side failures that led to
+that renderer error:
+
+```text
+[SEMU VGPU] virtio_gpu_defer_ctrl_response_token(): no free pending ctrl slot
+[SEMU VGPU] vgpu_sw_cmd_resource_attach_backing_handler(): invalid resource id
+vrend_renderer_copy_transfer3d: context error reported 2 "X" Illegal resource 117
+```
+
+### Root Cause
+
+The guest virtio-gpu queue supports up to `VIRTIO_GPU_QUEUE_NUM_MAX` descriptors
+(`1024`), but the lockless VirGL async path only had:
+
+- `VIRTIO_GPU_PENDING_CTRLS_MAX = 256`
+- `VGPU_RENDERER_QUEUE_SIZE = 256`, with one slot reserved by the ring full/empty
+  convention, so only `255` usable request slots
+
+When `startx` queued a burst from the second X server, semu ran out of pending
+response slots before the GL owner could drain enough renderer work. Some
+`RESOURCE_CREATE_3D` requests failed and removed their resource tracking entries;
+later `RESOURCE_ATTACH_BACKING` / VirGL submit commands then referenced resource
+ids that no longer existed, ending in VirGL `COPY_TRANSFER3D` illegal-resource
+errors.
+
+### Fix
+
+- Set `VIRTIO_GPU_PENDING_CTRLS_MAX` to `VIRTIO_GPU_QUEUE_NUM_MAX`, so there is
+  enough pending response state for one full guest control-queue burst.
+- Set `VGPU_RENDERER_QUEUE_SIZE` to `VIRTIO_GPU_QUEUE_NUM_MAX * 2`. The internal
+  ring intentionally keeps one slot empty, so it must be larger than the guest
+  queue depth to accept all `1024` descriptors.
+
+### Regression Coverage
+
+Added/updated:
+
+- `tests/vgpu-renderer-queue-test.c`: renderer request queue must accept a full
+  `VIRTIO_GPU_QUEUE_NUM_MAX` burst before draining.
+- `tests/virtio-gpu-fence-test.c`: pending control capacity must cover the full
+  virtio-gpu queue depth.
+
+The new tests failed before the fix:
+
+```text
+tests/vgpu-renderer-queue-test.c:142: check failed: accepted >= VIRTIO_GPU_QUEUE_NUM_MAX
+tests/virtio-gpu-fence-test.c:485: check failed: VIRTIO_GPU_PENDING_CTRLS_MAX >= VIRTIO_GPU_QUEUE_NUM_MAX
+```
+
+They pass after the fix, and the `startx` automation no longer reproduces the
+bad host log strings during the wait window.
+
+### Manual Retest Gate
+
+After rebuilding `semu`, run:
+
+```sh
+scripts/run-vgpu-crash-debug.sh
+```
+
+Guest:
+
+```sh
+root
+startx
+```
+
+Expected: no `no free pending ctrl slot`, no `invalid resource id`, no
+`Illegal resource`, no `COPY_TRANSFER3D`, and no `Illegal command buffer`.
+
+## Phase 10: VirGL Cached Current-context Regression
+
+Status: implemented in the working tree; real visible twm-menu xterm retest
+still pending.
+
+### Trigger
+
+Run `startx`, then use the twm root menu in the visible SDL window to open
+additional `xterm` windows. The remaining failure did not show the Phase 8
+`Failed to create fence sync object` message and did not show the Phase 9
+pending-slot/resource-ordering messages. It reported:
+
+```text
+vrend_check_no_error: context error reported 2 "X" Unknown 1282
+context 2 failed to dispatch COPY_TRANSFER3D: 22
+vrend_decode_ctx_submit_cmd: context error reported 2 "X" Illegal command buffer 917549
+```
+
+### Root Cause
+
+`virgl_renderer_submit_cmd()` eventually calls `vrend_hw_switch_context()`, but
+virglrenderer skips the actual `make_current()` call when its cached
+`current_ctx/current_hw_ctx` already match the submitted context.
+
+That cache can become stale in semu because SDL presentation intentionally
+detaches the real GL context after rendering. The next VirGL submit for the same
+ctx id can therefore run with virglrenderer believing ctx2 is current while SDL
+has no real current context bound on the thread.
+
+QEMU avoids this by calling `virgl_renderer_force_ctx_0()` before dispatching
+each VirGL command. That resets virglrenderer's cached current context and
+forces the next submit to perform a real `make_current()`.
+
+### Fix
+
+At the GL-owner boundary, call `virgl_renderer_force_ctx_0()` before executing
+each renderer-owned VirGL control command. Keep the separate legacy ctx0 fence
+force as well, because a successful submit switches into the guest context
+before fence creation.
+
+The earlier scanout publish-specific force calls are now redundant and were
+removed; publishing only hands a texture payload to the display queue and does
+not itself issue GL commands.
+
+### Regression Coverage
+
+Updated `test_submit_3d_copies_payload_to_renderer()` so
+`virgl_renderer_submit_cmd()` records the `force_ctx_0` count at submit time and
+requires it to be `1`.
+
+The test failed before the fix:
+
+```text
+tests/virtio-gpu-virgl-test.c:992: check failed: g_calls.submit_force_ctx_0_count == 1
+```
+
+After the fix, `make test-vgpu-virgl` passes, and automated `startx` with
+multiple xterms does not emit the known bad strings.
+
+### Manual Retest Gate
+
+Rebuild has already produced a VirGL-enabled `semu`. Retest the visible path:
+
+```sh
+scripts/run-vgpu-crash-debug.sh
+```
+
+Guest:
+
+```sh
+root
+startx
+```
+
+Then in the SDL window, use the twm root menu to open at least two additional
+`xterm` windows. Expected: no `COPY_TRANSFER3D`, no `Illegal command buffer`,
+and the X session remains responsive.
+
+## Phase 11: Input PageUp/Wheel Diagnostic Logging
+
+Status: diagnostic instrumentation implemented in the working tree; root-cause
+classification requires one more visible-window reproduction.
+
+### Trigger
+
+After a long `glmark2` run, moving the mouse in the SDL window can make the
+focused `xterm` continuously print:
+
+```text
+^[[5~
+```
+
+In xterm this is the PageUp escape sequence. In the current input model that can
+come from either an actual guest PageUp key event or from scroll/wheel events
+being interpreted by xterm.
+
+The current manual reproduction is:
+
+1. Enter the SDL mouse grab state.
+2. Press Alt+Tab while still grabbed and switch to a host window.
+3. Switch back to semu.
+4. Move the mouse over the focused guest `xterm`.
+
+### Diagnostic Gap
+
+The existing VGPU progress log could identify renderer/display/fence stalls, but
+it could not say which input boundary produced the bad event:
+
+- SDL frontend event pump.
+- Host-to-emulator virtio-input command queue.
+- Guest-facing virtio-input event queue.
+
+Without those counters, the symptom looked like "mouse motion becomes keyboard
+input", but there was no evidence showing whether semu sent a PageUp key,
+`REL_WHEEL`, or only normal `REL_Y` motion.
+
+### Instrumentation
+
+Extend the progress monitor with two input lines:
+
+- `input-host`: queue depths, pushed/dropped/popped host commands, SDL key/button
+  counts, SDL mouse motion counts, SDL wheel counts, and last motion/wheel deltas.
+- `input-guest`: guest key count, PageUp key count, mouse motion batch count,
+  scroll batch count, REL_X/REL_Y/REL_HWHEEL/REL_WHEEL counts, eventq writes and
+  drops, and last keyboard/mouse relative event.
+
+The important fields for this bug are:
+
+- `sdl_wheel`: SDL is delivering wheel events.
+- `scroll_batches` and `rel_x/y/hwheel/wheel`: semu is sending guest scroll
+  events.
+- `pageup`: semu is sending an actual guest PageUp key.
+- `sdl_motion`, `motion_batches`, and `rel_x/y/hwheel/wheel`: semu is sending
+  normal mouse motion only.
+
+### Manual Retest Gate
+
+Run the normal crash-debug wrapper:
+
+```sh
+scripts/run-vgpu-crash-debug.sh
+```
+
+Guest:
+
+```sh
+root
+startx
+glmark2
+```
+
+When `^[[5~` starts appearing, keep the system running for 5-10 seconds, then
+stop semu and inspect the saved `vgpu-progress.log`.
+
+Expected classification:
+
+- If `input-host sdl_wheel` rises together with `input-guest scroll_batches` or
+  `rel_wheel`, the host frontend is receiving wheel input and forwarding it as
+  guest scroll.
+- If `input-guest pageup` rises, semu is incorrectly forwarding PageUp key
+  events.
+- If only `sdl_motion`, `motion_batches`, and `rel_y` rise, the guest/X stack is
+  interpreting normal mouse motion in an unexpected way and the next
+  investigation should move into the guest X input path.
+
 ## Remaining Future Work Outside This Plan
 
 - Venus/Vulkan.

@@ -1,10 +1,13 @@
 #include <SDL.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #if SEMU_HAS(VIRGL)
@@ -76,6 +79,413 @@ struct sdl_scanout_info {
 };
 
 static struct sdl_scanout_info sdl_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
+#endif
+
+#if SEMU_HAS(VIRTIOGPU)
+enum window_debug_stage {
+    WINDOW_DEBUG_STAGE_IDLE = 0,
+    WINDOW_DEBUG_STAGE_HANDLE_EVENTS,
+    WINDOW_DEBUG_STAGE_DRAIN_RENDERER,
+    WINDOW_DEBUG_STAGE_EXEC_RENDERER,
+    WINDOW_DEBUG_STAGE_DRAIN_DISPLAY,
+    WINDOW_DEBUG_STAGE_APPLY_DISPLAY_CMD,
+    WINDOW_DEBUG_STAGE_APPLY_GL_FRAME,
+    WINDOW_DEBUG_STAGE_RENDER_SCANOUT,
+    WINDOW_DEBUG_STAGE_RENDER_GL_MAKE_CURRENT,
+    WINDOW_DEBUG_STAGE_RENDER_GL_BLIT,
+    WINDOW_DEBUG_STAGE_RENDER_GL_SWAP,
+};
+
+static uint32_t window_debug_stage;
+static uint32_t window_debug_stage_scanout;
+static uint32_t window_debug_stage_cmd;
+static uint64_t window_debug_sdl_events;
+static uint64_t window_debug_renderer_drains;
+static uint64_t window_debug_renderer_requests;
+static uint64_t window_debug_display_drains;
+static uint64_t window_debug_display_cmds;
+static uint64_t window_debug_scanout_renders;
+static bool window_debug_progress_stop;
+static bool window_debug_progress_started;
+static pthread_t window_debug_progress_thread;
+static FILE *window_debug_progress_file;
+static uint32_t window_debug_progress_interval_ms;
+
+static const char *window_debug_stage_name(uint32_t stage)
+{
+    switch ((enum window_debug_stage) stage) {
+    case WINDOW_DEBUG_STAGE_IDLE:
+        return "idle";
+    case WINDOW_DEBUG_STAGE_HANDLE_EVENTS:
+        return "handle-events";
+    case WINDOW_DEBUG_STAGE_DRAIN_RENDERER:
+        return "drain-renderer";
+    case WINDOW_DEBUG_STAGE_EXEC_RENDERER:
+        return "exec-renderer";
+    case WINDOW_DEBUG_STAGE_DRAIN_DISPLAY:
+        return "drain-display";
+    case WINDOW_DEBUG_STAGE_APPLY_DISPLAY_CMD:
+        return "apply-display-cmd";
+    case WINDOW_DEBUG_STAGE_APPLY_GL_FRAME:
+        return "apply-gl-frame";
+    case WINDOW_DEBUG_STAGE_RENDER_SCANOUT:
+        return "render-scanout";
+    case WINDOW_DEBUG_STAGE_RENDER_GL_MAKE_CURRENT:
+        return "render-gl-make-current";
+    case WINDOW_DEBUG_STAGE_RENDER_GL_BLIT:
+        return "render-gl-blit";
+    case WINDOW_DEBUG_STAGE_RENDER_GL_SWAP:
+        return "render-gl-swap";
+    }
+    return "unknown";
+}
+
+static const char *window_debug_display_cmd_name(uint32_t cmd)
+{
+    if (cmd == UINT32_MAX)
+        return "none";
+
+    switch ((enum vgpu_display_cmd_type) cmd) {
+    case VGPU_DISPLAY_CMD_PRIMARY_SET:
+        return "PRIMARY_SET";
+    case VGPU_DISPLAY_CMD_PRIMARY_CLEAR:
+        return "PRIMARY_CLEAR";
+    case VGPU_DISPLAY_CMD_CURSOR_SET:
+        return "CURSOR_SET";
+    case VGPU_DISPLAY_CMD_CURSOR_CLEAR:
+        return "CURSOR_CLEAR";
+    case VGPU_DISPLAY_CMD_CURSOR_MOVE:
+        return "CURSOR_MOVE";
+    }
+    return "UNKNOWN";
+}
+
+#if SEMU_HAS(VIRGL)
+static const char *window_debug_renderer_req_name(uint32_t type)
+{
+    switch ((enum vgpu_renderer_request_type) type) {
+    case VGPU_RENDERER_REQ_INIT:
+        return "INIT";
+    case VGPU_RENDERER_REQ_RESET:
+        return "RESET";
+    case VGPU_RENDERER_REQ_POLL:
+        return "POLL";
+    case VGPU_RENDERER_REQ_CTRL:
+        return "CTRL";
+    case VGPU_RENDERER_REQ_SHUTDOWN:
+        return "SHUTDOWN";
+    }
+    return "UNKNOWN";
+}
+
+static const char *window_debug_gpu_cmd_name(uint32_t cmd)
+{
+    switch (cmd) {
+    case VIRTIO_GPU_CMD_CTX_CREATE:
+        return "CTX_CREATE";
+    case VIRTIO_GPU_CMD_CTX_DESTROY:
+        return "CTX_DESTROY";
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+        return "CTX_ATTACH_RESOURCE";
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
+        return "CTX_DETACH_RESOURCE";
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
+        return "RESOURCE_CREATE_3D";
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+        return "RESOURCE_UNREF";
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+        return "RESOURCE_ATTACH_BACKING";
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+        return "RESOURCE_DETACH_BACKING";
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+        return "TRANSFER_TO_HOST_2D";
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
+        return "TRANSFER_TO_HOST_3D";
+    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
+        return "TRANSFER_FROM_HOST_3D";
+    case VIRTIO_GPU_CMD_SUBMIT_3D:
+        return "SUBMIT_3D";
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+        return "SET_SCANOUT";
+    case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+        return "RESOURCE_FLUSH";
+    case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
+        return "GET_CAPSET_INFO";
+    case VIRTIO_GPU_CMD_GET_CAPSET:
+        return "GET_CAPSET";
+    }
+    return "UNKNOWN";
+}
+#endif
+
+static void window_debug_set_stage(enum window_debug_stage stage,
+                                   uint32_t scanout_id,
+                                   uint32_t cmd)
+{
+    __atomic_store_n(&window_debug_stage_scanout, scanout_id, __ATOMIC_RELAXED);
+    __atomic_store_n(&window_debug_stage_cmd, cmd, __ATOMIC_RELAXED);
+    __atomic_store_n(&window_debug_stage, (uint32_t) stage, __ATOMIC_RELEASE);
+}
+
+static bool window_debug_env_enabled(const char *value)
+{
+    if (!value || !value[0])
+        return false;
+    return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 &&
+           strcmp(value, "FALSE") != 0 && strcmp(value, "no") != 0 &&
+           strcmp(value, "NO") != 0;
+}
+
+static uint32_t window_debug_parse_interval_ms(void)
+{
+    const char *value = getenv("SEMU_VGPU_PROGRESS_LOG_INTERVAL");
+    if (!value || !value[0])
+        return 2000;
+
+    char *end = NULL;
+    double seconds = strtod(value, &end);
+    if (end == value || seconds <= 0.0)
+        return 2000;
+    if (seconds < 0.1)
+        seconds = 0.1;
+    if (seconds > 60.0)
+        seconds = 60.0;
+    return (uint32_t) (seconds * 1000.0);
+}
+
+static void window_debug_log_progress(FILE *out)
+{
+    time_t now = time(NULL);
+    uint32_t stage = __atomic_load_n(&window_debug_stage, __ATOMIC_ACQUIRE);
+    uint32_t stage_scanout =
+        __atomic_load_n(&window_debug_stage_scanout, __ATOMIC_RELAXED);
+    uint32_t stage_cmd =
+        __atomic_load_n(&window_debug_stage_cmd, __ATOMIC_RELAXED);
+
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] t=%lld stage=%s scanout=%" PRIu32
+            " display_cmd=%s sdl_events=%" PRIu64 " renderer_drains=%" PRIu64
+            " renderer_reqs=%" PRIu64 " display_drains=%" PRIu64
+            " display_cmds=%" PRIu64 " renders=%" PRIu64 "\n",
+            (long long) now, window_debug_stage_name(stage), stage_scanout,
+            window_debug_display_cmd_name(stage_cmd),
+            __atomic_load_n(&window_debug_sdl_events, __ATOMIC_RELAXED),
+            __atomic_load_n(&window_debug_renderer_drains, __ATOMIC_RELAXED),
+            __atomic_load_n(&window_debug_renderer_requests, __ATOMIC_RELAXED),
+            __atomic_load_n(&window_debug_display_drains, __ATOMIC_RELAXED),
+            __atomic_load_n(&window_debug_display_cmds, __ATOMIC_RELAXED),
+            __atomic_load_n(&window_debug_scanout_renders, __ATOMIC_RELAXED));
+
+    struct vgpu_display_debug_stats display = {0};
+    vgpu_display_debug_snapshot(&display);
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] display scanouts=%" PRIu32 " q=%" PRIu32
+            " head=%" PRIu32 " tail=%" PRIu32 " queued=%" PRIu64
+            " dropped=%" PRIu64 " popped=%" PRIu64 " stale=%" PRIu64
+            " primary_set=%" PRIu64 " cursor_set=%" PRIu64
+            " cursor_move=%" PRIu64 " primary_clear=%" PRIu64
+            " cursor_clear=%" PRIu64 " unavailable=%u\n",
+            display.scanout_count, display.queue_depth, display.queue_head,
+            display.queue_tail, display.cmds_queued, display.cmds_dropped,
+            display.cmds_popped, display.stale_cmds_dropped,
+            display.primary_sets_published, display.cursor_sets_published,
+            display.cursor_moves_published, display.primary_clears,
+            display.cursor_clears, display.unavailable ? 1U : 0U);
+
+    struct virtio_gpu_debug_stats gpu = {0};
+    virtio_gpu_debug_snapshot(&gpu);
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] virtio generation=%" PRIu32
+            " pending_ctrls=%" PRIu32 " dispatch=%u deferred=%" PRIu64
+            " defer_dropped=%" PRIu64 " fence_done=%" PRIu64
+            " token_done=%" PRIu64 "\n",
+            gpu.ctrl_generation, gpu.pending_ctrls_active,
+            gpu.dispatch_active ? 1U : 0U, gpu.ctrl_responses_deferred,
+            gpu.ctrl_responses_defer_dropped, gpu.ctrl_responses_completed,
+            gpu.ctrl_token_responses_completed);
+
+#if SEMU_HAS(VIRTIOINPUT)
+    struct vinput_host_debug_stats host_input = {0};
+    vinput_debug_snapshot(&host_input);
+    fprintf(
+        out,
+        "[SEMU VGPU PROGRESS] input-host k_q=%" PRIu32 " m_q=%" PRIu32
+        " wake=%u k_push/drop/pop=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+        " m_push/drop/pop=%" PRIu64 "/%" PRIu64 "/%" PRIu64 " sdl_key=%" PRIu64
+        "/%" PRIu64 " sdl_btn=%" PRIu64 "/%" PRIu64 " sdl_motion=%" PRIu64
+        "/%" PRIu64 " last_motion=%" PRId32 ",%" PRId32 " sdl_wheel=%" PRIu64
+        "/%" PRIu64 " last_wheel=%" PRId32 ",%" PRId32 "\n",
+        host_input.keyboard_queue_depth, host_input.mouse_queue_depth,
+        host_input.wake_pending ? 1U : 0U, host_input.keyboard_cmds_pushed,
+        host_input.keyboard_cmds_dropped, host_input.keyboard_cmds_popped,
+        host_input.mouse_cmds_pushed, host_input.mouse_cmds_dropped,
+        host_input.mouse_cmds_popped, host_input.sdl_keydown,
+        host_input.sdl_keyup, host_input.sdl_mouse_button_down,
+        host_input.sdl_mouse_button_up, host_input.sdl_mouse_motion_observed,
+        host_input.sdl_mouse_motion_published, host_input.last_motion_dx,
+        host_input.last_motion_dy, host_input.sdl_mouse_wheel_observed,
+        host_input.sdl_mouse_wheel_published, host_input.last_wheel_dx,
+        host_input.last_wheel_dy);
+
+    struct virtio_input_debug_stats guest_input = {0};
+    virtio_input_debug_snapshot(&guest_input);
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] input-guest key=%" PRIu64 " pageup=%" PRIu64
+            " buttons=%" PRIu64 " motion_batches=%" PRIu64
+            " scroll_batches=%" PRIu64 " rel_x/y/hwheel/wheel=%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " eventq_writes k/m=%" PRIu64
+            "/%" PRIu64 " eventq_drops k/m=%" PRIu64 "/%" PRIu64
+            " last_key=%" PRIu16 ":%" PRIu32 " last_mouse_rel=%" PRIu16
+            ":%" PRId32 "\n",
+            guest_input.keyboard_keys, guest_input.keyboard_pageup_keys,
+            guest_input.mouse_buttons, guest_input.mouse_motion_batches,
+            guest_input.mouse_scroll_batches, guest_input.mouse_rel_x,
+            guest_input.mouse_rel_y, guest_input.mouse_rel_hwheel,
+            guest_input.mouse_rel_wheel, guest_input.keyboard_eventq_writes,
+            guest_input.mouse_eventq_writes, guest_input.keyboard_eventq_drops,
+            guest_input.mouse_eventq_drops, guest_input.last_keyboard_code,
+            guest_input.last_keyboard_value, guest_input.last_mouse_rel_code,
+            guest_input.last_mouse_rel_value);
+#endif
+
+#if SEMU_HAS(VIRGL)
+    struct vgpu_renderer_debug_stats renderer = {0};
+    vgpu_renderer_debug_snapshot(&renderer);
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] renderer req_q=%" PRIu32 " comp_q=%" PRIu32
+            " submitted=%" PRIu64 " submit_drop=%" PRIu64 " popped=%" PRIu64
+            " completed=%" PRIu64 " complete_drop=%" PRIu64
+            " done_popped=%" PRIu64 " exec=%" PRIu64 "/%" PRIu64
+            " current_seq=%" PRIu64 " current_req=%s current_cmd=%s/%" PRIu32
+            " token=%" PRIu32 " gen=%" PRIu32 "\n",
+            renderer.request_depth, renderer.completion_depth,
+            renderer.requests_submitted, renderer.requests_dropped,
+            renderer.requests_popped, renderer.completions_submitted,
+            renderer.completions_dropped, renderer.completions_popped,
+            renderer.execute_started, renderer.execute_finished,
+            renderer.current_execute_seq,
+            window_debug_renderer_req_name(renderer.current_request_type),
+            window_debug_gpu_cmd_name(renderer.current_command_type),
+            renderer.current_command_type, renderer.current_token_id,
+            renderer.current_generation);
+
+    struct vgpu_virgl_debug_stats virgl = {0};
+    vgpu_virgl_debug_snapshot(&virgl);
+    fprintf(
+        out,
+        "[SEMU VGPU PROGRESS] virgl pending_fences=%" PRIu32
+        " poll_pending=%u poll=%" PRIu64 "/%" PRIu64 " poll_drop=%" PRIu64
+        " fences=%" PRIu64 "/%" PRIu64 " ctrl=%" PRIu64 "/%" PRIu64
+        " scanout=%" PRIu64 " scanout_drop=%" PRIu64 " last_ctx0_fence=%" PRIu64
+        " last_ctx_fence=%" PRIu64 " ctx=%" PRIu32 " ring=%" PRIu32 "\n",
+        virgl.pending_fences, virgl.poll_request_pending ? 1U : 0U,
+        virgl.poll_requests_submitted, virgl.poll_requests_executed,
+        virgl.poll_requests_dropped, virgl.fences_created,
+        virgl.fences_completed, virgl.ctrl_requests_started,
+        virgl.ctrl_requests_completed, virgl.scanouts_published,
+        virgl.scanouts_dropped, virgl.last_ctx0_fence, virgl.last_context_fence,
+        virgl.last_context_ctx_id, virgl.last_context_ring_idx);
+#endif
+
+    fflush(out);
+}
+
+static void *window_debug_progress_main(void *arg)
+{
+    FILE *out = arg;
+    fprintf(out,
+            "[SEMU VGPU PROGRESS] monitor started interval_ms=%" PRIu32 "\n",
+            window_debug_progress_interval_ms);
+    fflush(out);
+
+    while (!__atomic_load_n(&window_debug_progress_stop, __ATOMIC_ACQUIRE)) {
+        window_debug_log_progress(out);
+
+        uint32_t slept_ms = 0;
+        while (
+            slept_ms < window_debug_progress_interval_ms &&
+            !__atomic_load_n(&window_debug_progress_stop, __ATOMIC_ACQUIRE)) {
+            uint32_t step_ms = window_debug_progress_interval_ms - slept_ms;
+            if (step_ms > 100)
+                step_ms = 100;
+            usleep(step_ms * 1000U);
+            slept_ms += step_ms;
+        }
+    }
+
+    window_debug_log_progress(out);
+    fprintf(out, "[SEMU VGPU PROGRESS] monitor stopped\n");
+    fflush(out);
+    return NULL;
+}
+
+static void window_debug_progress_start(void)
+{
+    const char *enabled = getenv("SEMU_VGPU_PROGRESS_LOG");
+    const char *path = getenv("SEMU_VGPU_PROGRESS_LOG_FILE");
+    if (enabled && !window_debug_env_enabled(enabled))
+        return;
+    if (!window_debug_env_enabled(enabled) && (!path || !path[0]))
+        return;
+
+    window_debug_progress_interval_ms = window_debug_parse_interval_ms();
+    FILE *out = stderr;
+    if (path && path[0]) {
+        out = fopen(path, "a");
+        if (!out) {
+            fprintf(stderr,
+                    WINDOW_LOG_PREFIX
+                    "%s(): failed to open progress log '%s'\n",
+                    __func__, path);
+            out = stderr;
+        }
+    }
+
+    window_debug_progress_file = out;
+    __atomic_store_n(&window_debug_progress_stop, false, __ATOMIC_RELEASE);
+    if (pthread_create(&window_debug_progress_thread, NULL,
+                       window_debug_progress_main, out) != 0) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX "%s(): failed to start progress monitor\n",
+                __func__);
+        if (out != stderr)
+            fclose(out);
+        window_debug_progress_file = NULL;
+        return;
+    }
+
+    window_debug_progress_started = true;
+}
+
+static void window_debug_progress_stop_monitor(void)
+{
+    if (!window_debug_progress_started)
+        return;
+
+    __atomic_store_n(&window_debug_progress_stop, true, __ATOMIC_RELEASE);
+    pthread_join(window_debug_progress_thread, NULL);
+    window_debug_progress_started = false;
+
+    if (window_debug_progress_file && window_debug_progress_file != stderr)
+        fclose(window_debug_progress_file);
+    window_debug_progress_file = NULL;
+}
+#else
+enum window_debug_stage {
+    WINDOW_DEBUG_STAGE_IDLE = 0,
+    WINDOW_DEBUG_STAGE_HANDLE_EVENTS,
+};
+
+static uint64_t window_debug_sdl_events;
+
+static void window_debug_set_stage(enum window_debug_stage stage,
+                                   uint32_t scanout_id,
+                                   uint32_t cmd)
+{
+    (void) stage;
+    (void) scanout_id;
+    (void) cmd;
+}
 #endif
 
 static void window_set_wake_fd_sw(int fd)
@@ -566,6 +976,8 @@ static bool sdl_scanout_apply_gl_frame(
     if (!scanout->gl_context)
         return false;
 
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_APPLY_GL_FRAME, 0,
+                           VGPU_DISPLAY_CMD_PRIMARY_SET);
     if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
         fprintf(stderr, "%s(): failed to make GL context current: %s\n",
                 __func__, SDL_GetError());
@@ -641,6 +1053,8 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
     if (!scanout->gl_context)
         return;
 
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_RENDER_GL_MAKE_CURRENT, 0,
+                           UINT32_MAX);
     if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0)
         return;
 
@@ -672,6 +1086,8 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
             src_y1 = (GLint) frame->src_y;
         }
 
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_RENDER_GL_BLIT, 0,
+                               UINT32_MAX);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, scanout->gl_primary_fb);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glBlitFramebuffer(src_x0, src_y0, src_x1, src_y1, 0, 0, width, height,
@@ -680,6 +1096,7 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
     }
 
     sdl_scanout_render_gl_cursor(scanout, width, height);
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_RENDER_GL_SWAP, 0, UINT32_MAX);
     SDL_GL_SwapWindow(scanout->window);
     sdl_scanout_detach_gl_context(scanout);
 }
@@ -687,6 +1104,8 @@ static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
 
 static void sdl_scanout_render(struct sdl_scanout_info *scanout)
 {
+    __atomic_add_fetch(&window_debug_scanout_renders, 1, __ATOMIC_RELAXED);
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_RENDER_SCANOUT, 0, UINT32_MAX);
 #if SEMU_HAS(VIRGL)
     if (scanout->gl_context) {
         sdl_scanout_render_gl(scanout);
@@ -708,6 +1127,9 @@ static void sdl_scanout_render(struct sdl_scanout_info *scanout)
 
 static void window_drain_display_queue(void)
 {
+    __atomic_add_fetch(&window_debug_display_drains, 1, __ATOMIC_RELAXED);
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_DRAIN_DISPLAY, 0, UINT32_MAX);
+
     bool dirty_scanouts[VIRTIO_GPU_MAX_SCANOUTS] = {0};
     bool cursor_dirty_scanouts[VIRTIO_GPU_MAX_SCANOUTS] = {0};
     struct vgpu_display_cmd cmd;
@@ -717,6 +1139,9 @@ static void window_drain_display_queue(void)
      * generations and filters stale lossy frame/move queue entries.
      */
     while (vgpu_display_pop_cmd(&cmd)) {
+        __atomic_add_fetch(&window_debug_display_cmds, 1, __ATOMIC_RELAXED);
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_APPLY_DISPLAY_CMD,
+                               cmd.scanout_id, (uint32_t) cmd.type);
         /* 'scanout_id' was validated by the guest-facing backend before the
          * command entered the display bridge.
          */
@@ -815,9 +1240,18 @@ static void window_drain_display_queue(void)
 #if SEMU_HAS(VIRGL)
 static void window_drain_renderer_queue(void)
 {
+    __atomic_add_fetch(&window_debug_renderer_drains, 1, __ATOMIC_RELAXED);
+    window_debug_set_stage(WINDOW_DEBUG_STAGE_DRAIN_RENDERER, 0, UINT32_MAX);
+
     struct vgpu_renderer_request request;
-    while (vgpu_renderer_pop_request(&request))
+    while (vgpu_renderer_pop_request(&request)) {
+        __atomic_add_fetch(&window_debug_renderer_requests, 1,
+                           __ATOMIC_RELAXED);
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_EXEC_RENDERER, 0, UINT32_MAX);
+        vgpu_renderer_debug_note_execute_begin(&request);
         vgpu_virgl_execute_renderer_request(&request);
+        vgpu_renderer_debug_note_execute_end();
+    }
 }
 #endif
 
@@ -841,6 +1275,7 @@ static void window_main_loop_sw(void)
      */
     while (!window_is_closed_sw()) {
 #if SEMU_HAS(VIRTIOINPUT)
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_HANDLE_EVENTS, 0, UINT32_MAX);
         if (vinput_handle_events()) {
             /* User closed the window. Set the flag so 'window_shutdown_sw()'
              * (called from the emulator thread) does not race with us, then
@@ -850,6 +1285,7 @@ static void window_main_loop_sw(void)
             window_shutdown_sw();
             return;
         }
+        __atomic_add_fetch(&window_debug_sdl_events, 1, __ATOMIC_RELAXED);
 #else
         SDL_Event e;
         /* Without 'virtio-input', there is no SDL event pump to wake on display
@@ -857,6 +1293,7 @@ static void window_main_loop_sw(void)
          * drain the display bridge; a future SDL user-event bridge could make
          * this fully event-driven.
          */
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_HANDLE_EVENTS, 0, UINT32_MAX);
         if (SDL_WaitEventTimeout(&e, SDL_EVENT_WAIT_TIMEOUT_MS)) {
             uint32_t processed = 0;
             do {
@@ -866,6 +1303,8 @@ static void window_main_loop_sw(void)
                 }
                 processed++;
             } while (processed < SDL_EVENT_BURST_LIMIT && SDL_PollEvent(&e));
+            __atomic_add_fetch(&window_debug_sdl_events, processed,
+                               __ATOMIC_RELAXED);
         }
 #endif
 
@@ -875,6 +1314,7 @@ static void window_main_loop_sw(void)
 #if SEMU_HAS(VIRTIOGPU)
         window_drain_display_queue();
 #endif
+        window_debug_set_stage(WINDOW_DEBUG_STAGE_IDLE, 0, UINT32_MAX);
     }
 }
 
@@ -1004,6 +1444,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
     SDL_RenderClear(scanout->renderer);
     SDL_RenderPresent(scanout->renderer);
 #endif
+    window_debug_progress_start();
 #else /* !SEMU_HAS(VIRTIOGPU) */
     sdl_input_window = SDL_CreateWindow("semu", SDL_WINDOWPOS_UNDEFINED,
                                         SDL_WINDOWPOS_UNDEFINED, width, height,
@@ -1023,6 +1464,10 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 
 static void window_cleanup_sw(void)
 {
+#if SEMU_HAS(VIRTIOGPU)
+    window_debug_progress_stop_monitor();
+#endif
+
 #if SEMU_HAS(VIRGL)
     vgpu_renderer_set_wake_frontend(NULL);
     vgpu_renderer_set_wake_backend(NULL);
