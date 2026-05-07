@@ -38,6 +38,29 @@ struct vgpu_virgl_fence_state {
     uint64_t last_context_fence;
 };
 
+struct vgpu_virgl_pending_fence {
+    /* Published last by renderer work and claimed atomically by callbacks so
+     * stale reset callbacks cannot observe or reuse a partially written slot.
+     */
+    uint64_t active_token;
+    uint32_t generation;
+    bool context_fence;
+    uint32_t ctx_id;
+    uint32_t ring_idx;
+    uint64_t renderer_fence_id;
+    uint64_t guest_fence_id;
+};
+
+struct vgpu_virgl_pending_fence_snapshot {
+    uint64_t active_token;
+    uint32_t generation;
+    bool context_fence;
+    uint32_t ctx_id;
+    uint32_t ring_idx;
+    uint64_t renderer_fence_id;
+    uint64_t guest_fence_id;
+};
+
 struct vgpu_virgl_ctrl_work {
     virtio_gpu_state_t *vgpu;
     struct virtio_gpu_ctrl_hdr hdr;
@@ -66,9 +89,14 @@ struct vgpu_virgl_ctrl_work {
 
 static struct vgpu_virgl_resource *g_vgpu_virgl_resources;
 static struct vgpu_virgl_fence_state g_vgpu_virgl_fences;
+static struct vgpu_virgl_pending_fence
+    g_vgpu_virgl_pending_fence_records[VIRTIO_GPU_PENDING_CTRLS_MAX];
 static uint32_t g_vgpu_virgl_pending_fences;
 static bool g_vgpu_virgl_poll_request_pending;
 static uint32_t g_vgpu_virgl_next_token;
+static uint32_t g_vgpu_virgl_next_ctx0_renderer_fence;
+static uint64_t g_vgpu_virgl_next_context_renderer_fence;
+static uint64_t g_vgpu_virgl_next_pending_fence_token;
 static uint64_t g_vgpu_virgl_debug_poll_requests_submitted;
 static uint64_t g_vgpu_virgl_debug_poll_requests_dropped;
 static uint64_t g_vgpu_virgl_debug_poll_requests_executed;
@@ -78,6 +106,8 @@ static uint64_t g_vgpu_virgl_debug_ctrl_requests_started;
 static uint64_t g_vgpu_virgl_debug_ctrl_requests_completed;
 static uint64_t g_vgpu_virgl_debug_scanouts_published;
 static uint64_t g_vgpu_virgl_debug_scanouts_dropped;
+
+#define VGPU_VIRGL_PENDING_FENCE_CLAIMED (UINT64_C(1) << 63)
 
 static uint32_t vgpu_virgl_count_capsets(void)
 {
@@ -107,6 +137,21 @@ static void vgpu_virgl_publish_capsets(virtio_gpu_state_t *vgpu)
 
 static void vgpu_virgl_reset_poll_state(void)
 {
+    for (size_t i = 0; i < ARRAY_SIZE(g_vgpu_virgl_pending_fence_records);
+         i++) {
+        struct vgpu_virgl_pending_fence *pending =
+            &g_vgpu_virgl_pending_fence_records[i];
+        for (;;) {
+            uint64_t token =
+                __atomic_load_n(&pending->active_token, __ATOMIC_ACQUIRE);
+            if (!token || (token & VGPU_VIRGL_PENDING_FENCE_CLAIMED))
+                break;
+            if (__atomic_compare_exchange_n(&pending->active_token, &token, 0,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE))
+                break;
+        }
+    }
     __atomic_store_n(&g_vgpu_virgl_pending_fences, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_vgpu_virgl_poll_request_pending, false,
                      __ATOMIC_RELEASE);
@@ -123,16 +168,73 @@ static void vgpu_virgl_reset_fence_state(void)
                      __ATOMIC_RELEASE);
 }
 
-static void vgpu_virgl_note_fence_created(void)
+static bool vgpu_virgl_pending_fence_stream_matches(
+    const struct vgpu_virgl_pending_fence_snapshot *pending,
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx)
 {
-    __atomic_add_fetch(&g_vgpu_virgl_pending_fences, 1, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&g_vgpu_virgl_debug_fences_created, 1, __ATOMIC_RELAXED);
+    if (pending->context_fence != context_fence)
+        return false;
+    if (!context_fence)
+        return true;
+
+    return pending->ctx_id == ctx_id && pending->ring_idx == ring_idx;
 }
 
-static void vgpu_virgl_note_fence_completed(void)
+static uint64_t vgpu_virgl_next_pending_fence_token(void)
 {
-    __atomic_add_fetch(&g_vgpu_virgl_debug_fences_completed, 1,
-                       __ATOMIC_RELAXED);
+    for (;;) {
+        uint64_t token = __atomic_add_fetch(
+            &g_vgpu_virgl_next_pending_fence_token, 1, __ATOMIC_RELAXED);
+        token &= ~VGPU_VIRGL_PENDING_FENCE_CLAIMED;
+        if (token)
+            return token;
+    }
+}
+
+static bool vgpu_virgl_load_pending_fence(
+    const struct vgpu_virgl_pending_fence *pending,
+    struct vgpu_virgl_pending_fence_snapshot *snapshot)
+{
+    uint64_t token = __atomic_load_n(&pending->active_token, __ATOMIC_ACQUIRE);
+    if (!token || (token & VGPU_VIRGL_PENDING_FENCE_CLAIMED))
+        return false;
+
+    *snapshot = (struct vgpu_virgl_pending_fence_snapshot) {
+        .active_token = token,
+        .generation = __atomic_load_n(&pending->generation, __ATOMIC_RELAXED),
+        .context_fence =
+            __atomic_load_n(&pending->context_fence, __ATOMIC_RELAXED),
+        .ctx_id = __atomic_load_n(&pending->ctx_id, __ATOMIC_RELAXED),
+        .ring_idx = __atomic_load_n(&pending->ring_idx, __ATOMIC_RELAXED),
+        .renderer_fence_id =
+            __atomic_load_n(&pending->renderer_fence_id, __ATOMIC_RELAXED),
+        .guest_fence_id =
+            __atomic_load_n(&pending->guest_fence_id, __ATOMIC_RELAXED),
+    };
+    return __atomic_load_n(&pending->active_token, __ATOMIC_ACQUIRE) == token;
+}
+
+static bool vgpu_virgl_claim_pending_fence(
+    struct vgpu_virgl_pending_fence *pending,
+    uint64_t token)
+{
+    uint64_t expected = token;
+    return __atomic_compare_exchange_n(&pending->active_token, &expected,
+                                       token | VGPU_VIRGL_PENDING_FENCE_CLAIMED,
+                                       false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
+}
+
+static void vgpu_virgl_release_claimed_fence(
+    struct vgpu_virgl_pending_fence *pending)
+{
+    __atomic_store_n(&pending->active_token, 0, __ATOMIC_RELEASE);
+}
+
+static void vgpu_virgl_decrement_pending_fences(void)
+{
     uint32_t pending =
         __atomic_load_n(&g_vgpu_virgl_pending_fences, __ATOMIC_ACQUIRE);
     while (pending) {
@@ -140,6 +242,144 @@ static void vgpu_virgl_note_fence_completed(void)
                                         pending - 1, false, __ATOMIC_ACQ_REL,
                                         __ATOMIC_ACQUIRE))
             return;
+    }
+}
+
+static bool vgpu_virgl_record_pending_fence(uint32_t generation,
+                                            bool context_fence,
+                                            uint32_t ctx_id,
+                                            uint32_t ring_idx,
+                                            uint64_t renderer_fence_id,
+                                            uint64_t guest_fence_id)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_vgpu_virgl_pending_fence_records);
+         i++) {
+        struct vgpu_virgl_pending_fence *pending =
+            &g_vgpu_virgl_pending_fence_records[i];
+        if (__atomic_load_n(&pending->active_token, __ATOMIC_ACQUIRE))
+            continue;
+
+        __atomic_store_n(&pending->generation, generation, __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->context_fence, context_fence,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->ctx_id, ctx_id, __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->ring_idx, ring_idx, __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->renderer_fence_id, renderer_fence_id,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->guest_fence_id, guest_fence_id,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&pending->active_token,
+                         vgpu_virgl_next_pending_fence_token(),
+                         __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_vgpu_virgl_pending_fences, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_vgpu_virgl_debug_fences_created, 1,
+                           __ATOMIC_RELAXED);
+        return true;
+    }
+
+    return false;
+}
+
+static bool vgpu_virgl_cancel_pending_fence(bool context_fence,
+                                            uint32_t ctx_id,
+                                            uint32_t ring_idx,
+                                            uint64_t renderer_fence_id)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_vgpu_virgl_pending_fence_records);
+         i++) {
+        struct vgpu_virgl_pending_fence *pending =
+            &g_vgpu_virgl_pending_fence_records[i];
+        struct vgpu_virgl_pending_fence_snapshot snapshot;
+        if (!vgpu_virgl_load_pending_fence(pending, &snapshot) ||
+            !vgpu_virgl_pending_fence_stream_matches(&snapshot, context_fence,
+                                                     ctx_id, ring_idx) ||
+            snapshot.renderer_fence_id != renderer_fence_id)
+            continue;
+        if (!vgpu_virgl_claim_pending_fence(pending, snapshot.active_token))
+            continue;
+
+        vgpu_virgl_release_claimed_fence(pending);
+        vgpu_virgl_decrement_pending_fences();
+        return true;
+    }
+
+    return false;
+}
+
+static bool vgpu_virgl_take_completed_fence(bool context_fence,
+                                            uint32_t ctx_id,
+                                            uint32_t ring_idx,
+                                            uint64_t renderer_fence_id,
+                                            uint32_t *generation,
+                                            uint64_t *guest_fence_id)
+{
+    for (;;) {
+        uint64_t best_renderer_fence = 0;
+        uint32_t best_generation = 0;
+        uint64_t best_guest_fence = 0;
+        uint64_t best_token = 0;
+        size_t best_index = 0;
+        bool found = false;
+
+        for (size_t i = 0; i < ARRAY_SIZE(g_vgpu_virgl_pending_fence_records);
+             i++) {
+            struct vgpu_virgl_pending_fence_snapshot pending;
+            if (!vgpu_virgl_load_pending_fence(
+                    &g_vgpu_virgl_pending_fence_records[i], &pending) ||
+                !vgpu_virgl_pending_fence_stream_matches(
+                    &pending, context_fence, ctx_id, ring_idx) ||
+                pending.renderer_fence_id > renderer_fence_id)
+                continue;
+            if (found && pending.renderer_fence_id < best_renderer_fence)
+                continue;
+
+            found = true;
+            best_renderer_fence = pending.renderer_fence_id;
+            best_generation = pending.generation;
+            best_guest_fence = pending.guest_fence_id;
+            best_token = pending.active_token;
+            best_index = i;
+        }
+
+        if (!found)
+            return false;
+
+        struct vgpu_virgl_pending_fence *best_pending =
+            &g_vgpu_virgl_pending_fence_records[best_index];
+        if (!vgpu_virgl_claim_pending_fence(best_pending, best_token))
+            continue;
+
+        vgpu_virgl_release_claimed_fence(best_pending);
+        vgpu_virgl_decrement_pending_fences();
+        __atomic_add_fetch(&g_vgpu_virgl_debug_fences_completed, 1,
+                           __ATOMIC_RELAXED);
+
+        for (size_t i = 0; i < ARRAY_SIZE(g_vgpu_virgl_pending_fence_records);
+             i++) {
+            if (i == best_index)
+                continue;
+
+            struct vgpu_virgl_pending_fence *pending =
+                &g_vgpu_virgl_pending_fence_records[i];
+            struct vgpu_virgl_pending_fence_snapshot snapshot;
+            if (!vgpu_virgl_load_pending_fence(pending, &snapshot) ||
+                !vgpu_virgl_pending_fence_stream_matches(
+                    &snapshot, context_fence, ctx_id, ring_idx) ||
+                snapshot.generation != best_generation ||
+                snapshot.renderer_fence_id > renderer_fence_id)
+                continue;
+            if (!vgpu_virgl_claim_pending_fence(pending, snapshot.active_token))
+                continue;
+
+            vgpu_virgl_release_claimed_fence(pending);
+            vgpu_virgl_decrement_pending_fences();
+            __atomic_add_fetch(&g_vgpu_virgl_debug_fences_completed, 1,
+                               __ATOMIC_RELAXED);
+        }
+
+        *generation = best_generation;
+        *guest_fence_id = best_guest_fence;
+        return true;
     }
 }
 
@@ -176,6 +416,24 @@ static uint32_t vgpu_virgl_next_token(void)
                                       __ATOMIC_RELAXED);
 }
 
+static uint32_t vgpu_virgl_next_ctx0_renderer_fence(void)
+{
+    uint32_t fence = __atomic_add_fetch(&g_vgpu_virgl_next_ctx0_renderer_fence,
+                                        1, __ATOMIC_RELAXED);
+    return fence ? fence
+                 : __atomic_add_fetch(&g_vgpu_virgl_next_ctx0_renderer_fence, 1,
+                                      __ATOMIC_RELAXED);
+}
+
+static uint64_t vgpu_virgl_next_context_renderer_fence(void)
+{
+    uint64_t fence = __atomic_add_fetch(
+        &g_vgpu_virgl_next_context_renderer_fence, 1, __ATOMIC_RELAXED);
+    return fence ? fence
+                 : __atomic_add_fetch(&g_vgpu_virgl_next_context_renderer_fence,
+                                      1, __ATOMIC_RELAXED);
+}
+
 static void vgpu_virgl_free_ctrl_work(struct vgpu_virgl_ctrl_work *work)
 {
     if (!work)
@@ -195,15 +453,20 @@ static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
     __atomic_store_n(&g_vgpu_virgl_fences.last_ctx0_fence, fence,
                      __ATOMIC_RELEASE);
-    vgpu_virgl_note_fence_completed();
     if (!cookie)
+        return;
+
+    uint32_t generation = 0;
+    uint64_t guest_fence_id = 0;
+    if (!vgpu_virgl_take_completed_fence(false, 0, 0, fence, &generation,
+                                         &guest_fence_id))
         return;
 
     struct vgpu_renderer_completion completion = {
         .type = VGPU_RENDERER_DONE_FENCE,
-        .token = {.generation = virtio_gpu_ctrl_generation(cookie)},
+        .token = {.generation = generation},
         .context_fence = false,
-        .fence_id = fence,
+        .fence_id = guest_fence_id,
     };
     if (!vgpu_renderer_complete(&completion))
         fprintf(stderr,
@@ -223,17 +486,22 @@ static void vgpu_virgl_write_context_fence(void *cookie,
                      __ATOMIC_RELEASE);
     __atomic_store_n(&g_vgpu_virgl_fences.last_context_fence, fence_id,
                      __ATOMIC_RELEASE);
-    vgpu_virgl_note_fence_completed();
     if (!cookie)
+        return;
+
+    uint32_t generation = 0;
+    uint64_t guest_fence_id = 0;
+    if (!vgpu_virgl_take_completed_fence(true, ctx_id, ring_idx, fence_id,
+                                         &generation, &guest_fence_id))
         return;
 
     struct vgpu_renderer_completion completion = {
         .type = VGPU_RENDERER_DONE_FENCE,
-        .token = {.generation = virtio_gpu_ctrl_generation(cookie)},
+        .token = {.generation = generation},
         .context_fence = true,
         .ctx_id = ctx_id,
         .ring_idx = ring_idx,
-        .fence_id = fence_id,
+        .fence_id = guest_fence_id,
     };
     if (!vgpu_renderer_complete(&completion))
         fprintf(stderr,
@@ -412,18 +680,37 @@ static void vgpu_virgl_complete_ctrl_work(
     if (response_type == VIRTIO_GPU_RESP_OK_NODATA &&
         (work->hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
         int ret;
-        vgpu_virgl_note_fence_created();
+        bool context_fence =
+            (work->hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
+        uint32_t fence_ctx_id = context_fence ? work->hdr.ctx_id : 0;
+        uint32_t fence_ring_idx = context_fence ? work->hdr.ring_idx : 0;
+        uint64_t guest_fence_id = work->hdr.fence_id;
+        /* Guest fence ids can restart after a device reset. Use a monotonic
+         * renderer-local id for callbacks, then map it back to the guest id.
+         */
+        uint64_t renderer_fence_id =
+            context_fence ? vgpu_virgl_next_context_renderer_fence()
+                          : vgpu_virgl_next_ctx0_renderer_fence();
+        if (!vgpu_virgl_record_pending_fence(
+                request->token.generation, context_fence, fence_ctx_id,
+                fence_ring_idx, renderer_fence_id, guest_fence_id)) {
+            free(response);
+            response = NULL;
+            response_size = 0;
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            goto complete;
+        }
+
         if (work->hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
             ret = virgl_renderer_context_create_fence(
                 work->hdr.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
-                work->hdr.ring_idx, work->hdr.fence_id);
+                work->hdr.ring_idx, renderer_fence_id);
         } else {
             /* virgl_renderer_create_fence() does not switch contexts; it
              * expects ctx0 to already be current before calling glFenceSync().
              */
             virgl_renderer_force_ctx_0();
-            ret = virgl_renderer_create_fence(
-                (int) (uint32_t) work->hdr.fence_id, 0);
+            ret = virgl_renderer_create_fence((int) renderer_fence_id, 0);
         }
 
         if (!ret) {
@@ -432,13 +719,15 @@ static void vgpu_virgl_complete_ctrl_work(
             return;
         }
 
-        vgpu_virgl_note_fence_completed();
+        vgpu_virgl_cancel_pending_fence(context_fence, fence_ctx_id,
+                                        fence_ring_idx, renderer_fence_id);
         free(response);
         response = NULL;
         response_size = 0;
         response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
     }
 
+complete:
     struct vgpu_renderer_completion completion = {
         .type = VGPU_RENDERER_DONE_CTRL,
         .token = request->token,

@@ -20,6 +20,9 @@ static uint64_t completion_tail;
 static void (*wake_frontend_cb)(void);
 static void (*wake_backend_cb)(void);
 static uint32_t active_generation;
+static bool queue_resetting;
+static uint32_t active_producers;
+static uint32_t active_consumers;
 
 static uint64_t debug_requests_submitted;
 static uint64_t debug_requests_dropped;
@@ -83,6 +86,59 @@ static void vgpu_renderer_clear_ready(uint8_t ready[VGPU_RENDERER_QUEUE_SIZE])
         __atomic_store_n(&ready[i], 0, __ATOMIC_RELEASE);
 }
 
+/* Reset drains and releases both rings from the emulator thread, so it must
+ * temporarily exclude regular producers and the GL/backend consumers.
+ */
+static bool vgpu_renderer_enter_producer(void)
+{
+    for (;;) {
+        if (__atomic_load_n(&queue_resetting, __ATOMIC_ACQUIRE))
+            return false;
+
+        __atomic_add_fetch(&active_producers, 1, __ATOMIC_ACQ_REL);
+        if (!__atomic_load_n(&queue_resetting, __ATOMIC_ACQUIRE))
+            return true;
+
+        __atomic_sub_fetch(&active_producers, 1, __ATOMIC_ACQ_REL);
+    }
+}
+
+static void vgpu_renderer_exit_producer(void)
+{
+    __atomic_sub_fetch(&active_producers, 1, __ATOMIC_ACQ_REL);
+}
+
+static void vgpu_renderer_wait_for_producers(void)
+{
+    while (__atomic_load_n(&active_producers, __ATOMIC_ACQUIRE))
+        ;
+}
+
+static bool vgpu_renderer_enter_consumer(void)
+{
+    for (;;) {
+        if (__atomic_load_n(&queue_resetting, __ATOMIC_ACQUIRE))
+            return false;
+
+        __atomic_add_fetch(&active_consumers, 1, __ATOMIC_ACQ_REL);
+        if (!__atomic_load_n(&queue_resetting, __ATOMIC_ACQUIRE))
+            return true;
+
+        __atomic_sub_fetch(&active_consumers, 1, __ATOMIC_ACQ_REL);
+    }
+}
+
+static void vgpu_renderer_exit_consumer(void)
+{
+    __atomic_sub_fetch(&active_consumers, 1, __ATOMIC_ACQ_REL);
+}
+
+static void vgpu_renderer_wait_for_consumers(void)
+{
+    while (__atomic_load_n(&active_consumers, __ATOMIC_ACQUIRE))
+        ;
+}
+
 static void vgpu_renderer_release_queued_requests(void)
 {
     uint64_t tail = __atomic_load_n(&request_tail, __ATOMIC_RELAXED);
@@ -135,23 +191,32 @@ bool vgpu_renderer_submit(const struct vgpu_renderer_request *request)
         return false;
     }
 
+    if (!vgpu_renderer_enter_producer()) {
+        __atomic_add_fetch(&debug_requests_dropped, 1, __ATOMIC_RELAXED);
+        return false;
+    }
+
+    bool submitted = false;
     uint64_t seq;
     if (!vgpu_renderer_claim_queue_slot(&request_head, &request_tail, &seq)) {
         __atomic_add_fetch(&debug_requests_dropped, 1, __ATOMIC_RELAXED);
-        return false;
+        goto out;
     }
 
     uint32_t index = vgpu_renderer_queue_index(seq);
     request_queue[index] = *request;
     __atomic_store_n(&request_ready[index], 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&debug_requests_submitted, 1, __ATOMIC_RELAXED);
+    submitted = true;
 
     void (*wake_frontend)(void) =
         __atomic_load_n(&wake_frontend_cb, __ATOMIC_ACQUIRE);
     if (wake_frontend)
         wake_frontend();
 
-    return true;
+out:
+    vgpu_renderer_exit_producer();
+    return submitted;
 }
 
 bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request)
@@ -159,20 +224,28 @@ bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request)
     if (!request)
         return false;
 
+    if (!vgpu_renderer_enter_consumer())
+        return false;
+
+    bool popped = false;
     uint64_t tail = __atomic_load_n(&request_tail, __ATOMIC_RELAXED);
     uint64_t head = __atomic_load_n(&request_head, __ATOMIC_ACQUIRE);
     if (tail == head)
-        return false;
+        goto out;
 
     uint32_t index = vgpu_renderer_queue_index(tail);
     if (!__atomic_load_n(&request_ready[index], __ATOMIC_ACQUIRE))
-        return false;
+        goto out;
 
     *request = request_queue[index];
     __atomic_store_n(&request_ready[index], 0, __ATOMIC_RELEASE);
     __atomic_store_n(&request_tail, tail + 1U, __ATOMIC_RELEASE);
     __atomic_add_fetch(&debug_requests_popped, 1, __ATOMIC_RELAXED);
-    return true;
+    popped = true;
+
+out:
+    vgpu_renderer_exit_consumer();
+    return popped;
 }
 
 bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
@@ -182,30 +255,39 @@ bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
         return false;
     }
 
+    if (!vgpu_renderer_enter_producer()) {
+        __atomic_add_fetch(&debug_completions_dropped, 1, __ATOMIC_RELAXED);
+        return false;
+    }
+
+    bool submitted = false;
     uint32_t generation = __atomic_load_n(&active_generation, __ATOMIC_ACQUIRE);
     if (completion->token.generation != generation) {
         __atomic_add_fetch(&debug_completions_dropped, 1, __ATOMIC_RELAXED);
-        return false;
+        goto out;
     }
 
     uint64_t seq;
     if (!vgpu_renderer_claim_queue_slot(&completion_head, &completion_tail,
                                         &seq)) {
         __atomic_add_fetch(&debug_completions_dropped, 1, __ATOMIC_RELAXED);
-        return false;
+        goto out;
     }
 
     uint32_t index = vgpu_renderer_queue_index(seq);
     completion_queue[index] = *completion;
     __atomic_store_n(&completion_ready[index], 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&debug_completions_submitted, 1, __ATOMIC_RELAXED);
+    submitted = true;
 
     void (*wake_backend)(void) =
         __atomic_load_n(&wake_backend_cb, __ATOMIC_ACQUIRE);
     if (wake_backend)
         wake_backend();
 
-    return true;
+out:
+    vgpu_renderer_exit_producer();
+    return submitted;
 }
 
 bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion)
@@ -213,17 +295,21 @@ bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion)
     if (!completion)
         return false;
 
+    if (!vgpu_renderer_enter_consumer())
+        return false;
+
+    bool popped = false;
     uint32_t generation = __atomic_load_n(&active_generation, __ATOMIC_ACQUIRE);
 
     for (;;) {
         uint64_t tail = __atomic_load_n(&completion_tail, __ATOMIC_RELAXED);
         uint64_t head = __atomic_load_n(&completion_head, __ATOMIC_ACQUIRE);
         if (tail == head)
-            return false;
+            break;
 
         uint32_t index = vgpu_renderer_queue_index(tail);
         if (!__atomic_load_n(&completion_ready[index], __ATOMIC_ACQUIRE))
-            return false;
+            break;
 
         struct vgpu_renderer_completion out = completion_queue[index];
         __atomic_store_n(&completion_ready[index], 0, __ATOMIC_RELEASE);
@@ -231,15 +317,23 @@ bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion)
         if (out.token.generation == generation) {
             *completion = out;
             __atomic_add_fetch(&debug_completions_popped, 1, __ATOMIC_RELAXED);
-            return true;
+            popped = true;
+            break;
         }
         __atomic_add_fetch(&debug_completions_dropped, 1, __ATOMIC_RELAXED);
     }
+
+    vgpu_renderer_exit_consumer();
+    return popped;
 }
 
 void vgpu_renderer_reset_queues(uint32_t generation)
 {
     __atomic_add_fetch(&debug_queue_resets, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&queue_resetting, true, __ATOMIC_RELEASE);
+    vgpu_renderer_wait_for_producers();
+    vgpu_renderer_wait_for_consumers();
+
     vgpu_renderer_release_queued_requests();
     vgpu_renderer_release_queued_completions();
     __atomic_store_n(&active_generation, generation, __ATOMIC_RELEASE);
@@ -249,6 +343,7 @@ void vgpu_renderer_reset_queues(uint32_t generation)
     __atomic_store_n(&completion_tail, 0, __ATOMIC_RELEASE);
     vgpu_renderer_clear_ready(request_ready);
     vgpu_renderer_clear_ready(completion_ready);
+    __atomic_store_n(&queue_resetting, false, __ATOMIC_RELEASE);
 }
 
 void vgpu_renderer_debug_note_execute_begin(

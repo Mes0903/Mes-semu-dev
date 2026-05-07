@@ -20,6 +20,10 @@ static int released_payload_count;
 static void *last_released_payload;
 static int released_response_count;
 static void *last_released_response;
+static bool submit_during_reset_result;
+static bool complete_during_reset_result;
+static bool pop_request_during_reset_result;
+static bool pop_completion_during_reset_result;
 
 #define CONCURRENT_PRODUCERS 16U
 #define CONCURRENT_REQUESTS_PER_PRODUCER 24U
@@ -73,6 +77,42 @@ static void release_response(void *response)
 {
     released_response_count++;
     last_released_response = response;
+}
+
+static void release_payload_and_submit_during_reset(void *payload)
+{
+    released_payload_count++;
+    last_released_payload = payload;
+
+    struct vgpu_renderer_request nested = test_request(90);
+    submit_during_reset_result = vgpu_renderer_submit(&nested);
+}
+
+static void release_response_and_complete_during_reset(void *response)
+{
+    released_response_count++;
+    last_released_response = response;
+
+    struct vgpu_renderer_completion nested = test_completion(91, 1);
+    complete_during_reset_result = vgpu_renderer_complete(&nested);
+}
+
+static void release_payload_and_pop_during_reset(void *payload)
+{
+    released_payload_count++;
+    last_released_payload = payload;
+
+    struct vgpu_renderer_request out;
+    pop_request_during_reset_result = vgpu_renderer_pop_request(&out);
+}
+
+static void release_response_and_pop_during_reset(void *response)
+{
+    released_response_count++;
+    last_released_response = response;
+
+    struct vgpu_renderer_completion out;
+    pop_completion_during_reset_result = vgpu_renderer_pop_completion(&out);
 }
 
 static void *submit_worker_main(void *arg)
@@ -222,6 +262,7 @@ static int test_request_queue_accepts_full_virtqueue_burst(void)
 static int test_concurrent_request_submitters_do_not_lose_requests(void)
 {
     vgpu_renderer_reset_queues(1);
+    vgpu_renderer_set_wake_frontend(NULL);
 
     pthread_t threads[CONCURRENT_PRODUCERS];
     struct submit_worker workers[CONCURRENT_PRODUCERS];
@@ -266,6 +307,7 @@ static int test_concurrent_request_submitters_do_not_lose_requests(void)
 static int test_concurrent_completion_submitters_do_not_lose_completions(void)
 {
     vgpu_renderer_reset_queues(1);
+    vgpu_renderer_set_wake_backend(NULL);
 
     pthread_t threads[CONCURRENT_PRODUCERS];
     struct submit_worker workers[CONCURRENT_PRODUCERS];
@@ -366,6 +408,84 @@ static int test_reset_releases_queued_completion_responses(void)
     return 0;
 }
 
+static int test_reset_rejects_request_submitters_until_queue_is_cleared(void)
+{
+    vgpu_renderer_reset_queues(1);
+    submit_during_reset_result = true;
+
+    struct vgpu_renderer_request request = test_request(42);
+    request.release_payload = release_payload_and_submit_during_reset;
+    CHECK(vgpu_renderer_submit(&request));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_payload_count >= 1);
+    CHECK(!submit_during_reset_result);
+
+    struct vgpu_renderer_request out;
+    CHECK(!vgpu_renderer_pop_request(&out));
+    return 0;
+}
+
+static int test_reset_rejects_completion_submitters_until_queue_is_cleared(void)
+{
+    vgpu_renderer_reset_queues(1);
+    complete_during_reset_result = true;
+
+    struct vgpu_renderer_completion completion = test_completion(43, 1);
+    completion.response = (void *) (uintptr_t) 0x43430000U;
+    completion.release_response = release_response_and_complete_during_reset;
+    CHECK(vgpu_renderer_complete(&completion));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_response_count >= 1);
+    CHECK(!complete_during_reset_result);
+
+    struct vgpu_renderer_completion out;
+    CHECK(!vgpu_renderer_pop_completion(&out));
+    return 0;
+}
+
+static int test_reset_rejects_request_consumers_until_queue_is_cleared(void)
+{
+    vgpu_renderer_reset_queues(1);
+    pop_request_during_reset_result = true;
+
+    struct vgpu_renderer_request request = test_request(44);
+    request.release_payload = release_payload_and_pop_during_reset;
+    CHECK(vgpu_renderer_submit(&request));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_payload_count >= 1);
+    CHECK(!pop_request_during_reset_result);
+
+    struct vgpu_renderer_request out;
+    CHECK(!vgpu_renderer_pop_request(&out));
+    return 0;
+}
+
+static int test_reset_rejects_completion_consumers_until_queue_is_cleared(void)
+{
+    vgpu_renderer_reset_queues(1);
+    pop_completion_during_reset_result = true;
+
+    struct vgpu_renderer_completion completion = test_completion(45, 1);
+    completion.response = (void *) (uintptr_t) 0x45450000U;
+    completion.release_response = release_response_and_pop_during_reset;
+    CHECK(vgpu_renderer_complete(&completion));
+
+    vgpu_renderer_reset_queues(2);
+
+    CHECK(released_response_count >= 1);
+    CHECK(!pop_completion_during_reset_result);
+
+    struct vgpu_renderer_completion out;
+    CHECK(!vgpu_renderer_pop_completion(&out));
+    return 0;
+}
+
 static int test_debug_snapshot_tracks_queue_progress(void)
 {
     vgpu_renderer_reset_queues(50);
@@ -424,6 +544,12 @@ int main(void)
     CHECK(test_reset_generation_filters_stale_completions() == 0);
     CHECK(test_reset_releases_queued_request_payloads() == 0);
     CHECK(test_reset_releases_queued_completion_responses() == 0);
+    CHECK(test_reset_rejects_request_submitters_until_queue_is_cleared() == 0);
+    CHECK(test_reset_rejects_completion_submitters_until_queue_is_cleared() ==
+          0);
+    CHECK(test_reset_rejects_request_consumers_until_queue_is_cleared() == 0);
+    CHECK(test_reset_rejects_completion_consumers_until_queue_is_cleared() ==
+          0);
     CHECK(test_debug_snapshot_tracks_queue_progress() == 0);
     return 0;
 }

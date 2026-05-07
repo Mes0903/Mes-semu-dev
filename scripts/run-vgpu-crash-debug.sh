@@ -155,8 +155,9 @@ else
     echo "Writing VGPU progress samples to ${SEMU_VGPU_PROGRESS_LOG_FILE}"
 fi
 echo "Run the guest normally here. If semu segfaults, gdb will append a host backtrace."
-echo "VirGL test-tools note: Xorg usually starts as :0 during boot. Do not run startx;"
-echo "use '. /root/local-env.sh', then DISPLAY=:0 twm/xterm/glxgears on the existing server."
+echo "VirGL test-tools note: Xorg usually starts as :0 during boot."
+echo "For normal smoke, use '. /root/local-env.sh' and DISPLAY=:0 twm/xterm/glxgears."
+echo "Run startx only for a plan/manual gate that explicitly asks for startx stress."
 
 set +e
 GDB_BIN=""

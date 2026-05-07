@@ -1214,8 +1214,8 @@ bash -n scripts/run-vgpu-crash-debug.sh
 bash -n tests/vgpu-opengl-scope-test.sh
 bash -n tests/vgpu-no-gl-lock-test.sh
 make test-vgpu-opengl-scope test-vgpu-no-gl-lock test-vgpu-renderer \
-    test-vgpu-display test-vinput-event-coalesce test-vgpu-desc \
-    test-vgpu-chain test-vgpu-fence test-vgpu-virgl test-vgpu-virgl-gate \
+    test-vgpu-display test-vinput-event-coalesce test-vinput-focus-grab \
+    test-vgpu-desc test-vgpu-chain test-vgpu-fence test-vgpu-virgl test-vgpu-virgl-gate \
     test-vgpu-virgl-image test-vgpu-virgl-init-order \
     test-vgpu-virgl-backend-build
 make clean
@@ -1236,8 +1236,8 @@ bash -n scripts/run-vgpu-crash-debug.sh
 bash -n tests/vgpu-opengl-scope-test.sh
 bash -n tests/vgpu-no-gl-lock-test.sh
 make test-vgpu-opengl-scope test-vgpu-no-gl-lock test-vgpu-renderer \
-    test-vgpu-display test-vinput-event-coalesce test-vgpu-desc \
-    test-vgpu-chain test-vgpu-fence test-vgpu-virgl test-vgpu-virgl-gate \
+    test-vgpu-display test-vinput-event-coalesce test-vinput-focus-grab \
+    test-vgpu-desc test-vgpu-chain test-vgpu-fence test-vgpu-virgl test-vgpu-virgl-gate \
     test-vgpu-virgl-image test-vgpu-virgl-init-order \
     test-vgpu-virgl-backend-build
 make clean
