@@ -1644,6 +1644,30 @@ Without those counters, the symptom looked like "mouse motion becomes keyboard
 input", but there was no evidence showing whether semu sent a PageUp key,
 `REL_WHEEL`, or only normal `REL_Y` motion.
 
+### Root Cause
+
+The `20260507-171321` progress log showed:
+
+- `input-host sdl_wheel=0/0`
+- `input-guest scroll_batches=0`
+- `input-guest rel_x/y/hwheel/wheel=.../0/0`
+- `input-guest pageup` increased, with `last_key=104`
+
+`104` is `SEMU_KEY_PAGEUP`, so this was not mouse wheel input. SDL delivered
+real PageUp keyboard events around the host Alt+Tab / focus transition, and
+semu forwarded them to the guest after the window was re-entered.
+
+### Fix
+
+On `SDL_WINDOWEVENT_FOCUS_LOST`, release any guest-visible pressed keyboard
+keys, reset SDL's keyboard state, disable keyboard forwarding, and leave
+forwarding disabled until the user explicitly clicks the semu window to re-enter
+mouse-grabbed guest input mode.
+
+The implementation keeps a small host-side pressed-key bitmap so the focus-loss
+path can synthesize releases for keys already visible to the guest. It also
+clears that bitmap on virtio-input keyboard reset.
+
 ### Instrumentation
 
 Extend the progress monitor with two input lines:

@@ -482,6 +482,10 @@ test-vgpu-virgl-backend-build:
 test-vinput-event-coalesce:
 	$(Q)bash tests/vinput-event-coalesce-test.sh
 
+.PHONY: test-vinput-focus-grab
+test-vinput-focus-grab:
+	$(Q)bash tests/vinput-focus-grab-test.sh
+
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
 	@printf 'SEMU_FEATURE_VIRGL=%s\n' '$(call has, VIRGL)'

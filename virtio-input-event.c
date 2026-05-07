@@ -9,6 +9,7 @@
 
 #define VINPUT_CMD_QUEUE_SIZE 1024U
 #define VINPUT_CMD_QUEUE_MASK (VINPUT_CMD_QUEUE_SIZE - 1U)
+#define VINPUT_KEY_STATE_SIZE 256U
 
 #define VINPUT_SDL_EVENT_WAIT_TIMEOUT_MS 1 /* ms */
 #define VINPUT_SDL_EVENT_BURST_LIMIT 64U
@@ -54,6 +55,8 @@ static int32_t vinput_debug_last_motion_dx;
 static int32_t vinput_debug_last_motion_dy;
 static int32_t vinput_debug_last_wheel_dx;
 static int32_t vinput_debug_last_wheel_dy;
+static bool vinput_guest_key_down[VINPUT_KEY_STATE_SIZE];
+static bool vinput_keyboard_forwarding_enabled = true;
 
 static uint32_t vinput_queue_depth(const struct vinput_cmd_queue *queue)
 {
@@ -244,6 +247,50 @@ static int vinput_sdl_scancode_to_linux_key(int sdl_scancode)
     return -1;
 }
 
+static void vinput_publish_keyboard_key(uint32_t key, uint32_t value)
+{
+    struct vinput_cmd event = {
+        .type = VINPUT_CMD_KEYBOARD_KEY,
+        .u.keyboard_key = {.key = key, .value = value},
+    };
+    vinput_push_cmd(VINPUT_KEYBOARD_ID, &event);
+}
+
+static void vinput_forward_keyboard_key(uint32_t key, uint32_t value)
+{
+    if (key < VINPUT_KEY_STATE_SIZE) {
+        bool pressed = value != 0;
+        if (vinput_guest_key_down[key] == pressed)
+            return;
+        vinput_guest_key_down[key] = pressed;
+    }
+
+    vinput_publish_keyboard_key(key, value);
+}
+
+static void vinput_release_pressed_keys(void)
+{
+    for (uint32_t key = 0; key < VINPUT_KEY_STATE_SIZE; key++) {
+        if (!vinput_guest_key_down[key])
+            continue;
+        vinput_guest_key_down[key] = false;
+        vinput_publish_keyboard_key(key, 0);
+    }
+}
+
+static void vinput_suspend_keyboard_until_regrab(void)
+{
+    /* Host Alt+Tab and desktop switchers can produce navigation key events
+     * while SDL focus is moving away from semu. Release keys already visible
+     * to the guest and ignore later SDL key events until the user explicitly
+     * clicks the semu window to re-enter guest-directed input mode.
+     */
+    vinput_release_pressed_keys();
+    vinput_keyboard_forwarding_enabled = false;
+    SDL_ResetKeyboard();
+    g_window.window_set_mouse_grab(false);
+}
+
 bool vinput_pop_cmd(int dev_id, struct vinput_cmd *event)
 {
     /* Consumer-side dequeue. Called from the emulator thread after poll()
@@ -356,6 +403,10 @@ void vinput_reset_host_events(int dev_id)
     struct vinput_cmd event;
     while (vinput_pop_cmd(dev_id, &event))
         ;
+    if (dev_id == VINPUT_KEYBOARD_ID) {
+        for (uint32_t key = 0; key < VINPUT_KEY_STATE_SIZE; key++)
+            vinput_guest_key_down[key] = false;
+    }
 
     /* Restore the wake-gate invariant: wake_pending true means a pipe byte is
      * in flight, or the consumer has not rearmed yet.
@@ -398,7 +449,7 @@ bool vinput_handle_events(void)
             return true;
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
-                g_window.window_set_mouse_grab(false);
+                vinput_suspend_keyboard_until_regrab();
             break;
         case SDL_KEYDOWN:
             __atomic_add_fetch(&vinput_debug_sdl_keydown, 1, __ATOMIC_RELAXED);
@@ -412,31 +463,24 @@ bool vinput_handle_events(void)
             /* EV_REP is advertised, so the guest kernel drives key repeat.
              * Drop host autorepeat events to avoid double repeat.
              */
-            if (e.key.repeat)
+            if (e.key.repeat || !vinput_keyboard_forwarding_enabled)
                 break;
             linux_key = vinput_sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0) {
-                struct vinput_cmd event = {
-                    .type = VINPUT_CMD_KEYBOARD_KEY,
-                    .u.keyboard_key = {.key = (uint32_t) linux_key, .value = 1},
-                };
-                vinput_push_cmd(VINPUT_KEYBOARD_ID, &event);
-            }
+            if (linux_key >= 0)
+                vinput_forward_keyboard_key((uint32_t) linux_key, 1);
             break;
         case SDL_KEYUP:
             __atomic_add_fetch(&vinput_debug_sdl_keyup, 1, __ATOMIC_RELAXED);
+            if (!vinput_keyboard_forwarding_enabled)
+                break;
             linux_key = vinput_sdl_scancode_to_linux_key(e.key.keysym.scancode);
-            if (linux_key >= 0) {
-                struct vinput_cmd event = {
-                    .type = VINPUT_CMD_KEYBOARD_KEY,
-                    .u.keyboard_key = {.key = (uint32_t) linux_key, .value = 0},
-                };
-                vinput_push_cmd(VINPUT_KEYBOARD_ID, &event);
-            }
+            if (linux_key >= 0)
+                vinput_forward_keyboard_key((uint32_t) linux_key, 0);
             break;
         case SDL_MOUSEBUTTONDOWN:
             __atomic_add_fetch(&vinput_debug_sdl_mouse_button_down, 1,
                                __ATOMIC_RELAXED);
+            vinput_keyboard_forwarding_enabled = true;
             g_window.window_set_mouse_grab(true);
             linux_key = vinput_sdl_button_to_linux_key(e.button.button);
             if (linux_key >= 0) {
