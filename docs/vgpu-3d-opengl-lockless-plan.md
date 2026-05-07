@@ -1206,6 +1206,25 @@ make ENABLE_VIRGL=1 semu
 git diff --check
 ```
 
+Final automated gate after Phase 12 also passed on 2026-05-07:
+
+```sh
+bash -n .ci/test-virgl.sh
+bash -n scripts/run-vgpu-crash-debug.sh
+bash -n tests/vgpu-opengl-scope-test.sh
+bash -n tests/vgpu-no-gl-lock-test.sh
+make test-vgpu-opengl-scope test-vgpu-no-gl-lock test-vgpu-renderer \
+    test-vgpu-display test-vinput-event-coalesce test-vgpu-desc \
+    test-vgpu-chain test-vgpu-fence test-vgpu-virgl test-vgpu-virgl-gate \
+    test-vgpu-virgl-image test-vgpu-virgl-init-order \
+    test-vgpu-virgl-backend-build
+make clean
+make semu
+make clean
+make ENABLE_VIRGL=1 semu
+git diff --check
+```
+
 Expected: all commands exit 0. The final `./semu` should be built with
 `ENABLE_VIRGL=1` for manual smoke testing.
 
@@ -1279,7 +1298,7 @@ before exiting cleanly. Current semu SBI reset handling stops the host process
 instead of warm-rebooting the guest in-place; the smoke script now accepts that
 clean reset exit and also accepts a future return to the login prompt.
 
-- [ ] **Step 4: Run interactive stress**
+- [x] **Step 4: Run interactive stress**
 
 Run:
 
@@ -1306,9 +1325,18 @@ Note: the VirGL test-tools image starts `Xorg :0` during boot. Do not run
 that is a separate multi-server stress path and was the source of the
 `Xorg.1.log` / `COPY_TRANSFER3D` errors seen during the first manual attempt.
 
-Status: not completed in this headless/Xvfb session. It still needs a real
-visible host display because Xvfb cannot reproduce interactive mouse capture,
-manual FPS comparison, or host window close behavior.
+Verified after the follow-up race fixes on a real visible host display:
+
+- single-Xorg `DISPLAY=:0` path with `twm`, `xterm`, and `glxgears` remained
+  responsive;
+- `startx` / twm-menu xterm path no longer reproduced the known
+  `COPY_TRANSFER3D` / `Illegal command buffer` errors;
+- two `glmark2` instances with aggressive mouse movement stayed live for about
+  ten minutes after the renderer MPSC queue fix.
+
+The earlier headless/Xvfb runs still cover automated VirGL plumbing, but the
+visible stress result above is the coverage for mouse capture, compositor, and
+real host display behavior.
 
 - [x] **Step 5: Update final docs**
 
@@ -1333,9 +1361,9 @@ documentation file but cannot be included in the Mes-semu commit.
 
 ## Phase 8: ctx0 Fence Current-context Regression
 
-Status: implemented in the working tree. The single-Xorg visible SDL retest
-passed with the manual `DISPLAY=:0 ...` commands. The separate `startx` /
-multi-Xorg path is tracked in Phase 9.
+Status: implemented, committed, and manually retested. The single-Xorg visible
+SDL retest passed with the manual `DISPLAY=:0 ...` commands. The separate
+`startx` / multi-Xorg path is tracked in Phase 9.
 
 ### Trigger
 
@@ -1440,9 +1468,10 @@ Expected: no `Failed to create fence sync object`, no `COPY_TRANSFER3D`, no
 
 ## Phase 9: startx Multi-Xorg Burst Queue Regression
 
-Status: implemented in the working tree. This fixed the pending-slot/resource
-ordering failure that appeared in automated `startx` testing, but a later
-visible twm-menu xterm test still exposed Phase 10.
+Status: implemented, committed, and manually retested. This fixed the
+pending-slot/resource ordering failure that appeared in automated `startx`
+testing. The later visible twm-menu xterm failure is tracked separately in
+Phase 10.
 
 ### Trigger
 
@@ -1530,8 +1559,9 @@ Expected: no `no free pending ctrl slot`, no `invalid resource id`, no
 
 ## Phase 10: VirGL Cached Current-context Regression
 
-Status: implemented in the working tree; real visible twm-menu xterm retest
-still pending.
+Status: implemented, committed, and manually retested. The visible `startx`
+twm-menu xterm path no longer reproduced the known `COPY_TRANSFER3D` /
+`Illegal command buffer` failure after this fix.
 
 ### Trigger
 
@@ -1608,8 +1638,10 @@ and the X session remains responsive.
 
 ## Phase 11: Input PageUp/Wheel Diagnostic Logging
 
-Status: diagnostic instrumentation implemented in the working tree; root-cause
-classification requires one more visible-window reproduction.
+Status: implemented, committed, and manually retested. The diagnostic
+instrumentation identified actual PageUp key forwarding after host Alt+Tab, and
+the focus-loss keyboard suppression fix stopped that visible `^[[5~`
+reproduction.
 
 ### Trigger
 
@@ -1703,10 +1735,19 @@ startx
 glmark2
 ```
 
-When `^[[5~` starts appearing, keep the system running for 5-10 seconds, then
-stop semu and inspect the saved `vgpu-progress.log`.
+Before the fix, when `^[[5~` started appearing, the saved
+`vgpu-progress.log` classified the issue as actual PageUp key forwarding rather
+than wheel or relative motion. After the fix, repeat the host Alt+Tab while
+grabbed, switch back to semu, click to re-enter guest input, and move the mouse
+over the focused `xterm`.
 
-Expected classification:
+Expected after the fix:
+
+- no new `^[[5~` stream appears in the focused `xterm`;
+- keyboard forwarding resumes only after an explicit click/regrab;
+- mouse motion continues to appear as relative motion, not PageUp keys.
+
+Diagnostic interpretation if this regresses:
 
 - If `input-host sdl_wheel` rises together with `input-guest scroll_batches` or
   `rel_wheel`, the host frontend is receiving wheel input and forwarding it as
@@ -1719,8 +1760,9 @@ Expected classification:
 
 ## Phase 12: Renderer MPSC Queue Lost Poll Fix
 
-Status: implemented in the working tree; needs a manual long-running visible
-stress pass to confirm the original freeze is gone.
+Status: implemented, committed, and manually retested. A visible run with two
+`glmark2` instances and aggressive mouse movement stayed responsive for about
+ten minutes, which covers the original freeze trigger.
 
 ### Trigger
 
