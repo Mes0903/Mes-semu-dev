@@ -281,7 +281,33 @@ void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets)
     if (!vgpu->priv)
         return;
 
-    PRIV(vgpu)->num_capsets = num_capsets;
+    __atomic_store_n(&PRIV(vgpu)->num_capsets, num_capsets, __ATOMIC_RELEASE);
+}
+
+void virtio_gpu_set_primary_scanout_will_change_hook(
+    virtio_gpu_state_t *vgpu,
+    virtio_gpu_primary_scanout_will_change_func hook,
+    void *opaque)
+{
+    if (!vgpu->priv)
+        return;
+
+    PRIV(vgpu)->primary_scanout_will_change = hook;
+    PRIV(vgpu)->primary_scanout_will_change_opaque = opaque;
+}
+
+void virtio_gpu_notify_primary_scanout_will_change(virtio_gpu_state_t *vgpu,
+                                                   uint32_t scanout_id)
+{
+    if (!vgpu->priv)
+        return;
+
+    virtio_gpu_primary_scanout_will_change_func hook =
+        PRIV(vgpu)->primary_scanout_will_change;
+    if (!hook)
+        return;
+
+    hook(vgpu, scanout_id, PRIV(vgpu)->primary_scanout_will_change_opaque);
 }
 
 bool virtio_gpu_cancel_ctrl_response(virtio_gpu_state_t *vgpu,
@@ -504,12 +530,21 @@ static void virtio_gpu_release_renderer_completion(
     completion->response = NULL;
 }
 
+static void virtio_gpu_apply_renderer_side_effect(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion)
+{
+    if (g_virtio_gpu_backend.apply_renderer_side_effect)
+        g_virtio_gpu_backend.apply_renderer_side_effect(vgpu, completion);
+}
+
 static void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
 {
     struct vgpu_renderer_completion completion;
     while (vgpu_renderer_pop_completion(&completion)) {
         switch (completion.type) {
         case VGPU_RENDERER_DONE_CTRL:
+            virtio_gpu_apply_renderer_side_effect(vgpu, &completion);
             if (completion.token.id) {
                 virtio_gpu_complete_ctrl_response_token(
                     vgpu, completion.token.generation, completion.token.id,
@@ -521,6 +556,10 @@ static void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
                     completion.context_fence, completion.ctx_id,
                     completion.ring_idx);
             }
+            virtio_gpu_release_renderer_completion(&completion);
+            break;
+        case VGPU_RENDERER_DONE_VIRGL_RESOURCE:
+            virtio_gpu_apply_renderer_side_effect(vgpu, &completion);
             virtio_gpu_release_renderer_completion(&completion);
             break;
         case VGPU_RENDERER_DONE_FENCE:
@@ -1296,7 +1335,8 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
             return true;
         }
         case offsetof(struct virtio_gpu_config, num_capsets): {
-            *value = PRIV(vgpu)->num_capsets;
+            *value =
+                __atomic_load_n(&PRIV(vgpu)->num_capsets, __ATOMIC_ACQUIRE);
             return true;
         }
         default:

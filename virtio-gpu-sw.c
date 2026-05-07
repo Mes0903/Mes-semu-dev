@@ -594,6 +594,7 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
             continue;
 
         if (scanout->primary_resource_id == request->resource_id) {
+            virtio_gpu_notify_primary_scanout_will_change(vgpu, i);
             scanout->primary_resource_id = 0;
             scanout->src_x = scanout->src_y = 0;
             scanout->src_w = scanout->src_h = 0;
@@ -648,6 +649,8 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
      * 'virtgpu_object.c' for details.
      */
     if (request->resource_id == 0) {
+        virtio_gpu_notify_primary_scanout_will_change(vgpu,
+                                                      request->scanout_id);
         scanout->primary_resource_id = 0;
         scanout->src_x = scanout->src_y = 0;
         scanout->src_w = scanout->src_h = 0;
@@ -699,6 +702,7 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
     }
 
     /* Bind scanout with resource and record the source rectangle */
+    virtio_gpu_notify_primary_scanout_will_change(vgpu, request->scanout_id);
     scanout->primary_resource_id = res_2d->resource_id;
     scanout->src_x = request->r.x;
     scanout->src_y = request->r.y;

@@ -20,8 +20,26 @@ enum vgpu_renderer_request_type {
 
 enum vgpu_renderer_completion_type {
     VGPU_RENDERER_DONE_CTRL = 0,
+    VGPU_RENDERER_DONE_VIRGL_RESOURCE,
     VGPU_RENDERER_DONE_FENCE,
     VGPU_RENDERER_DONE_FATAL,
+};
+
+enum vgpu_virgl_resource_side_effect_type {
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE = 0,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF_ROLLBACK,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_ATTACH_BACKING,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_DETACH_BACKING,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT_ROLLBACK,
+};
+
+struct vgpu_virgl_scanout_side_effect {
+    uint32_t scanout_id;
+    uint32_t scanout_generation;
+    struct virtio_gpu_scanout_info scanout;
 };
 
 struct vgpu_renderer_token {
@@ -45,6 +63,17 @@ struct vgpu_renderer_completion {
     void *response;
     size_t response_size;
     void (*release_response)(void *response);
+    struct {
+        enum vgpu_virgl_resource_side_effect_type type;
+        uint32_t resource_id;
+        uint64_t resource_generation;
+        bool backing_transition_success;
+        uint32_t scanout_id;
+        uint32_t scanout_generation;
+        struct virtio_gpu_rect rect;
+        struct vgpu_virgl_scanout_side_effect scanouts[VIRTIO_GPU_MAX_SCANOUTS];
+        uint32_t scanout_count;
+    } virgl_resource;
     bool context_fence;
     uint32_t ctx_id;
     uint32_t ring_idx;

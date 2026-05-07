@@ -1,5 +1,7 @@
 #include "vgpu-renderer.h"
 
+#include <sched.h>
+
 /* The ring keeps one slot empty to distinguish full from empty. Make it larger
  * than the guest virtqueue so one full control-queue burst can be deferred.
  */
@@ -111,7 +113,7 @@ static void vgpu_renderer_exit_producer(void)
 static void vgpu_renderer_wait_for_producers(void)
 {
     while (__atomic_load_n(&active_producers, __ATOMIC_ACQUIRE))
-        ;
+        sched_yield();
 }
 
 static bool vgpu_renderer_enter_consumer(void)
@@ -136,7 +138,7 @@ static void vgpu_renderer_exit_consumer(void)
 static void vgpu_renderer_wait_for_consumers(void)
 {
     while (__atomic_load_n(&active_consumers, __ATOMIC_ACQUIRE))
-        ;
+        sched_yield();
 }
 
 static void vgpu_renderer_release_queued_requests(void)
@@ -234,6 +236,10 @@ bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request)
         goto out;
 
     uint32_t index = vgpu_renderer_queue_index(tail);
+    /* Preserve FIFO ordering: a later ready slot cannot be consumed before this
+     * tail slot publishes, so producer preemption can briefly stall dequeue
+     * progress without risking lost work.
+     */
     if (!__atomic_load_n(&request_ready[index], __ATOMIC_ACQUIRE))
         goto out;
 

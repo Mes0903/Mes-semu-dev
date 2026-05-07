@@ -411,7 +411,7 @@ test-vgpu-display: $(VGPU_DISPLAY_TEST)
 $(VGPU_DISPLAY_TEST): tests/vgpu-display-test.c vgpu-display.c vgpu-display.h virtio-gpu.h
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -O2 -g -Wall -Wextra -include common.h \
-	    -DSEMU_FEATURE_VIRTIOGPU=1 -o $@ $< vgpu-display.c
+	    -DSEMU_FEATURE_VIRTIOGPU=1 -pthread -o $@ $< vgpu-display.c
 
 .PHONY: test-vgpu-virgl
 test-vgpu-virgl: $(VGPU_VIRGL_TEST)

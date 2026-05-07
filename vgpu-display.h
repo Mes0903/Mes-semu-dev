@@ -67,6 +67,8 @@ struct vgpu_display_cmd {
     enum vgpu_display_cmd_type type;
     uint32_t scanout_id;
     uint32_t generation;
+    const uint32_t *guard_generation;
+    uint32_t guard_expected;
     union {
         struct {
             struct vgpu_display_payload *payload;
@@ -111,6 +113,11 @@ bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd);
 void vgpu_display_set_unavailable(void);
 bool vgpu_display_can_publish(void);
 void vgpu_display_debug_snapshot(struct vgpu_display_debug_stats *stats);
+bool vgpu_display_publish_primary_set_guarded(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload,
+    const uint32_t *guard_generation,
+    uint32_t guard_expected);
 void vgpu_display_publish_primary_set(uint32_t scanout_id,
                                       struct vgpu_display_payload *payload);
 void vgpu_display_publish_cursor_set(uint32_t scanout_id,

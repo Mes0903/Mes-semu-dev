@@ -28,6 +28,9 @@ struct vgpu_virgl_debug_stats {
 
 void vgpu_virgl_execute_renderer_request(
     const struct vgpu_renderer_request *request);
+void vgpu_virgl_apply_renderer_side_effect(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion);
 void vgpu_virgl_debug_snapshot(struct vgpu_virgl_debug_stats *stats);
 
 virgl_renderer_gl_context vgpu_window_virgl_create_context(

@@ -1,3 +1,5 @@
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,14 @@
             return 1;                                                        \
         }                                                                    \
     } while (0)
+
+#define PRODUCER_THREADS 4
+#define MOVES_PER_PRODUCER 8
+
+struct producer_arg {
+    pthread_barrier_t *barrier;
+    int producer_id;
+};
 
 static struct vgpu_display_payload *test_payload(void)
 {
@@ -127,11 +137,59 @@ static int test_debug_snapshot_tracks_display_queue_progress(void)
     return 0;
 }
 
+static void *publish_cursor_moves(void *opaque)
+{
+    struct producer_arg *arg = opaque;
+
+    pthread_barrier_wait(arg->barrier);
+    for (int32_t i = 0; i < MOVES_PER_PRODUCER; i++)
+        vgpu_display_publish_cursor_move(
+            0, arg->producer_id * MOVES_PER_PRODUCER + i, i);
+
+    return NULL;
+}
+
+static int test_display_queue_accepts_multiple_producers(void)
+{
+    pthread_t threads[PRODUCER_THREADS];
+    struct producer_arg args[PRODUCER_THREADS];
+    pthread_barrier_t barrier;
+    bool seen[PRODUCER_THREADS * MOVES_PER_PRODUCER] = {0};
+
+    CHECK(pthread_barrier_init(&barrier, NULL, PRODUCER_THREADS) == 0);
+    for (int i = 0; i < PRODUCER_THREADS; i++) {
+        args[i] = (struct producer_arg) {
+            .barrier = &barrier,
+            .producer_id = i,
+        };
+        CHECK(pthread_create(&threads[i], NULL, publish_cursor_moves,
+                             &args[i]) == 0);
+    }
+    for (int i = 0; i < PRODUCER_THREADS; i++)
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    pthread_barrier_destroy(&barrier);
+
+    struct vgpu_display_cmd cmd;
+    for (int i = 0; i < PRODUCER_THREADS * MOVES_PER_PRODUCER; i++) {
+        CHECK(vgpu_display_pop_cmd(&cmd));
+        CHECK(cmd.type == VGPU_DISPLAY_CMD_CURSOR_MOVE);
+        CHECK(cmd.u.cursor_move.x >= 0);
+        CHECK(cmd.u.cursor_move.x < PRODUCER_THREADS * MOVES_PER_PRODUCER);
+        CHECK(!seen[cmd.u.cursor_move.x]);
+        seen[cmd.u.cursor_move.x] = true;
+        vgpu_display_release_cmd(&cmd);
+    }
+
+    CHECK(!vgpu_display_pop_cmd(&cmd));
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_cursor_moves_are_queued_in_order() == 0);
     CHECK(test_cursor_set_keeps_chronological_order_after_move() == 0);
     CHECK(test_cursor_moves_before_set_keep_fifo_order() == 0);
     CHECK(test_debug_snapshot_tracks_display_queue_progress() == 0);
+    CHECK(test_display_queue_accepts_multiple_producers() == 0);
     return 0;
 }

@@ -27,16 +27,17 @@ static struct vgpu_display_plane_clear_state
     vgpu_display_cursor_clear[VIRTIO_GPU_MAX_SCANOUTS];
 static uint32_t vgpu_display_scanout_count = 1U;
 
-/* The SPSC queue carries lossy frame/move commands. It's process-wide and
- * currently assumes one 'virtio-gpu' producer. The GPU backend is the only
- * producer and the window backend is the only consumer. Commands entering this
- * bridge carry 'scanout_id' values already validated by the guest-facing
- * backend; the SDL consumer relies on that internal contract.
+/* The MPSC queue carries lossy frame/move commands. Software rendering can
+ * publish from the emulator thread while VirGL can publish from the GL owner,
+ * and the window backend is the single consumer. Commands entering this bridge
+ * carry 'scanout_id' values already validated by the guest-facing backend; the
+ * SDL consumer relies on that internal contract.
  */
 static struct vgpu_display_cmd
     vgpu_display_cmd_queue[VGPU_DISPLAY_CMD_QUEUE_SIZE];
-static uint32_t vgpu_display_cmd_head;
-static uint32_t vgpu_display_cmd_tail;
+static uint8_t vgpu_display_cmd_ready[VGPU_DISPLAY_CMD_QUEUE_SIZE];
+static uint64_t vgpu_display_cmd_head;
+static uint64_t vgpu_display_cmd_tail;
 
 static bool vgpu_display_unavailable;
 
@@ -50,13 +51,23 @@ static uint64_t debug_cmds_dropped;
 static uint64_t debug_cmds_popped;
 static uint64_t debug_stale_cmds_dropped;
 
-static uint32_t vgpu_display_queue_depth(uint32_t head, uint32_t tail)
+static uint32_t vgpu_display_queue_depth(uint64_t head, uint64_t tail)
 {
-    return (head - tail) & VGPU_DISPLAY_CMD_QUEUE_MASK;
+    if (head < tail)
+        return 0;
+
+    uint64_t depth = head - tail;
+    return depth > VGPU_DISPLAY_CMD_QUEUE_SIZE ? VGPU_DISPLAY_CMD_QUEUE_SIZE
+                                               : (uint32_t) depth;
 }
 
 static bool vgpu_display_is_cmd_stale(const struct vgpu_display_cmd *cmd)
 {
+    if (cmd->guard_generation &&
+        __atomic_load_n(cmd->guard_generation, __ATOMIC_ACQUIRE) !=
+            cmd->guard_expected)
+        return true;
+
     switch (cmd->type) {
     case VGPU_DISPLAY_CMD_PRIMARY_SET:
         return cmd->generation !=
@@ -135,46 +146,68 @@ void vgpu_display_publish_cursor_clear(uint32_t scanout_id)
 
 static bool vgpu_display_is_cmd_queue_full(void)
 {
-    uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_RELAXED);
-    uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
-    uint32_t next = (head + 1U) & VGPU_DISPLAY_CMD_QUEUE_MASK;
-    return next == tail;
+    uint64_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
+    uint64_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
+    return head >= tail && head - tail >= VGPU_DISPLAY_CMD_QUEUE_SIZE - 1U;
+}
+
+static bool vgpu_display_claim_queue_slot(uint64_t *seq)
+{
+    for (;;) {
+        uint64_t head =
+            __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
+        uint64_t tail =
+            __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
+        if (tail > head)
+            continue;
+        if (head - tail >= VGPU_DISPLAY_CMD_QUEUE_SIZE - 1U)
+            return false;
+
+        uint64_t next = head + 1U;
+        if (__atomic_compare_exchange_n(&vgpu_display_cmd_head, &head, next,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            *seq = head;
+            return true;
+        }
+    }
 }
 
 static bool vgpu_display_push_cmd(struct vgpu_display_cmd *cmd)
 {
-    uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_RELAXED);
-    uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
-    uint32_t next = (head + 1U) & VGPU_DISPLAY_CMD_QUEUE_MASK;
-
     /* Keep the producer non-blocking. If the window backend falls behind,
      * prefer dropping lossy display updates over stalling guest/device
      * execution on the emulator thread. Clear commands do not use this queue.
      */
-    if (next == tail) {
+    uint64_t seq;
+    if (!vgpu_display_claim_queue_slot(&seq)) {
         __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         vgpu_display_release_cmd(cmd);
         return false;
     }
 
-    vgpu_display_cmd_queue[head] = *cmd;
-    __atomic_store_n(&vgpu_display_cmd_head, next, __ATOMIC_RELEASE);
+    uint32_t index = (uint32_t) seq & VGPU_DISPLAY_CMD_QUEUE_MASK;
+    vgpu_display_cmd_queue[index] = *cmd;
+    __atomic_store_n(&vgpu_display_cmd_ready[index], 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&debug_cmds_queued, 1, __ATOMIC_RELAXED);
     return true;
 }
 
 static bool vgpu_display_pop_queued_cmd(struct vgpu_display_cmd *cmd)
 {
-    uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_RELAXED);
-    uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
+    uint64_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_RELAXED);
+    uint64_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
 
     if (tail == head)
         return false;
 
-    *cmd = vgpu_display_cmd_queue[tail];
-    __atomic_store_n(&vgpu_display_cmd_tail,
-                     (tail + 1U) & VGPU_DISPLAY_CMD_QUEUE_MASK,
-                     __ATOMIC_RELEASE);
+    uint32_t index = (uint32_t) tail & VGPU_DISPLAY_CMD_QUEUE_MASK;
+    if (!__atomic_load_n(&vgpu_display_cmd_ready[index], __ATOMIC_ACQUIRE))
+        return false;
+
+    *cmd = vgpu_display_cmd_queue[index];
+    __atomic_store_n(&vgpu_display_cmd_ready[index], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&vgpu_display_cmd_tail, tail + 1U, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -252,14 +285,14 @@ void vgpu_display_debug_snapshot(struct vgpu_display_debug_stats *stats)
     if (!stats)
         return;
 
-    uint32_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
-    uint32_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
+    uint64_t head = __atomic_load_n(&vgpu_display_cmd_head, __ATOMIC_ACQUIRE);
+    uint64_t tail = __atomic_load_n(&vgpu_display_cmd_tail, __ATOMIC_ACQUIRE);
 
     *stats = (struct vgpu_display_debug_stats) {
         .scanout_count =
             __atomic_load_n(&vgpu_display_scanout_count, __ATOMIC_ACQUIRE),
-        .queue_head = head,
-        .queue_tail = tail,
+        .queue_head = (uint32_t) head,
+        .queue_tail = (uint32_t) tail,
         .queue_depth = vgpu_display_queue_depth(head, tail),
         .unavailable =
             __atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE),
@@ -281,14 +314,17 @@ void vgpu_display_debug_snapshot(struct vgpu_display_debug_stats *stats)
     };
 }
 
-void vgpu_display_publish_primary_set(uint32_t scanout_id,
-                                      struct vgpu_display_payload *payload)
+bool vgpu_display_publish_primary_set_guarded(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload,
+    const uint32_t *guard_generation,
+    uint32_t guard_expected)
 {
     __atomic_add_fetch(&debug_primary_sets_published, 1, __ATOMIC_RELAXED);
     if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE)) {
         __atomic_add_fetch(&debug_cmds_dropped, 1, __ATOMIC_RELAXED);
         free(payload);
-        return;
+        return false;
     }
 
     struct vgpu_display_cmd cmd = {
@@ -297,9 +333,24 @@ void vgpu_display_publish_primary_set(uint32_t scanout_id,
         .generation =
             __atomic_load_n(&vgpu_display_primary_clear[scanout_id].generation,
                             __ATOMIC_ACQUIRE),
+        .guard_generation = guard_generation,
+        .guard_expected = guard_expected,
         .u.primary_set = {.payload = payload},
     };
-    vgpu_display_push_cmd(&cmd);
+    if (vgpu_display_is_cmd_stale(&cmd)) {
+        __atomic_add_fetch(&debug_stale_cmds_dropped, 1, __ATOMIC_RELAXED);
+        vgpu_display_release_cmd(&cmd);
+        return false;
+    }
+
+    return vgpu_display_push_cmd(&cmd);
+}
+
+void vgpu_display_publish_primary_set(uint32_t scanout_id,
+                                      struct vgpu_display_payload *payload)
+{
+    (void) vgpu_display_publish_primary_set_guarded(scanout_id, payload, NULL,
+                                                    0);
 }
 
 void vgpu_display_publish_cursor_set(uint32_t scanout_id,

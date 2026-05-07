@@ -79,10 +79,19 @@ struct virtio_gpu_dispatch_state {
     uint16_t buffer_idx;
 };
 
+struct vgpu_renderer_completion;
+
+typedef void (*virtio_gpu_primary_scanout_will_change_func)(
+    virtio_gpu_state_t *vgpu,
+    uint32_t scanout_id,
+    void *opaque);
+
 typedef struct {
     struct virtio_gpu_scanout_info scanouts[VIRTIO_GPU_MAX_SCANOUTS];
     struct virtio_gpu_pending_ctrl pending_ctrls[VIRTIO_GPU_PENDING_CTRLS_MAX];
     struct virtio_gpu_dispatch_state dispatch;
+    virtio_gpu_primary_scanout_will_change_func primary_scanout_will_change;
+    void *primary_scanout_will_change_opaque;
     uint32_t ctrl_generation;
     uint32_t num_scanouts;
     uint32_t num_capsets;
@@ -372,6 +381,9 @@ struct virtio_gpu_cmd_backend {
     void (*init)(virtio_gpu_state_t *vgpu);
     void (*poll)(virtio_gpu_state_t *vgpu);
     void (*reset)(virtio_gpu_state_t *vgpu);
+    void (*apply_renderer_side_effect)(
+        virtio_gpu_state_t *vgpu,
+        const struct vgpu_renderer_completion *completion);
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
     virtio_gpu_cmd_func resource_create_2d;
@@ -458,6 +470,12 @@ bool virtio_gpu_cancel_ctrl_response_token(virtio_gpu_state_t *vgpu,
                                            uint32_t token_id);
 uint32_t virtio_gpu_ctrl_generation(virtio_gpu_state_t *vgpu);
 void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
+void virtio_gpu_set_primary_scanout_will_change_hook(
+    virtio_gpu_state_t *vgpu,
+    virtio_gpu_primary_scanout_will_change_func hook,
+    void *opaque);
+void virtio_gpu_notify_primary_scanout_will_change(virtio_gpu_state_t *vgpu,
+                                                   uint32_t scanout_id);
 void virtio_gpu_complete_ctrl_response(virtio_gpu_state_t *vgpu,
                                        uint32_t generation,
                                        uint64_t fence_id,
