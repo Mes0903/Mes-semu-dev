@@ -3,6 +3,9 @@
 *.sw*
 semu
 
+# Local git worktrees
+.worktrees/
+
 # Linux-specific
 *.dtb
 Image
