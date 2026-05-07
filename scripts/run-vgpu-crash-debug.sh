@@ -47,6 +47,8 @@ ulimit -c unlimited 2>/dev/null || true
 
 echo "Writing crash capture to ${OUT_DIR}/gdb.log"
 echo "Run the guest normally here. If semu segfaults, gdb will append a host backtrace."
+echo "VirGL test-tools note: Xorg usually starts as :0 during boot. Do not run startx;"
+echo "use '. /root/local-env.sh', then DISPLAY=:0 twm/xterm/glxgears on the existing server."
 
 set +e
 GDB_BIN=""

@@ -28,7 +28,8 @@ The current `vgpu-3D` branch has a working first OpenGL/VirGL spike:
 - `ENABLE_VIRGL=1` advertises `VIRTIO_GPU_F_VIRGL`.
 - VirGL/VirGL2 capsets, context/resource/backing/transfer/submit/fence handlers
   exist.
-- The guest can run `startx` and `glxgears` with the VirGL renderer.
+- The guest can use the boot-started `Xorg :0` server and run `glxgears` with
+  the VirGL renderer.
 - The cursor format issue and the host Mesa/GLX crash under fast mouse movement
   have been fixed for the current threaded model.
 
@@ -1290,13 +1291,20 @@ Guest commands:
 
 ```sh
 root
-startx
+. /root/local-env.sh
+DISPLAY=:0 twm >/tmp/twm.log 2>&1 &
+DISPLAY=:0 xterm >/tmp/xterm.log 2>&1 &
 DISPLAY=:0 glxgears
 ```
 
 Move the mouse quickly for at least five minutes. Expected: no host segfault,
 no guest Xorg crash, cursor remains visible without black square artifacts, and
 window close exits cleanly.
+
+Note: the VirGL test-tools image starts `Xorg :0` during boot. Do not run
+`startx` for this manual gate because that starts a second X server on `:1`;
+that is a separate multi-server stress path and was the source of the
+`Xorg.1.log` / `COPY_TRANSFER3D` errors seen during the first manual attempt.
 
 Status: not completed in this headless/Xvfb session. It still needs a real
 visible host display because Xvfb cannot reproduce interactive mouse capture,

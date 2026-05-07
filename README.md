@@ -184,9 +184,20 @@ evidence before reproducing the issue:
 $ scripts/run-vgpu-crash-debug.sh
 ```
 
-Use the guest normally from that terminal (`root`, `startx`, `glxgears`, mouse
-movement). If the `semu` host process segfaults, the script leaves the serial
-console output and a host `gdb` backtrace under `vgpu-crash-logs/`.
+For the VirGL test-tools image, guest `Xorg :0` usually starts during boot. Do
+not run `startx` again; that starts a second X server on `:1` and is a different
+stress path. From the guest shell, attach clients to the existing server:
+
+```
+# . /root/local-env.sh
+# DISPLAY=:0 twm >/tmp/twm.log 2>&1 &
+# DISPLAY=:0 xterm >/tmp/xterm.log 2>&1 &
+# DISPLAY=:0 glxgears
+```
+
+Then move the mouse and drag the X window from the SDL display. If the `semu`
+host process segfaults, the script leaves the serial console output and a host
+`gdb` backtrace under `vgpu-crash-logs/`.
 
 ## Usage
 
