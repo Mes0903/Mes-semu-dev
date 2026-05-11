@@ -177,6 +177,18 @@ while the mouse is idle and while moving it quickly. `xvfb-run -a
 .ci/test-virgl.sh` is useful for automated GL plumbing checks, but the
 five-minute fast-mouse stress still needs a real visible host display.
 
+For an interactive demo without the automation wrapper or `gdb` capture, run:
+
+```shell
+$ scripts/run-virgl.sh
+```
+
+It rebuilds `./semu` with `ENABLE_VIRGL=1` if the current binary lacks it, then
+launches semu against the staged VirGL kernel and test-tools disk. The kernel
+is fetched from the [Mes0903/semu](https://github.com/Mes0903/semu) `blob`
+branch when missing locally; the test-tools disk has no upstream fallback, so
+rebuild it with `scripts/build-image.sh --virgl` if it is absent.
+
 For interactive VirGL crashes that make the whole VM exit, collect host-side
 evidence before reproducing the issue:
 
