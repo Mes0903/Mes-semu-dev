@@ -5,31 +5,16 @@ name: Publish prebuilt images
 # assets on a fixed-tag GitHub prerelease so the download URL stays stable
 # across rebuilds, keeping large binary artifacts out of the source tree.
 #
-# Triggers automatically on master pushes that touch any input listed
-# in the paths filter below, and can be invoked manually via
-# workflow_dispatch. The archive SHA1 sums and the input-fingerprint
-# hash are all read at make-time / CI-time from the prebuilt.sha1
-# manifest uploaded with the archives, so no source-tree edit is
-# needed on a republish.
+# Manual fallback for rebuilding and publishing the rolling prebuilt
+# release. The normal master path is owned by .github/workflows/main.yml:
+# CI builds guest artifacts once when the prebuilt inputs drift, tests
+# those artifacts, then publishes the same artifacts after the checks pass.
+# The archive SHA1 sums and the input-fingerprint hash are all read at
+# make-time / CI-time from the prebuilt.sha1 manifest uploaded with the
+# archives, so no source-tree edit is needed on a republish.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [master]
-    # Republish the prebuilt artifacts whenever any input that defines
-    # what gets baked into Image / rootfs.cpio actually changes. The list
-    # mirrors PREBUILT_INPUTS in mk/external.mk -- keep them in sync.
-    paths:
-      - 'configs/linux.config'
-      - 'configs/busybox.config'
-      - 'configs/buildroot.config'
-      - 'configs/x11.config'
-      - 'configs/riscv-cross-file'
-      - 'scripts/build-image.sh'
-      - 'scripts/rootfs_ext4.sh'
-      - 'target/**'
-      - '.ci/publish-prebuilt.sh'
-      - '.github/workflows/prebuilt.yml'
 
 permissions:
   contents: write
@@ -71,12 +56,15 @@ jobs:
 
       - name: Compress and checksum artifacts
         id: checksum
-        # The shell logic lives in .ci/publish-prebuilt.sh so it can be
+        # The shell logic lives in .ci/package-prebuilt.sh so it can be
         # exercised locally and stays out of the YAML.
         run: |
           set -euo pipefail
-          .ci/publish-prebuilt.sh >> "$GITHUB_OUTPUT"
+          .ci/package-prebuilt.sh >> "$GITHUB_OUTPUT"
           ls -la Image.bz2 rootfs.cpio.bz2 test-tools.img.bz2 prebuilt.sha1
+
+      - name: Verify packaged artifacts
+        run: .ci/verify-prebuilt-package.sh
 
       - name: Update prebuilt prerelease
         uses: softprops/action-gh-release@v2
@@ -95,8 +83,9 @@ jobs:
           body: |
             Rolling prerelease of the Linux kernel, Buildroot rootfs,
             and optional test tools disk consumed by `mk/external.mk`.
-            Re-published whenever any input that defines the prebuilt
-            content changes.
+            Manually re-published from the fallback prebuilt workflow.
+            The normal master path publishes from the tested CI-built
+            artifacts in `.github/workflows/main.yml`.
 
             All checksums (archive hashes plus the source-input
             fingerprint used for drift detection) are published in the
