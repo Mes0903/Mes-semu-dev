@@ -352,6 +352,8 @@ jobs:
     permissions:
       contents: write
     steps:
+    - name: checkout code
+      uses: actions/checkout@v4
     - name: download workflow-built external artifacts
       uses: actions/download-artifact@v4
       with:
