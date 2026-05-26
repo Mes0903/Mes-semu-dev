@@ -3,7 +3,7 @@
 # Source common functions and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
-source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/../common.sh"
 
 # Override timeout for netdev tests
 # Network tests need different timeout: 30s for Linux, 900s for macOS

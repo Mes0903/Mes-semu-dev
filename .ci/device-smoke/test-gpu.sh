@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "${SCRIPT_DIR}/common.sh"
+. "${SCRIPT_DIR}/../common.sh"
 
 # Override timeout and sleep duration for macOS - emulation is significantly slower
 case "${OS_TYPE}" in

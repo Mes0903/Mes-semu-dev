@@ -166,19 +166,19 @@ jobs:
       shell: bash
       timeout-minutes: 10
     - name: netdev test
-      run: sudo .ci/test-netdev.sh
+      run: sudo .ci/device-smoke/test-netdev.sh
       shell: bash
       timeout-minutes: 10
     - name: sound test
-      run: .ci/test-sound.sh
+      run: .ci/device-smoke/test-sound.sh
       shell: bash
       timeout-minutes: 5
     - name: virtio-input test
-      run: .ci/test-vinput.sh
+      run: .ci/device-smoke/test-vinput.sh
       shell: bash
       timeout-minutes: 5
     - name: virtio-gpu test
-      run: .ci/test-gpu.sh
+      run: .ci/device-smoke/test-gpu.sh
       shell: bash
       timeout-minutes: 10
 
@@ -284,7 +284,7 @@ jobs:
       run: |
             if sudo -n true 2>/dev/null; then
               echo "sudo available, running netdev test"
-              sudo .ci/test-netdev.sh
+              sudo .ci/device-smoke/test-netdev.sh
             else
               echo "Skipping netdev test: sudo not available in GitHub Actions runner"
               echo "vmnet.framework requires root privileges or com.apple.vm.networking entitlement"
@@ -293,15 +293,15 @@ jobs:
       timeout-minutes: 20
       if: ${{ success() }}
     - name: sound test
-      run: .ci/test-sound.sh
+      run: .ci/device-smoke/test-sound.sh
       shell: bash
       timeout-minutes: 20
     - name: virtio-input test
-      run: .ci/test-vinput.sh
+      run: .ci/device-smoke/test-vinput.sh
       shell: bash
       timeout-minutes: 20
     - name: virtio-gpu test
-      run: .ci/test-gpu.sh
+      run: .ci/device-smoke/test-gpu.sh
       shell: bash
       timeout-minutes: 20
 
@@ -337,7 +337,7 @@ jobs:
       if: github.event_name == 'pull_request'
       env:
         REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: .ci/suggest-format.sh
+      run: .ci/github/suggest-format.sh
       shell: bash
       timeout-minutes: 5
     - name: Check formatting (fail on violations)
