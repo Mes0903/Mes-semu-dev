@@ -56,15 +56,15 @@ jobs:
 
       - name: Compress and checksum artifacts
         id: checksum
-        # The shell logic lives in .ci/package-prebuilt.sh so it can be
+        # The shell logic lives in .ci/prebuilt/package.sh so it can be
         # exercised locally and stays out of the YAML.
         run: |
           set -euo pipefail
-          .ci/package-prebuilt.sh >> "$GITHUB_OUTPUT"
+          .ci/prebuilt/package.sh >> "$GITHUB_OUTPUT"
           ls -la Image.bz2 rootfs.cpio.bz2 test-tools.img.bz2 prebuilt.sha1
 
       - name: Verify packaged artifacts
-        run: .ci/verify-prebuilt-package.sh
+        run: .ci/prebuilt/verify-package.sh
 
       - name: Update prebuilt prerelease
         uses: softprops/action-gh-release@v2

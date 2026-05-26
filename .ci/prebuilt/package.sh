@@ -7,7 +7,7 @@
 #   Image
 #   rootfs.cpio
 #   test-tools.img
-#   plus the source inputs listed by .ci/prebuilt-inputs.sh
+#   plus the source inputs listed by .ci/prebuilt/inputs.sh
 #
 # Outputs (in cwd):
 #   Image.bz2
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-. "$SCRIPT_DIR/prebuilt-inputs.sh"
+. "$SCRIPT_DIR/inputs.sh"
 
 read -r -a SHA1 <<< "$(prebuilt_sha1_tool)"
 mapfile -t INPUTS < <(prebuilt_inputs)

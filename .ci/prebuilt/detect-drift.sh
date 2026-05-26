@@ -3,9 +3,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-. "$SCRIPT_DIR/prebuilt-inputs.sh"
+. "$SCRIPT_DIR/inputs.sh"
 
-PREBUILT_URL=${PREBUILT_URL:-https://github.com/sysprog21/semu/releases/download/prebuilt}
+: "${PREBUILT_URL:?Need PREBUILT_URL pointing at the prebuilt artifact directory}"
 manifest=prebuilt.sha1
 manifest_url="${PREBUILT_URL}/${manifest}"
 

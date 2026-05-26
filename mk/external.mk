@@ -83,12 +83,12 @@ $(foreach T,$(EXTERNAL_DATA),$(eval $(download)))
 # and the init stub). When any of those change locally the prebuilt may no
 # longer reflect the user's intent, so we compute the SHA1 of those
 # inputs and compare against the publisher's recorded inputs hash --
-# the line of prebuilt.sha1 written by .ci/package-prebuilt.sh under
+# the line of prebuilt.sha1 written by .ci/prebuilt/package.sh under
 # the virtual name 'inputs'.
 #
 # Mismatch -> warn but do not auto-rebuild: a buildroot run takes the
 # better part of an hour, so we let the user opt in via make build-image.
-# .ci/prebuilt-inputs.sh is the canonical source for this list. Keep the
+# .ci/prebuilt/inputs.sh is the canonical source for this list. Keep the
 # Make copy in sync because recipes need to expand the files directly.
 PREBUILT_INPUTS := \
     configs/linux.config \
