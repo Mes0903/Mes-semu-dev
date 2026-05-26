@@ -1,0 +1,13 @@
+name: Cache external guest artifacts
+description: Restore and save release-downloaded guest artifacts for no-drift CI jobs.
+runs:
+  using: composite
+  steps:
+    - name: cache external guest artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          Image
+          rootfs.cpio
+          test-tools.img
+        key: external-${{ hashFiles('mk/external.mk', 'configs/linux.config', 'configs/busybox.config', 'configs/buildroot.config', 'configs/x11.config', 'scripts/build-image.sh', 'scripts/rootfs_ext4.sh', 'target/**') }}

@@ -78,7 +78,7 @@ requests or non-master branch pushes, it first tries to restore a raw artifact
 cache keyed by the exact input fingerprint:
 
 ```text
-prebuilt-raw-v1-${runner.os}-${live_inputs_sha1}
+prebuilt-raw-v1-${live_inputs_sha1}
 ```
 
 That cache contains only raw artifacts:
@@ -101,10 +101,11 @@ runs `.ci/prebuilt/package.sh` to create:
 - `test-tools.img.bz2`
 - `prebuilt.sha1`
 
-The job uploads both raw and packaged files as the `guest-artifacts` workflow
-artifact. Downstream Linux, legacy initramfs, and macOS test jobs download that
-workflow artifact whenever `should_build=true`, so all test jobs exercise the
-same artifacts from the same workflow run.
+The job uploads raw files as the `guest-artifacts-raw` workflow artifact and
+packaged files as the `guest-artifacts-packaged` workflow artifact. Downstream
+Linux, legacy initramfs, and macOS test jobs download the raw artifact whenever
+`should_build=true`, so all test jobs exercise the same artifacts from the same
+workflow run. The publish job downloads only the packaged artifact.
 
 ## Publish Flow
 
@@ -118,8 +119,11 @@ true:
 
 The publish job does not build or repackage guest artifacts. It checks out the
 repository only to get `.ci/prebuilt/verify-package.sh`, downloads the tested
-`guest-artifacts` workflow artifact, verifies the package, and uploads the
-release files to the rolling `prebuilt` release.
+`guest-artifacts-packaged` workflow artifact, verifies the package, and uploads
+the release files to the rolling `prebuilt` release. Master push runs are not
+canceled while in progress, and the publish job uses the `prebuilt-release`
+concurrency group so a later push or manual fallback cannot interrupt an active
+release upload.
 
 This keeps the normal master path as:
 
@@ -136,7 +140,9 @@ This keeps the normal master path as:
 It builds guest artifacts, packages them with `.ci/prebuilt/package.sh`,
 verifies them with `.ci/prebuilt/verify-package.sh`, and uploads them to the
 rolling `prebuilt` release. This path is a maintainer override, not the normal
-tested publish path.
+tested publish path. It shares the `prebuilt-release` concurrency group with
+the normal master publish job so two workflows cannot update the rolling
+release at the same time.
 
 ## Responsibility Boundaries
 
@@ -170,7 +176,9 @@ These files are intentionally GitHub-specific:
 | `.github/workflows/main.yml` | GitHub CI trigger, job graph, caches, workflow artifacts, release publish gate, and `$GITHUB_OUTPUT` plumbing. |
 | `.github/workflows/prebuilt.yml` | GitHub manual fallback for rebuilding and publishing the rolling prebuilt release. |
 | `.github/actions/setup-semu/action.yml` | GitHub composite action that installs Linux/macOS test dependencies. |
+| `.github/actions/cache-external-artifacts/action.yml` | GitHub composite action that restores/saves no-drift external guest artifact downloads. |
 | `.ci/github/check-ci-shape.sh` | Validates the expected GitHub workflow adapter shape. |
+| `.ci/github/test-check-ci-shape.sh` | Regression test for the GitHub workflow shape checker. |
 | `.ci/github/suggest-format.sh` | Uses reviewdog's GitHub reporter to post pull request format suggestions. |
 
 If semu gains a GitLab or Gitea adapter, it should call the provider-neutral

@@ -14,6 +14,7 @@ remote=
 
 if ! curl --fail --silent --show-error --retry 3 --retry-delay 1 \
     -L -o "$manifest" "$manifest_url"; then
+    rm -f "$manifest"
     echo "prebuilt manifest is unavailable at $manifest_url; will rebuild from source" >&2
     echo "should_build=true"
     echo "live_inputs_sha1=$live"

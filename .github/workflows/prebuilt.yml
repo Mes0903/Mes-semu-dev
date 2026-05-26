@@ -9,6 +9,7 @@ name: Publish prebuilt images
 # release. The normal master path is owned by .github/workflows/main.yml:
 # CI builds guest artifacts once when the prebuilt inputs drift, tests
 # those artifacts, then publishes the same artifacts after the checks pass.
+#
 # The archive SHA1 sums and the input-fingerprint hash are all read at
 # make-time / CI-time from the prebuilt.sha1 manifest uploaded with the
 # archives, so no source-tree edit is needed on a republish.
@@ -20,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: prebuilt
+  group: prebuilt-release
   cancel-in-progress: false
 
 jobs:
@@ -53,6 +54,7 @@ jobs:
 
       - name: Build Buildroot, Linux, and test tools disk
         run: ./scripts/build-image.sh --all --x11 --directfb2-test
+        timeout-minutes: 180
 
       - name: Compress and checksum artifacts
         id: checksum

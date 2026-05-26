@@ -1,0 +1,23 @@
+CompileFlags:
+  Compiler: cc
+  Add:
+    - -Wall
+    - -Wextra
+    - -include
+    - stdint.h
+    - -include
+    - common.h
+    - -Iportaudio/include
+    - -I/usr/include/SDL2
+    - -D_REENTRANT
+    - -DCLOCK_FREQ=65000000
+    - -DSEMU_BOOT_TARGET_TIME=10
+    - -DSEMU_INPUT_DEBUG=0
+    - -DSEMU_FEATURE_EXTERNAL_ROOT=1
+    - -DSEMU_FEATURE_VIRTIOBLK=1
+    - -DSEMU_FEATURE_VIRTIORNG=1
+    - -DSEMU_FEATURE_VIRTIOFS=1
+    - -DSEMU_FEATURE_VIRTIONET=1
+    - -DSEMU_FEATURE_VIRTIOSND=1
+    - -DSEMU_FEATURE_VIRTIOINPUT=1
+    - -DSEMU_FEATURE_VIRTIOGPU=1

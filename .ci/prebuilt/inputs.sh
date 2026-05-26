@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
-
 prebuilt_inputs() {
     printf '%s\n' \
         configs/linux.config \
@@ -27,7 +25,9 @@ prebuilt_sha1_tool() {
 }
 
 prebuilt_inputs_sha1() {
-    local sha1
-    sha1=$(prebuilt_sha1_tool)
-    cat $(prebuilt_inputs) | $sha1 | awk '{print $1}'
+    local -a inputs sha1
+
+    read -r -a sha1 <<< "$(prebuilt_sha1_tool)"
+    mapfile -t inputs < <(prebuilt_inputs)
+    cat "${inputs[@]}" | "${sha1[@]}" | awk '{print $1}'
 }
