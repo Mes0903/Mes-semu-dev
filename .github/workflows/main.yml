@@ -42,8 +42,18 @@ jobs:
       id: detect
       shell: bash
       run: .ci/prebuilt/detect-drift.sh >> "$GITHUB_OUTPUT"
+    - name: cache drift-built raw guest artifacts
+      if: steps.detect.outputs.should_build == 'true' && (github.event_name != 'push' || github.ref != 'refs/heads/master')
+      id: guest_artifact_cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          Image
+          rootfs.cpio
+          test-tools.img
+        key: prebuilt-raw-v1-${{ runner.os }}-${{ steps.detect.outputs.live_inputs_sha1 }}
     - name: install build dependencies
-      if: steps.detect.outputs.should_build == 'true'
+      if: steps.detect.outputs.should_build == 'true' && steps.guest_artifact_cache.outputs.cache-hit != 'true'
       run: |
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -53,7 +63,7 @@ jobs:
           meson ninja-build pkg-config
       timeout-minutes: 5
     - name: build kernel, rootfs, and test tools disk from source
-      if: steps.detect.outputs.should_build == 'true'
+      if: steps.detect.outputs.should_build == 'true' && steps.guest_artifact_cache.outputs.cache-hit != 'true'
       run: ./scripts/build-image.sh --all --x11 --directfb2-test
       timeout-minutes: 180
     - name: package prebuilt artifacts
