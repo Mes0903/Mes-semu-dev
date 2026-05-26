@@ -9,71 +9,39 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PREBUILT_URL: https://github.com/${{ github.repository }}/releases/download/prebuilt
+
 jobs:
-  # PR-only: rebuild Image/rootfs.cpio/test-tools.img from source when local
+  # Rebuild Image/rootfs.cpio/test-tools.img from source when local
   # guest-artifact inputs have drifted from the prebuilt's recorded inputs.
-  # Without this, make check on a PR that touches configs, scripts, or
+  # Without this, make check on a change that touches configs, scripts, or
   # target would silently exercise the stale prebuilt instead of the
   # contributor's actual change.
   #
   # The artifacts produced here are published as a workflow artifact
   # (reliable cross-job and cross-runner handoff) and consumed by the
-  # test jobs below. They are NOT published to the prebuilt GitHub
-  # release; that path is owned by .github/workflows/prebuilt.yml on
-  # master push.
+  # test jobs below. On master pushes, a later job publishes the same
+  # tested artifacts to the prebuilt GitHub release.
   #
-  # The job always runs but short-circuits unless this is a PR with
-  # drifted inputs, so non-drifting PRs and master pushes pay only the
-  # cost of a checkout plus drift check.
-  pr-prebuilt-build:
+  # The job always runs but short-circuits unless inputs have drifted, so
+  # non-drifting runs pay only the cost of a checkout plus drift check.
+  guest-artifact-build:
     runs-on: ubuntu-24.04
     outputs:
       should_build: ${{ steps.detect.outputs.should_build }}
+      live_inputs_sha1: ${{ steps.detect.outputs.live_inputs_sha1 }}
+      kernel_sha1: ${{ steps.package.outputs.kernel_sha1 }}
+      initrd_sha1: ${{ steps.package.outputs.initrd_sha1 }}
+      test_tools_sha1: ${{ steps.package.outputs.test_tools_sha1 }}
+      inputs_sha1: ${{ steps.package.outputs.inputs_sha1 }}
     steps:
     - name: checkout code
       uses: actions/checkout@v4
     - name: detect input drift
       id: detect
       shell: bash
-      run: |
-        if [ "${{ github.event_name }}" != "pull_request" ]; then
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        # The prebuilt's input-fingerprint lives on the release as the
-        # third line of prebuilt.sha1 (virtual name 'inputs'). Pull it
-        # from there instead of mirroring it in the source tree.
-        manifest_url="https://github.com/sysprog21/semu/releases/download/prebuilt/prebuilt.sha1"
-        curl --fail --silent --show-error --retry 3 --retry-delay 1 \
-          -L -o prebuilt.sha1 "$manifest_url"
-        expected=$(awk '$2 == "inputs" {print $1}' prebuilt.sha1)
-        if [ -z "$expected" ]; then
-          # Manifest predates the inputs line (transition window after
-          # this workflow lands). Skip drift detection until prebuilt.yml
-          # republishes with the new format; treat as no drift to avoid
-          # gratuitous 90-minute from-source rebuilds on every PR.
-          echo "manifest has no inputs hash yet; skipping drift detection"
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        live=$(cat \
-          configs/linux.config \
-          configs/busybox.config \
-          configs/buildroot.config \
-          configs/x11.config \
-          configs/riscv-cross-file \
-          scripts/build-image.sh \
-          scripts/rootfs_ext4.sh \
-          target/init \
-          target/local-env.sh \
-          | sha1sum | awk '{print $1}')
-        if [ "$live" = "$expected" ]; then
-          echo "PR inputs match the prebuilt ($live); skipping rebuild"
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "PR inputs drifted ($live != $expected); will rebuild from source"
-          echo "should_build=true" >> "$GITHUB_OUTPUT"
-        fi
+      run: .ci/prebuilt/detect-drift.sh >> "$GITHUB_OUTPUT"
     - name: install build dependencies
       if: steps.detect.outputs.should_build == 'true'
       run: |
@@ -88,20 +56,33 @@ jobs:
       if: steps.detect.outputs.should_build == 'true'
       run: ./scripts/build-image.sh --all --x11 --directfb2-test
       timeout-minutes: 180
-    - name: upload PR-built artifacts
+    - name: package prebuilt artifacts
+      id: package
+      if: steps.detect.outputs.should_build == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        .ci/prebuilt/package.sh >> "$GITHUB_OUTPUT"
+        ls -la Image rootfs.cpio test-tools.img \
+          Image.bz2 rootfs.cpio.bz2 test-tools.img.bz2 prebuilt.sha1
+    - name: upload guest artifacts
       if: steps.detect.outputs.should_build == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: prebuilt-pr
+        name: guest-artifacts
         path: |
           Image
           rootfs.cpio
           test-tools.img
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
         retention-days: 1
         if-no-files-found: error
 
   semu-linux:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -115,18 +96,18 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
-    # Drift PR: pull the freshly-built Image/rootfs.cpio/test-tools.img from
-    # pr-prebuilt-build via workflow artifact (reliable, not cache).
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
+    # Drifted inputs: pull the freshly-built Image/rootfs.cpio/test-tools.img
+    # from guest-artifact-build via workflow artifact (reliable, not cache).
+    - name: download workflow-built external artifacts
+      if: needs.guest-artifact-build.outputs.should_build == 'true'
       uses: actions/download-artifact@v4
       with:
-        name: prebuilt-pr
-    # Non-drift PR or master push: cache the release-downloaded artifacts
+        name: guest-artifacts
+    # Non-drift run: cache the release-downloaded artifacts
     # across runs. Include mk/external.mk so checksum or input-pin bumps
     # after a republish invalidate the old external artifacts.
     - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
+      if: needs.guest-artifact-build.outputs.should_build != 'true'
       uses: actions/cache@v4
       with:
         path: |
@@ -186,20 +167,20 @@ jobs:
   # default boot mode is /dev/vda. Single slim job: fresh build with
   # ENABLE_EXTERNAL_ROOT=0, then run autorun.
   semu-linux-initramfs:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: ubuntu-24.04
     steps:
     - name: checkout code
       uses: actions/checkout@v4
       with:
         submodules: recursive
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
+    - name: download workflow-built external artifacts
+      if: needs.guest-artifact-build.outputs.should_build == 'true'
       uses: actions/download-artifact@v4
       with:
-        name: prebuilt-pr
+        name: guest-artifacts
     - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
+      if: needs.guest-artifact-build.outputs.should_build != 'true'
       uses: actions/cache@v4
       with:
         path: |
@@ -235,23 +216,23 @@ jobs:
       timeout-minutes: 10
 
   semu-macOS:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
-    # macOS cannot run buildroot. On a drift PR it must consume
-    # pr-prebuilt-build's artifact (built on a linux runner) -- a cache
+    # macOS cannot run buildroot. On drifted inputs it must consume
+    # guest-artifact-build's artifact (built on a linux runner) -- a cache
     # miss here would silently fall back to downloading the stale
     # release, defeating the whole point of the drift-detection logic.
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
+    - name: download workflow-built external artifacts
+      if: needs.guest-artifact-build.outputs.should_build == 'true'
       uses: actions/download-artifact@v4
       with:
-        name: prebuilt-pr
+        name: guest-artifacts
     - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
+      if: needs.guest-artifact-build.outputs.should_build != 'true'
       uses: actions/cache@v4
       with:
         path: |
@@ -344,3 +325,59 @@ jobs:
       run: .ci/check-format.sh
       shell: bash
       timeout-minutes: 5
+    - name: Check CI shape
+      run: .ci/github/check-ci-shape.sh
+      shell: bash
+      timeout-minutes: 5
+
+  publish-prebuilt:
+    needs:
+      - guest-artifact-build
+      - semu-linux
+      - semu-linux-initramfs
+      - semu-macOS
+      - coding_style
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.guest-artifact-build.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+    - name: download workflow-built external artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: guest-artifacts
+    - name: verify packaged artifacts
+      run: .ci/prebuilt/verify-package.sh
+    - name: update prebuilt prerelease
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: prebuilt
+        name: Prebuilt images (rolling)
+        prerelease: true
+        fail_on_unmatched_files: true
+        files: |
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
+        body: |
+          Rolling prerelease of the Linux kernel, Buildroot rootfs,
+          and optional test tools disk consumed by `mk/external.mk`.
+          Re-published from CI whenever any input that defines the
+          prebuilt content changes on master.
+
+          All checksums (archive hashes plus the source-input
+          fingerprint used for drift detection) are published in the
+          `prebuilt.sha1` manifest below; consumers read it directly,
+          so no source-tree edit is needed on a republish.
+
+          ## Raw checksums
+
+          ```
+          ${{ needs.guest-artifact-build.outputs.kernel_sha1 }}  Image.bz2
+          ${{ needs.guest-artifact-build.outputs.initrd_sha1 }}  rootfs.cpio.bz2
+          ${{ needs.guest-artifact-build.outputs.test_tools_sha1 }}  test-tools.img.bz2
+          ${{ needs.guest-artifact-build.outputs.inputs_sha1 }}  inputs (configs + scripts + target files, concatenated)
+          ```
