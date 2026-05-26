@@ -2,22 +2,22 @@
 #   _DATA_URL : the hyperlink which points to archive.
 #   _DATA : the file to be read by specific executable.
 #
-# Artifacts are published as assets on the fixed-tag prebuilt GitHub
-# prerelease by .github/workflows/prebuilt.yml. The expected SHA-1 of
-# each archive is read from the prebuilt.sha1 manifest published
-# alongside the archives, so checksum updates require no edit here.
+# Artifacts are published by workflow adapters to a rolling prebuilt
+# backend. The expected SHA-1 of each archive is read from the
+# prebuilt.sha1 manifest published alongside the archives, so checksum
+# updates require no edit here.
 
-COMMON_URL = https://github.com/sysprog21/semu/releases/download/prebuilt
+PREBUILT_URL ?= https://github.com/sysprog21/semu/releases/download/prebuilt
 
 PREBUILT_MANIFEST = prebuilt.sha1
-PREBUILT_MANIFEST_URL = $(COMMON_URL)/$(PREBUILT_MANIFEST)
+PREBUILT_MANIFEST_URL = $(PREBUILT_URL)/$(PREBUILT_MANIFEST)
 
 # kernel
-KERNEL_DATA_URL = $(COMMON_URL)/Image.bz2
+KERNEL_DATA_URL = $(PREBUILT_URL)/Image.bz2
 KERNEL_DATA = Image
 
 # initrd
-INITRD_DATA_URL = $(COMMON_URL)/rootfs.cpio.bz2
+INITRD_DATA_URL = $(PREBUILT_URL)/rootfs.cpio.bz2
 INITRD_DATA = rootfs.cpio
 
 $(PREBUILT_MANIFEST): FORCE
@@ -27,7 +27,7 @@ $(PREBUILT_MANIFEST): FORCE
 	    if [ -f "$@" ] && cmp -s "$@" "$@.part"; then \
 	        rm -f "$@.part"; \
 	    else \
-	        mv "$@.part" "$@"; \
+	        mv -f "$@.part" "$@"; \
 	    fi; \
 	else \
 	    rm -f "$@.part"; \
@@ -40,7 +40,7 @@ $(PREBUILT_MANIFEST): FORCE
 	fi
 
 # optional test tools disk
-TEST_TOOLS_DATA_URL = $(COMMON_URL)/test-tools.img.bz2
+TEST_TOOLS_DATA_URL = $(PREBUILT_URL)/test-tools.img.bz2
 TEST_TOOLS_DATA = test-tools.img
 
 define download
@@ -57,7 +57,7 @@ define download
 # file and rename only on success, so an interrupted bunzip2 cannot
 # leave a half-decompressed artifact that make would treat as a valid
 # up-to-date target on the next invocation.
-$($(T)_DATA): $(PREBUILT_MANIFEST) | prebuilt-check
+$($(T)_DATA): | $(PREBUILT_MANIFEST) prebuilt-check
 	$(VECHO) "  GET\t$$@\n"
 	$(Q)curl --fail --retry 3 --retry-delay 1 --progress-bar \
 	    -L -o "$$@.bz2.part" "$(strip $($(T)_DATA_URL))" \
@@ -66,10 +66,10 @@ $($(T)_DATA): $(PREBUILT_MANIFEST) | prebuilt-check
 	    [ -n "$$$$expected" ] || { echo "verify: no $(notdir $($(T)_DATA_URL)) entry in $(PREBUILT_MANIFEST)" >&2; rm -f "$$@.bz2.part"; exit 1; }; \
 	    echo "$$$$expected  $$@.bz2.part" | $(SHA1SUM) -c - \
 	    || { rm -f "$$@.bz2.part"; exit 1; }
-	$(Q)mv "$$@.bz2.part" "$$@.bz2"
+	$(Q)mv -f "$$@.bz2.part" "$$@.bz2"
 	$(Q)bunzip2 -c "$$@.bz2" > "$$@.tmp" \
 	    || { rm -f "$$@.tmp"; exit 1; }
-	$(Q)mv "$$@.tmp" "$$@"
+	$(Q)mv -f "$$@.tmp" "$$@"
 	$(Q)rm -f "$$@.bz2"
 endef
 
@@ -83,13 +83,13 @@ $(foreach T,$(EXTERNAL_DATA),$(eval $(download)))
 # and the init stub). When any of those change locally the prebuilt may no
 # longer reflect the user's intent, so we compute the SHA1 of those
 # inputs and compare against the publisher's recorded inputs hash --
-# the line of prebuilt.sha1 written by .ci/publish-prebuilt.sh under
+# the line of prebuilt.sha1 written by .ci/prebuilt/package.sh under
 # the virtual name 'inputs'.
 #
 # Mismatch -> warn but do not auto-rebuild: a buildroot run takes the
 # better part of an hour, so we let the user opt in via make build-image.
-# Keep this list in sync with the INPUTS array in .ci/publish-prebuilt.sh
-# and the paths filter in .github/workflows/prebuilt.yml.
+# .ci/prebuilt/inputs.sh is the canonical source for this list. Keep the
+# Make copy in sync because recipes need to expand the files directly.
 PREBUILT_INPUTS := \
     configs/linux.config \
     configs/busybox.config \
