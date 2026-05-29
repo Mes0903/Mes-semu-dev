@@ -4,78 +4,73 @@ on: [push, pull_request]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not cancel master push runs because they may be publishing the rolling prebuilt release.
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
 
 permissions:
   contents: read
 
+env:
+  # Use github.repository so forks and mirrors resolve their own rolling prebuilt release.
+  PREBUILT_URL: https://github.com/${{ github.repository }}/releases/download/prebuilt
+
 jobs:
-  # PR-only: rebuild Image/rootfs.cpio/test-tools.img from source when local
-  # guest-artifact inputs have drifted from the prebuilt's recorded inputs.
-  # Without this, make check on a PR that touches configs, scripts, or
-  # target would silently exercise the stale prebuilt instead of the
-  # contributor's actual change.
-  #
-  # The artifacts produced here are published as a workflow artifact
-  # (reliable cross-job and cross-runner handoff) and consumed by the
-  # test jobs below. They are NOT published to the prebuilt GitHub
-  # release; that path is owned by .github/workflows/prebuilt.yml on
-  # master push.
-  #
-  # The job always runs but short-circuits unless this is a PR with
-  # drifted inputs, so non-drifting PRs and master pushes pay only the
-  # cost of a checkout plus drift check.
-  pr-prebuilt-build:
+  # Resolve guest artifacts through the provider-neutral prebuilt layer.
+  # GitHub cache and workflow artifacts are transport mechanisms only; the
+  # resolver decides the plan, and the materializer only executes that plan.
+  guest-artifact-build:
     runs-on: ubuntu-24.04
     outputs:
-      should_build: ${{ steps.detect.outputs.should_build }}
+      release_needs_update: ${{ steps.resolve.outputs.release_needs_update }}
+      release_manifest_sha1: ${{ steps.resolve.outputs.release_manifest_sha1 }}
     steps:
     - name: checkout code
-      uses: actions/checkout@v4
-    - name: detect input drift
-      id: detect
+      uses: actions/checkout@v6
+    - name: resolve release update plan
+      id: resolve
       shell: bash
+      env:
+        # Forks and mirrors may not have created their own rolling prebuilt
+        # release yet. Only those repos may bootstrap on HTTP 404; the
+        # canonical repo should fail fast so maintainers can inspect the
+        # external release state manually.
+        PREBUILT_BOOTSTRAP_ON_404: ${{ github.repository != 'sysprog21/semu' }}
       run: |
-        if [ "${{ github.event_name }}" != "pull_request" ]; then
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        # The prebuilt's input-fingerprint lives on the release as the
-        # third line of prebuilt.sha1 (virtual name 'inputs'). Pull it
-        # from there instead of mirroring it in the source tree.
-        manifest_url="https://github.com/sysprog21/semu/releases/download/prebuilt/prebuilt.sha1"
-        curl --fail --silent --show-error --retry 3 --retry-delay 1 \
-          -L -o prebuilt.sha1 "$manifest_url"
-        expected=$(awk '$2 == "inputs" {print $1}' prebuilt.sha1)
-        if [ -z "$expected" ]; then
-          # Manifest predates the inputs line (transition window after
-          # this workflow lands). Skip drift detection until prebuilt.yml
-          # republishes with the new format; treat as no drift to avoid
-          # gratuitous 90-minute from-source rebuilds on every PR.
-          echo "manifest has no inputs hash yet; skipping drift detection"
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        live=$(cat \
-          configs/linux.config \
-          configs/busybox.config \
-          configs/buildroot.config \
-          configs/x11.config \
-          configs/riscv-cross-file \
-          scripts/build-image.sh \
-          scripts/rootfs_ext4.sh \
-          target/init \
-          target/local-env.sh \
-          | sha1sum | awk '{print $1}')
-        if [ "$live" = "$expected" ]; then
-          echo "PR inputs match the prebuilt ($live); skipping rebuild"
-          echo "should_build=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "PR inputs drifted ($live != $expected); will rebuild from source"
-          echo "should_build=true" >> "$GITHUB_OUTPUT"
-        fi
+        scripts/prebuilt/resolve-artifacts.sh > "$RUNNER_TEMP/prebuilt-plan.env"
+        .ci/github/append-github-output.sh "$RUNNER_TEMP/prebuilt-plan.env" \
+          release_needs_update \
+          release_manifest_sha1 \
+          current_recipe_classes_sha1
+    - name: cache workflow-local raw guest artifacts
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      id: guest_artifact_cache
+      uses: actions/cache@v5
+      with:
+        path: |
+          Image
+          rootfs.cpio
+          test-tools.img
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
+          .prebuilt
+        key: prebuilt-raw-${{ steps.resolve.outputs.current_recipe_classes_sha1 }}-${{ hashFiles('scripts/prebuilt/artifact-inputs.sh', 'scripts/prebuilt/artifact-recipe-*.env', 'scripts/prebuilt/build-artifacts.sh', 'scripts/prebuilt/build-plan-artifacts.sh', 'scripts/prebuilt/resolve-artifacts.sh', 'scripts/prebuilt/stamp-artifacts.sh', 'scripts/prebuilt/materialize-artifacts.sh', 'scripts/prebuilt/plan-materialize.sh', 'scripts/prebuilt/package.sh', 'scripts/prebuilt/verify-package.sh', 'scripts/rootfs_ext4.sh', 'mk/external.mk') }}
+    - name: strict materialization plan after cache restore
+      id: strict_resolve
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      shell: bash
+      env:
+        PREBUILT_STRICT: 1
+        PREBUILT_LOCAL_FIRST: 1
+        # Keep the strict post-cache resolver on the same fork/mirror bootstrap
+        # policy as the initial publish-gate resolver.
+        PREBUILT_BOOTSTRAP_ON_404: ${{ github.repository != 'sysprog21/semu' }}
+      run: |
+        scripts/prebuilt/resolve-artifacts.sh > "$RUNNER_TEMP/prebuilt-plan-strict.env"
+        .ci/github/append-github-output.sh "$RUNNER_TEMP/prebuilt-plan-strict.env"
     - name: install build dependencies
-      if: steps.detect.outputs.should_build == 'true'
+      if: steps.resolve.outputs.release_needs_update == 'true' && steps.strict_resolve.outputs.requires_build == 'true'
       run: |
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -84,24 +79,53 @@ jobs:
           git python3 libssl-dev libelf-dev wget \
           meson ninja-build pkg-config
       timeout-minutes: 5
-    - name: build kernel, rootfs, and test tools disk from source
-      if: steps.detect.outputs.should_build == 'true'
-      run: ./scripts/build-image.sh --all --x11 --directfb2-test
+    - name: materialize guest artifacts
+      id: materialize
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      shell: bash
+      env:
+        PREBUILT_STRICT: 1
+        PREBUILT_PLAN_FILE: ${{ runner.temp }}/prebuilt-plan-strict.env
+      run: |
+        scripts/prebuilt/materialize-artifacts.sh > "$RUNNER_TEMP/prebuilt-materialize.env"
+        .ci/github/append-github-output.sh "$RUNNER_TEMP/prebuilt-materialize.env"
       timeout-minutes: 180
-    - name: upload PR-built artifacts
-      if: steps.detect.outputs.should_build == 'true'
-      uses: actions/upload-artifact@v4
+    - name: package prebuilt artifacts
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      shell: bash
+      run: scripts/prebuilt/package.sh
+    - name: upload raw guest artifacts
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      uses: actions/upload-artifact@v7
       with:
-        name: prebuilt-pr
+        name: guest-artifacts-raw
         path: |
           Image
           rootfs.cpio
           test-tools.img
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
+          .prebuilt
+        include-hidden-files: true
+        retention-days: 1
+        if-no-files-found: error
+    - name: upload packaged guest artifacts
+      if: steps.resolve.outputs.release_needs_update == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-artifacts-packaged
+        path: |
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
         retention-days: 1
         if-no-files-found: error
 
   semu-linux:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -112,30 +136,18 @@ jobs:
           - libjack-jackd2-dev
     steps:
     - name: checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
-    # Drift PR: pull the freshly-built Image/rootfs.cpio/test-tools.img from
-    # pr-prebuilt-build via workflow artifact (reliable, not cache).
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
-      uses: actions/download-artifact@v4
+    # provide-guest-artifacts exports PREBUILT_STRICT=1 through GITHUB_ENV so
+    # later make invocations reject stale or unmanaged cached guest artifacts.
+    - name: provide guest artifacts
+      uses: ./.github/actions/provide-guest-artifacts
       with:
-        name: prebuilt-pr
-    # Non-drift PR or master push: cache the release-downloaded artifacts
-    # across runs. Include mk/external.mk so checksum or input-pin bumps
-    # after a republish invalidate the old external artifacts.
-    - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
-      uses: actions/cache@v4
-      with:
-        path: |
-          Image
-          rootfs.cpio
-          test-tools.img
-        key: external-${{ hashFiles('mk/external.mk', 'configs/linux.config', 'configs/busybox.config', 'configs/buildroot.config', 'configs/x11.config', 'scripts/build-image.sh', 'scripts/rootfs_ext4.sh', 'target/**') }}
+        use-workflow-artifacts: ${{ needs.guest-artifact-build.outputs.release_needs_update }}
+        manifest-sha1: ${{ needs.guest-artifact-build.outputs.release_manifest_sha1 }}
     - name: cache submodule builds
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           mini-gdbstub/build
@@ -144,7 +156,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-submodules-
     - name: cache apt packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: /var/cache/apt/archives
         key: ${{ runner.os }}-apt-${{ hashFiles('.github/actions/setup-semu/action.yml') }}
@@ -166,19 +178,19 @@ jobs:
       shell: bash
       timeout-minutes: 10
     - name: netdev test
-      run: sudo .ci/test-netdev.sh
+      run: sudo .ci/device-smoke/test-netdev.sh
       shell: bash
       timeout-minutes: 10
     - name: sound test
-      run: .ci/test-sound.sh
+      run: .ci/device-smoke/test-sound.sh
       shell: bash
       timeout-minutes: 5
     - name: virtio-input test
-      run: .ci/test-vinput.sh
+      run: .ci/device-smoke/test-vinput.sh
       shell: bash
       timeout-minutes: 5
     - name: virtio-gpu test
-      run: .ci/test-gpu.sh
+      run: .ci/device-smoke/test-gpu.sh
       shell: bash
       timeout-minutes: 10
 
@@ -186,29 +198,22 @@ jobs:
   # default boot mode is /dev/vda. Single slim job: fresh build with
   # ENABLE_EXTERNAL_ROOT=0, then run autorun.
   semu-linux-initramfs:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: ubuntu-24.04
     steps:
     - name: checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
-      uses: actions/download-artifact@v4
+    # provide-guest-artifacts exports PREBUILT_STRICT=1 through GITHUB_ENV so
+    # later make invocations reject stale or unmanaged cached guest artifacts.
+    - name: provide guest artifacts
+      uses: ./.github/actions/provide-guest-artifacts
       with:
-        name: prebuilt-pr
-    - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
-      uses: actions/cache@v4
-      with:
-        path: |
-          Image
-          rootfs.cpio
-          test-tools.img
-        key: external-${{ hashFiles('mk/external.mk', 'configs/linux.config', 'configs/busybox.config', 'configs/buildroot.config', 'configs/x11.config', 'scripts/build-image.sh', 'scripts/rootfs_ext4.sh', 'target/**') }}
+        use-workflow-artifacts: ${{ needs.guest-artifact-build.outputs.release_needs_update }}
+        manifest-sha1: ${{ needs.guest-artifact-build.outputs.release_manifest_sha1 }}
     - name: cache submodule builds
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           mini-gdbstub/build
@@ -217,7 +222,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-submodules-
     - name: cache apt packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: /var/cache/apt/archives
         key: ${{ runner.os }}-apt-${{ hashFiles('.github/actions/setup-semu/action.yml') }}
@@ -235,32 +240,21 @@ jobs:
       timeout-minutes: 10
 
   semu-macOS:
-    needs: pr-prebuilt-build
+    needs: guest-artifact-build
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: recursive
-    # macOS cannot run buildroot. On a drift PR it must consume
-    # pr-prebuilt-build's artifact (built on a linux runner) -- a cache
-    # miss here would silently fall back to downloading the stale
-    # release, defeating the whole point of the drift-detection logic.
-    - name: download PR-built external artifacts
-      if: needs.pr-prebuilt-build.outputs.should_build == 'true'
-      uses: actions/download-artifact@v4
+    # provide-guest-artifacts exports PREBUILT_STRICT=1 through GITHUB_ENV so
+    # later make invocations reject stale or unmanaged cached guest artifacts.
+    - name: provide guest artifacts
+      uses: ./.github/actions/provide-guest-artifacts
       with:
-        name: prebuilt-pr
-    - name: cache external downloads
-      if: needs.pr-prebuilt-build.outputs.should_build != 'true'
-      uses: actions/cache@v4
-      with:
-        path: |
-          Image
-          rootfs.cpio
-          test-tools.img
-        key: external-${{ hashFiles('mk/external.mk', 'configs/linux.config', 'configs/busybox.config', 'configs/buildroot.config', 'configs/x11.config', 'scripts/build-image.sh', 'scripts/rootfs_ext4.sh', 'target/**') }}
+        use-workflow-artifacts: ${{ needs.guest-artifact-build.outputs.release_needs_update }}
+        manifest-sha1: ${{ needs.guest-artifact-build.outputs.release_manifest_sha1 }}
     - name: cache submodule builds
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           mini-gdbstub/build
@@ -284,24 +278,23 @@ jobs:
       run: |
             if sudo -n true 2>/dev/null; then
               echo "sudo available, running netdev test"
-              sudo .ci/test-netdev.sh
+              sudo .ci/device-smoke/test-netdev.sh
             else
               echo "Skipping netdev test: sudo not available in GitHub Actions runner"
               echo "vmnet.framework requires root privileges or com.apple.vm.networking entitlement"
             fi
       shell: bash
       timeout-minutes: 20
-      if: ${{ success() }}
     - name: sound test
-      run: .ci/test-sound.sh
+      run: .ci/device-smoke/test-sound.sh
       shell: bash
       timeout-minutes: 20
     - name: virtio-input test
-      run: .ci/test-vinput.sh
+      run: .ci/device-smoke/test-vinput.sh
       shell: bash
       timeout-minutes: 20
     - name: virtio-gpu test
-      run: .ci/test-gpu.sh
+      run: .ci/device-smoke/test-gpu.sh
       shell: bash
       timeout-minutes: 20
 
@@ -311,11 +304,11 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: recursive
     - name: cache apt packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: /var/cache/apt/archives
         key: ${{ runner.os }}-apt-clang-format-20
@@ -337,10 +330,69 @@ jobs:
       if: github.event_name == 'pull_request'
       env:
         REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: .ci/suggest-format.sh
+      run: .ci/github/suggest-format.sh
       shell: bash
       timeout-minutes: 5
     - name: Check formatting (fail on violations)
       run: .ci/check-format.sh
       shell: bash
       timeout-minutes: 5
+
+  prebuilt-flow:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+    - name: Test prebuilt flow
+      run: bash .ci/prebuilt/test-flow.sh
+      shell: bash
+      timeout-minutes: 5
+    - name: Test GitHub workflow shape
+      run: bash .ci/github/test-workflow-shape.sh
+      shell: bash
+      timeout-minutes: 5
+
+  publish-prebuilt:
+    needs:
+      - guest-artifact-build
+      - semu-linux
+      - semu-linux-initramfs
+      - semu-macOS
+      - coding_style
+      - prebuilt-flow
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.guest-artifact-build.outputs.release_needs_update == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: prebuilt-release
+      cancel-in-progress: false
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v6
+    - name: download packaged guest artifacts
+      uses: actions/download-artifact@v7
+      with:
+        name: guest-artifacts-packaged
+    - name: verify packaged artifacts
+      run: scripts/prebuilt/verify-package.sh
+    - name: update prebuilt prerelease
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: prebuilt
+        name: Prebuilt images (rolling)
+        prerelease: true
+        fail_on_unmatched_files: true
+        files: |
+          Image.bz2
+          rootfs.cpio.bz2
+          test-tools.img.bz2
+          prebuilt.sha1
+        body: |
+          Rolling prerelease of the Linux kernel, Buildroot rootfs,
+          and optional test tools disk consumed by `mk/external.mk`.
+          Re-published from CI whenever any input that defines the
+          prebuilt content changes on master.
+
+          Recipe keys for each artifact class are published in the attached
+          `prebuilt.sha1` manifest; consumers read it directly, so no
+          source-tree edit is needed on a republish.
