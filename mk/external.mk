@@ -1,122 +1,81 @@
-# For each external target, the following must be defined in advance:
-#   _DATA_URL : the hyperlink which points to archive.
-#   _DATA : the file to be read by specific executable.
-#
-# Artifacts are published as assets on the fixed-tag prebuilt GitHub
-# prerelease by .github/workflows/prebuilt.yml. The expected SHA-1 of
-# each archive is read from the prebuilt.sha1 manifest published
-# alongside the archives, so checksum updates require no edit here.
+PREBUILT_URL ?= https://github.com/sysprog21/semu/releases/download/prebuilt
+PREBUILT_STRICT ?= 0
+PREBUILT_IGNORE_SHA ?= 0
+PREBUILT_VERBOSE ?= 0
 
-COMMON_URL = https://github.com/sysprog21/semu/releases/download/prebuilt
 
-PREBUILT_MANIFEST = prebuilt.sha1
-PREBUILT_MANIFEST_URL = $(COMMON_URL)/$(PREBUILT_MANIFEST)
-
-# kernel
-KERNEL_DATA_URL = $(COMMON_URL)/Image.bz2
 KERNEL_DATA = Image
-
-# initrd
-INITRD_DATA_URL = $(COMMON_URL)/rootfs.cpio.bz2
 INITRD_DATA = rootfs.cpio
-
-$(PREBUILT_MANIFEST): FORCE
-	$(VECHO) "  GET\t$@\n"
-	$(Q)if curl --fail --retry 3 --retry-delay 1 --progress-bar \
-	    -L -o "$@.part" "$(PREBUILT_MANIFEST_URL)"; then \
-	    if [ -f "$@" ] && cmp -s "$@" "$@.part"; then \
-	        rm -f "$@.part"; \
-	    else \
-	        mv "$@.part" "$@"; \
-	    fi; \
-	else \
-	    rm -f "$@.part"; \
-	    if [ -f "$@" ]; then \
-	        $(PRINTF) "  KEEP\t$@ (offline; using cached manifest)\n"; \
-	    else \
-	        echo "manifest fetch failed and no cached manifest; cannot proceed" >&2; \
-	        exit 1; \
-	    fi; \
-	fi
-
-# optional test tools disk
-TEST_TOOLS_DATA_URL = $(COMMON_URL)/test-tools.img.bz2
 TEST_TOOLS_DATA = test-tools.img
 
-define download
-# Download to a .part file so an interrupted curl never lands a
-# corrupt or incomplete .bz2 that a later run mistakes for valid input.
-# Curl resume (-C -) is intentionally NOT used: a fully-downloaded .part
-# left over from a previous run, e.g. interrupted before sha1 verify,
-# would make curl request a byte range past EOF, the server replies
-# HTTP 416, and curl exits non-zero, a permanent self-inflicted
-# deadlock. These files are small enough that a fresh GET is cheap.
-#
-# Look up the expected SHA-1 by archive basename in the release
-# manifest, then verify the .part against it. Decompress to a .tmp
-# file and rename only on success, so an interrupted bunzip2 cannot
-# leave a half-decompressed artifact that make would treat as a valid
-# up-to-date target on the next invocation.
-$($(T)_DATA): $(PREBUILT_MANIFEST) | prebuilt-check
-	$(VECHO) "  GET\t$$@\n"
-	$(Q)curl --fail --retry 3 --retry-delay 1 --progress-bar \
-	    -L -o "$$@.bz2.part" "$(strip $($(T)_DATA_URL))" \
-	    || { rm -f "$$@.bz2.part"; exit 1; }
-	$(Q)expected=$$$$(awk -v f="$(notdir $($(T)_DATA_URL))" '$$$$2==f{print $$$$1}' $(PREBUILT_MANIFEST)); \
-	    [ -n "$$$$expected" ] || { echo "verify: no $(notdir $($(T)_DATA_URL)) entry in $(PREBUILT_MANIFEST)" >&2; rm -f "$$@.bz2.part"; exit 1; }; \
-	    echo "$$$$expected  $$@.bz2.part" | $(SHA1SUM) -c - \
-	    || { rm -f "$$@.bz2.part"; exit 1; }
-	$(Q)mv "$$@.bz2.part" "$$@.bz2"
-	$(Q)bunzip2 -c "$$@.bz2" > "$$@.tmp" \
-	    || { rm -f "$$@.tmp"; exit 1; }
-	$(Q)mv "$$@.tmp" "$$@"
-	$(Q)rm -f "$$@.bz2"
-endef
+# scripts/prebuilt is the provider-neutral artifact layer. Make exposes local
+# build-system verbs here; CI adapters add cache/upload/publish behavior above it.
+PREBUILT_SCRIPT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../scripts/prebuilt)
+PREBUILT_INPUTS_SCRIPT := $(PREBUILT_SCRIPT_DIR)/artifact-inputs.sh
+PREBUILT_RESOLVER := $(PREBUILT_SCRIPT_DIR)/resolve-artifacts.sh
+PREBUILT_PLAN_MATERIALIZER := $(PREBUILT_SCRIPT_DIR)/plan-materialize.sh
 
-EXTERNAL_DATA = KERNEL INITRD TEST_TOOLS
-$(foreach T,$(EXTERNAL_DATA),$(eval $(download)))
+.PHONY: prebuilt-classes prebuilt-inputs prebuilt-recipe-key prebuilt-plan
+.PHONY: materialize-prebuilt-image materialize-prebuilt-rootfs materialize-prebuilt-test-tools
+prebuilt-classes:
+	$(Q)"$(PREBUILT_INPUTS_SCRIPT)" classes
 
-# --- Stale-prebuilt detection -------------------------------------------
-#
-# The prebuilt Image, rootfs.cpio, and test-tools.img above are baked from a
-# fixed set of input files (kernel/buildroot/busybox configs, the build script,
-# and the init stub). When any of those change locally the prebuilt may no
-# longer reflect the user's intent, so we compute the SHA1 of those
-# inputs and compare against the publisher's recorded inputs hash --
-# the line of prebuilt.sha1 written by .ci/publish-prebuilt.sh under
-# the virtual name 'inputs'.
-#
-# Mismatch -> warn but do not auto-rebuild: a buildroot run takes the
-# better part of an hour, so we let the user opt in via make build-image.
-# Keep this list in sync with the INPUTS array in .ci/publish-prebuilt.sh
-# and the paths filter in .github/workflows/prebuilt.yml.
-PREBUILT_INPUTS := \
-    configs/linux.config \
-    configs/busybox.config \
-    configs/buildroot.config \
-    configs/x11.config \
-    configs/riscv-cross-file \
-    scripts/build-image.sh \
-    scripts/rootfs_ext4.sh \
-    target/init \
-    target/local-env.sh
+prebuilt-inputs:
+	$(Q)test -n "$(CLASS)" || { \
+	    echo "CLASS is required, e.g. make prebuilt-inputs CLASS=image" >&2; \
+	    exit 1; \
+	}
+	$(Q)"$(PREBUILT_INPUTS_SCRIPT)" inputs "$(CLASS)"
 
-# Read the publisher's inputs hash from the downloaded manifest at
-# recipe time, after the manifest refresh above has had a chance to run.
-.PHONY: prebuilt-check
-prebuilt-check: $(PREBUILT_MANIFEST)
-	$(Q)manifest_sha1=$$(awk '$$2 == "inputs" {print $$1}' $(PREBUILT_MANIFEST)); \
-	    if [ -n "$$manifest_sha1" ]; then \
-	        expected=$(words $(PREBUILT_INPUTS)); \
-	        found=0; \
-	        for f in $(PREBUILT_INPUTS); do [ -f "$$f" ] && found=$$((found + 1)); done; \
-	        if [ "$$found" -eq "$$expected" ]; then \
-	            live_sha1=$$(cat $(PREBUILT_INPUTS) | $(SHA1SUM) | awk '{print $$1}'); \
-	            if [ "$$live_sha1" != "$$manifest_sha1" ]; then \
-	                echo "warning: Local prebuilt guest inputs ($$live_sha1) differ from" >&2; \
-	                echo "warning: the prebuilt's recorded inputs ($$manifest_sha1)." >&2; \
-	                echo "warning: The downloaded guest artifacts do not reflect your local configs." >&2; \
-	                echo "warning: Run \`make build-image\` to rebuild from source." >&2; \
-	            fi; \
-	        fi; \
-	    fi
+prebuilt-recipe-key:
+	$(Q)test -n "$(CLASS)" || { \
+	    echo "CLASS is required, e.g. make prebuilt-recipe-key CLASS=image" >&2; \
+	    exit 1; \
+	}
+	$(Q)"$(PREBUILT_INPUTS_SCRIPT)" recipe-key "$(CLASS)"
+
+prebuilt-plan:
+	$(Q)PREBUILT_URL="$(PREBUILT_URL)" \
+	    PREBUILT_STRICT="$(PREBUILT_STRICT)" \
+	    PREBUILT_IGNORE_SHA="$(PREBUILT_IGNORE_SHA)" \
+	    PREBUILT_LOCAL_FIRST=1 \
+	    "$(PREBUILT_RESOLVER)"
+
+materialize-prebuilt-image:
+	$(Q)PREBUILT_URL="$(PREBUILT_URL)" \
+	    PREBUILT_STRICT="$(PREBUILT_STRICT)" \
+	    PREBUILT_IGNORE_SHA="$(PREBUILT_IGNORE_SHA)" \
+	    PREBUILT_VERBOSE="$(PREBUILT_VERBOSE)" \
+	    "$(PREBUILT_PLAN_MATERIALIZER)" image >/dev/null
+
+materialize-prebuilt-rootfs:
+	$(Q)PREBUILT_URL="$(PREBUILT_URL)" \
+	    PREBUILT_STRICT="$(PREBUILT_STRICT)" \
+	    PREBUILT_IGNORE_SHA="$(PREBUILT_IGNORE_SHA)" \
+	    PREBUILT_VERBOSE="$(PREBUILT_VERBOSE)" \
+	    "$(PREBUILT_PLAN_MATERIALIZER)" rootfs >/dev/null
+
+materialize-prebuilt-test-tools:
+	$(Q)PREBUILT_URL="$(PREBUILT_URL)" \
+	    PREBUILT_STRICT="$(PREBUILT_STRICT)" \
+	    PREBUILT_IGNORE_SHA="$(PREBUILT_IGNORE_SHA)" \
+	    PREBUILT_VERBOSE="$(PREBUILT_VERBOSE)" \
+	    "$(PREBUILT_PLAN_MATERIALIZER)" test-tools >/dev/null
+
+$(KERNEL_DATA): materialize-prebuilt-image
+	$(Q)test -f "$@" || { \
+	    echo "prebuilt materializer did not produce $@" >&2; \
+	    exit 1; \
+	}
+
+$(INITRD_DATA): materialize-prebuilt-rootfs
+	$(Q)test -f "$@" || { \
+	    echo "prebuilt materializer did not produce $@" >&2; \
+	    exit 1; \
+	}
+
+$(TEST_TOOLS_DATA): materialize-prebuilt-test-tools
+	$(Q)test -f "$@" || { \
+	    echo "prebuilt materializer did not produce $@" >&2; \
+	    exit 1; \
+	}

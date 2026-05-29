@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+TEST_SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$TEST_SCRIPT_DIR/../.." && pwd)
+SCRIPT_DIR=$REPO_ROOT/scripts/prebuilt
+TEST_FLOW_DIR=$TEST_SCRIPT_DIR/test-flow
+
+# The test driver sources the real class registry plus focused test modules.
+# Keeping the modules sourced, rather than executed as separate scripts, lets
+# them share fixture helpers and one temporary workspace while still keeping the
+# individual test groups small.
+# The linter cannot resolve these runtime directories from the repository root.
+# shellcheck disable=SC1090,SC1091
+{
+    . "$SCRIPT_DIR/artifact-inputs.sh"
+    . "$TEST_FLOW_DIR/common.sh"
+    . "$TEST_FLOW_DIR/inputs.sh"
+    . "$TEST_FLOW_DIR/package.sh"
+    . "$TEST_FLOW_DIR/resolver.sh"
+    . "$TEST_FLOW_DIR/materializer.sh"
+    . "$TEST_FLOW_DIR/makefile.sh"
+    . "$TEST_FLOW_DIR/build.sh"
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+test_recipe_uses_immutable_external_revisions
+test_build_artifacts_library_enables_fail_fast
+test_buildroot_rootfs_mode_change_cleans_target_state
+test_buildroot_rootfs_same_state_keeps_target_state
+test_build_artifacts_test_tools_target_is_canonical
+test_build_image_enables_fail_fast_before_sourcing_recipe
+test_build_image_failure_invalidates_selected_stamps
+test_resolver_uses_current_local_artifacts_without_fetching_release
+test_resolver_fails_when_release_manifest_is_unavailable
+test_resolver_bootstraps_missing_http_release_when_enabled
+test_resolver_and_materializer_run_from_outside_repo_root
+test_stamp_artifacts_fails_when_stamp_dir_cannot_be_created
+test_stamp_artifacts_rejects_unknown_flags
+test_package_removes_partial_archive_on_failure
+test_class_registry_exposes_plan_metadata
+test_recipe_keys_only_track_class_recipe_inputs
+test_input_lists_match_makefile
+test_package_and_verify
+test_resolve_artifacts_decisions
+test_resolve_splits_rootfs_and_test_tools_classes
+test_resolve_requested_classes_ignore_unrequested_missing_artifacts
+test_resolve_uses_recipe_stamped_local_artifact_without_content_check
+test_materialize_downloads_release_and_writes_stamps
+test_materialize_consumes_supplied_plan_without_resolving_again
+test_materialize_requires_supplied_plan
+test_materialize_does_not_require_url_without_download
+test_materialize_rejects_class_args
+test_materialize_rejects_unknown_plan_keys
+test_materialize_rejects_unsupported_plan_version
+test_materialize_blocked_message_lists_selected_class_actions
+test_materialize_build_uses_prebuilt_internal_builder
+test_materialize_action_is_authoritative_for_builds
+test_materialize_accepts_recipe_only_release_manifest
+test_plan_materialize_reuses_current_local_artifacts_without_url
+test_materialize_requested_classes_only
+test_materialize_requested_classes_reuse_local_without_fetching_unrequested
+test_materialize_strict_refreshes_stale_local_cache
+test_materialize_image_build_preserves_valid_local_rootfs
+test_make_uses_valid_local_artifacts_without_release
+test_make_prebuilt_plan_uses_local_first
+test_make_downloads_release_artifacts_through_materializer
+test_make_check_materializes_only_default_guest_artifacts
+test_make_blocks_unmanaged_local_artifacts_in_non_strict_mode
+test_make_uses_unstamped_local_artifacts_when_sha_ignored
+test_make_strict_refreshes_unmanaged_local_artifacts
+test_make_strict_builds_when_release_inputs_do_not_match
+test_make_build_image_stamps_built_outputs
+test_make_distclean_removes_packaged_artifacts
+test_build_image_test_tool_flags_require_test_tools_target
+test_build_image_help_lists_class_targets
+test_make_check_accepts_run_flags
+
+echo "prebuilt flow tests passed"
