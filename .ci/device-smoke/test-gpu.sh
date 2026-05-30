@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "${SCRIPT_DIR}/common.sh"
+. "${SCRIPT_DIR}/../common.sh"
 
 # Override timeout and sleep duration for macOS - emulation is significantly slower
 case "${OS_TYPE}" in
@@ -18,7 +18,7 @@ esac
 export DFB_SLEEP
 SEMU_DIRECTFB2_TEST="${SEMU_DIRECTFB2_TEST:-1}"
 export SEMU_DIRECTFB2_TEST
-MAKE_CHECK_DISKIMG_ARG=""
+MAKE_CHECK_RUN_ARGS=""
 
 cleanup
 trap cleanup EXIT
@@ -38,11 +38,11 @@ if [[ "${SEMU_DIRECTFB2_TEST}" == "1" ]]; then
     if [ ! -f test-tools.img ]; then
         make test-tools.img
     fi
-    MAKE_CHECK_DISKIMG_ARG="DISKIMG_FILE=test-tools.img"
+    MAKE_CHECK_RUN_ARGS="RUN_DISK=test-tools.img"
 elif [ ! -f ext4.img ]; then
     make ext4.img
 fi
-export MAKE_CHECK_DISKIMG_ARG
+export MAKE_CHECK_RUN_ARGS
 
 # NOTE: We want to capture the 'expect' exit code and map
 # it to our 'MESSAGES' array for meaningful error output.
@@ -50,10 +50,10 @@ export MAKE_CHECK_DISKIMG_ARG
 set +e
 expect <<'DONE'
 set timeout $env(TIMEOUT)
-if {$env(MAKE_CHECK_DISKIMG_ARG) eq ""} {
+if {$env(MAKE_CHECK_RUN_ARGS) eq ""} {
   spawn make check
 } else {
-  spawn make check $env(MAKE_CHECK_DISKIMG_ARG)
+  spawn make check $env(MAKE_CHECK_RUN_ARGS)
 }
 
 # Boot and login
