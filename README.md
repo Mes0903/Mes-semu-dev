@@ -58,10 +58,14 @@ Build the emulator:
 $ make
 ```
 
-Download the prebuilt guest artifacts and run the default check:
+On Linux hosts, build any missing guest artifacts and run the default check:
 ```shell
 $ make check
 ```
+
+macOS can build and run the emulator, but the guest artifact source build path is
+Linux-only. From a fresh macOS checkout, provide `Image`, `rootfs.cpio`, and
+`ext4.img` from a Linux build or CI artifact before running `make check`.
 
 With the default external-root build, `make check` uses `Image`, `minimal.dtb`,
 and `ext4.img`, and boots `semu` headlessly with an equivalent command line:
@@ -70,8 +74,9 @@ and `ext4.img`, and boots `semu` headlessly with an equivalent command line:
 $ ./semu -k Image -c 1 -b minimal.dtb -H -d ext4.img
 ```
 
-If `ENABLE_EXTERNAL_ROOT=0` is used, `make check` switches to the legacy
-initramfs path and passes `-i rootfs.cpio` instead of `-d ext4.img`.
+If `ENABLE_EXTERNAL_ROOT=0` is used, `make check` adds the legacy
+initramfs payload with `-i rootfs.cpio`. The default disk remains `ext4.img`;
+set `RUN_DISK=` when you want to boot the initramfs path without `-d ext4.img`.
 
 Please be patient while `semu` is running.
 
@@ -90,16 +95,18 @@ Enter `root` to access shell.
 
 You can exit the emulator using: \<Ctrl-a x\>. (press Ctrl+A, leave it, afterwards press X)
 
-To test virtio-gpu with a visible SDL window, run `semu` manually without `-H`.
-Make sure `sdl2-config` is in `PATH`, then build the emulator, DTB, kernel, and
-test tools disk. Press `Ctrl+Alt+G` to release the mouse cursor from the SDL
-window:
+`make check` accepts runtime flags for common local test variants. Set
+`RUN_HEADLESS=0` to show the SDL window, and set `RUN_DISK` to choose the ext4
+image exposed as `/dev/vda`:
 
 ```shell
-$ sdl2-config --version
-$ make semu minimal.dtb Image test-tools.img
-$ ./semu -k Image -c 1 -b minimal.dtb -d test-tools.img
+$ make check RUN_HEADLESS=0
+$ make check RUN_HEADLESS=0 RUN_DISK=test-tools.img
 ```
+
+The default disk is `ext4.img`. `test-tools.img` is an optional replacement disk
+image for tests that need larger third-party payloads, such as DirectFB2. Press
+`Ctrl+Alt+G` to release the mouse cursor from the SDL window.
 
 Log in as `root`, source the test-tools image environment, and run one of
 the DirectFB2 examples:
@@ -144,9 +151,9 @@ unpacking a large cpio, and matches how real systems deploy. The
 `ext4.img` is built from `rootfs.cpio` via `scripts/rootfs_ext4.sh`,
 which requires `fakeroot` and `mkfs.ext4`.
 
-The rolling `prebuilt` release provides an optional `test-tools.img.bz2` for
-larger test/user tools that should not inflate `rootfs.cpio` or the default
-`ext4.img`. Use `make test-tools.img` to download it.
+`test-tools.img` is an optional replacement disk for larger test/user tools that
+should not inflate `rootfs.cpio` or the default `ext4.img`. On Linux hosts, use
+`make test-tools.img` to build it locally.
 
 If `fakeroot` is missing, the build falls back to the legacy initramfs
 path (`-i rootfs.cpio`) automatically and prints a one-line warning. To
@@ -199,84 +206,90 @@ $ umount [shared-directory]
 
 ## Build Linux kernel image and root file system
 
-An automated build script is provided to compile the RISC-V cross-compiler, Busybox, and Linux kernel from source.
+Fresh local `make` invocations download missing guest artifacts from the rolling
+`prebuilt` release by default. An explicit local source-build path is provided
+to compile the RISC-V cross-compiler, Busybox, and Linux kernel from source.
 Please note that it only supports the Linux host environment.
 
-To build everything, simply run:
+Use the Make target as the public entry point for local guest artifact source
+builds:
 
 ```shell
 $ make build-image
 ```
 
-This command invokes the underlying script: `scripts/build-image.sh --all`, which also offers more flexible usage options.
 
-### Script Usage
+`BUILD_IMAGE_ARGS` is passed to the lower-level build script. To build selected
+artifact classes, set it explicitly:
+
+```shell
+$ make build-image BUILD_IMAGE_ARGS=image
+$ make build-image BUILD_IMAGE_ARGS=rootfs
+$ make build-image BUILD_IMAGE_ARGS="rootfs --no-ext4"
+$ make build-image BUILD_IMAGE_ARGS=test-tools
+$ make build-image BUILD_IMAGE_ARGS="all --clean-build"
+```
+
+`make build-image` is only a Make wrapper around `scripts/build-image.sh`; pass
+class targets and class-specific flags through `BUILD_IMAGE_ARGS` so the script
+remains the single local artifact-build CLI.
+
+Local `make` treats `Image`, `rootfs.cpio`, and `test-tools.img` as ordinary
+file targets. If one is missing, Make downloads it from the rolling prebuilt
+release; if one already exists, Make will use it. Run `make build-image`
+explicitly after changing guest configs when you want the build system to update
+those artifacts from source. CI prebuilt cache and recipe-key stamps are handled
+separately under `.ci/prebuilt/` and are not part of the local build interface.
+
+Targets:
 
 ```
-./scripts/build-image.sh [--buildroot] [--linux] [--directfb2-test] [--all] [--no-ext4] [--clean-build] [--help]
+image             Build the Linux Image. This prepares the Buildroot
+                  toolchain if needed but does not publish rootfs.cpio or
+                  test-tools.img as final outputs.
+rootfs            Build Buildroot rootfs.cpio and, unless --no-ext4 is
+                  given, derive ext4.img from it.
+test-tools        Build test-tools.img. By default this uses the canonical
+                  X11 + DirectFB2 smoke-test payload.
+all               Build image, rootfs, and canonical test-tools.
+```
 
 Options:
-  --buildroot         Build Buildroot userland (produces rootfs.cpio and,
-                      unless --no-ext4 is given, ext4.img for vda boot)
-  --directfb2-test    Build test-tools.img with the DirectFB2 test payload
-  --linux             Build the Linux kernel
-  --all               Build both Buildroot and Linux
-  --no-ext4           Skip ext4.img generation; produce only rootfs.cpio
-                      (matches the legacy ENABLE_EXTERNAL_ROOT=0 path)
-  --clean-build       Remove buildroot/ and/or linux/ before building;
-                      with --directfb2-test, also remove DirectFB2 build outputs
-  --help              Show this message
-```
-
-### Examples
-
-Build the Linux kernel only:
 
 ```
-$ scripts/build-image.sh --linux
+--x11             Select the X11/C++ runtime payload for test-tools. When
+                  any test-tools payload option is given, only selected
+                  payloads are included.
+--directfb2-test  Select the DirectFB2 smoke-test payload for test-tools;
+                  this implies --x11.
+--minimal-test-tools
+                  Build test-tools.img without optional payloads.
+--test-tools-payloads=list
+                  Set test-tools payloads explicitly. Use comma-separated
+                  values from: x11, directfb2, minimal.
+--no-ext4         With rootfs, skip ext4.img generation and produce only
+                  rootfs.cpio (matches the legacy ENABLE_EXTERNAL_ROOT=0 path).
+--clean-build     Remove buildroot/ and/or linux/ before building; with
+                  test-tools, also remove DirectFB2 sources.
+--help            Show this message.
 ```
 
-Build Buildroot (produces both `rootfs.cpio` and `ext4.img`):
+`test-tools.img` is the shared optional disk for test payloads that should not
+live in the default `rootfs.cpio` or `ext4.img`. This keeps the default guest
+image small while still allowing larger tools to be collected in one place.
+The selected payload set is part of the CI `test-tools.img` recipe key, so
+workflow caches and release artifacts distinguish the canonical DirectFB2
+smoke-test image from smaller variants.
 
-```
-$ scripts/build-image.sh --buildroot
-```
-
-Build Buildroot for the legacy initramfs-only path (no ext4):
-
-```
-$ scripts/build-image.sh --buildroot --no-ext4
-```
-
-`test-tools.img` is the shared optional disk for test payloads that should
-not live in the default `rootfs.cpio` or `ext4.img`. This keeps the default
-guest image small while still allowing larger tools to be collected in one
-place.
-
-Build Buildroot and the test tools image with the DirectFB2 test payload. Add
-`--x11` when the test tools image should use an X11-enabled rootfs:
-
-```
-$ scripts/build-image.sh --x11 --directfb2-test
-```
-
-To add a new test tool, extend the `test-tools.img` build path in
-`scripts/build-image.sh` so the tool is staged into `extra_packages`, then
-update `target/local-env.sh` if the tool needs an additional binary or library
-search path.
+To add a new test tool, extend the test-tools build path in
+`scripts/prebuilt/build-artifacts.sh` so the tool is staged into
+`extra_packages`, then update `target/local-env.sh` if the tool needs an
+additional binary or library search path.
 
 The build script copies `target/local-env.sh` to `/root/local-env.sh` in the
-test tools image. After booting the VM, source it once to pick up paths such
-as `/usr/local/bin` and `/usr/local/lib`, instead of running overlaid tools
-through full paths like `/usr/local/bin/df_*`.
-
-Force a clean build:
-
-```
-$ scripts/build-image.sh --all --clean-build
-$ scripts/build-image.sh --linux --clean-build
-$ scripts/build-image.sh --buildroot --clean-build
-```
+test tools image. After booting the VM, source it once to pick up paths such as
+`/usr/local/bin` and `/usr/local/lib`, instead of running overlaid tools through
+full paths like `/usr/local/bin/df_*`.
 
 ## License
 
