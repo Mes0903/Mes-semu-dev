@@ -117,7 +117,7 @@ else
     fi
 fi
 
-echo "Platform: ${UNAME_S}"
+echo "Platform: ${OS_TYPE}"
 echo "Network devices to test: ${NETWORK_DEVICES[@]}"
 
 for NETDEV in "${NETWORK_DEVICES[@]}"; do
