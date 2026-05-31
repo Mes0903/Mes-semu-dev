@@ -47,9 +47,6 @@ get_timeout() {
         Darwin)
             echo "900"
             ;;
-        Linux)
-            echo "90"
-            ;;
         *)
             echo "90"
             ;;

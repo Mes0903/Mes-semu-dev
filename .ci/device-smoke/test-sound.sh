@@ -5,7 +5,7 @@ set -euo pipefail
 # Source common functions and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
-source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/../common.sh"
 
 SAMPLE_SOUND="/usr/share/sounds/alsa/Front_Center.wav"
 
@@ -14,9 +14,6 @@ SAMPLE_SOUND="/usr/share/sounds/alsa/Front_Center.wav"
 case "${OS_TYPE}" in
     Darwin)
         TIMEOUT=900
-        ;;
-    Linux)
-        TIMEOUT=30
         ;;
     *)
         TIMEOUT=30

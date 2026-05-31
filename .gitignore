@@ -9,7 +9,11 @@ Image
 ext4.img
 test-tools.img
 rootfs.cpio
+Image.bz2
+rootfs.cpio.bz2
+test-tools.img.bz2
 prebuilt.sha1
+.prebuilt/
 
 # intermediate
 riscv-harts.dtsi

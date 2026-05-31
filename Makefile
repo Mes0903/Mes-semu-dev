@@ -47,7 +47,6 @@ MKFS_EXT4 ?= mkfs.ext4
 ifeq ($(call has, VIRTIOBLK), 1)
     OBJS_EXTRA += virtio-blk.o
     DISKIMG_FILE := ext4.img
-    OPTS += -d $(DISKIMG_FILE)
     MKFS_EXT4 := $(shell which $(MKFS_EXT4))
     ifndef MKFS_EXT4
 	MKFS_EXT4 := $(shell which $$(brew --prefix e2fsprogs)/sbin/mkfs.ext4)
@@ -351,22 +350,33 @@ INITRD_DEP := $(INITRD_DATA)
 INITRD_OPT := -i $(INITRD_DATA)
 endif
 
+RUN_HEADLESS ?= 1
+RUN_DISK ?= $(DISKIMG_FILE)
+RUN_EXTRA_ARGS ?=
+RUN_HEADLESS_OPT := $(if $(filter 0 false no,$(RUN_HEADLESS)),,-H)
+RUN_DISK_OPT := $(if $(RUN_DISK),-d $(RUN_DISK))
+RUN_DISK_DEP := $(RUN_DISK)
+RUN_COMMON_ARGS = -k $(KERNEL_DATA) -b minimal.dtb $(RUN_HEADLESS_OPT) $(INITRD_OPT) $(RUN_DISK_OPT) $(OPTS) $(RUN_EXTRA_ARGS)
+RUN_CHECK_ARGS = $(RUN_COMMON_ARGS) -c $(SMP) $(if $(NETDEV),-n $(NETDEV))
+
 .PHONY: bench-login
-bench-login: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE)
-	$(Q)/usr/bin/time -p expect scripts/bench-login.expect \
-	    ./$(BIN) -k $(KERNEL_DATA) -b minimal.dtb -H $(INITRD_OPT) $(OPTS)
+bench-login: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(RUN_DISK_DEP)
+	$(Q)/usr/bin/time -p expect scripts/bench-login.expect ./$(BIN) $(RUN_COMMON_ARGS)
 
-check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_DIRECTORY)
+check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(RUN_DISK_DEP) $(SHARED_DIRECTORY)
 	@$(call notice, Ready to launch Linux kernel. Please be patient.)
-	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -H $(INITRD_OPT) $(if $(NETDEV),-n $(NETDEV)) $(OPTS)
+	$(Q)./$(BIN) $(RUN_CHECK_ARGS)
 
-BUILD_IMAGE_ARGS ?= --all
+BUILD_IMAGE_ARGS ?= all
+.PHONY: build-image
 build-image:
 	scripts/build-image.sh $(BUILD_IMAGE_ARGS)
 
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
-	$(Q)$(MAKE) -C mini-gdbstub clean
+	$(Q)if [ -f mini-gdbstub/Makefile ]; then \
+		$(MAKE) -C mini-gdbstub clean; \
+	fi
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \
 	fi
@@ -377,6 +387,8 @@ distclean: clean
 	$(Q)$(RM) .dtb-config.stamp
 	$(Q)$(RM) .build-config.stamp
 	$(Q)$(RM) Image rootfs.cpio prebuilt.sha1
+	$(Q)$(RM) Image.bz2 rootfs.cpio.bz2 test-tools.img.bz2
 	$(Q)$(RM) ext4.img test-tools.img
+	$(Q)$(RM) -r .prebuilt
 
 -include $(deps)
