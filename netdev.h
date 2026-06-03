@@ -24,7 +24,7 @@ typedef struct netdev netdev_t;
         _(user)
 #endif
 /* clang-format on */
-
+//
 typedef enum {
 #define _(dev) NETDEV_IMPL_##dev,
     SUPPORTED_DEVICES

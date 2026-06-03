@@ -33,7 +33,7 @@ ifeq ($(call has, EXTERNAL_ROOT), 1)
     endif
 endif
 $(call set-feature, EXTERNAL_ROOT)
-
+#
 # virtio-blk
 ENABLE_VIRTIOBLK ?= 1
 ifeq ($(call has, EXTERNAL_ROOT), 1)
