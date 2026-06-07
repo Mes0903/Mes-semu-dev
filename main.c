@@ -43,6 +43,8 @@
 #define PRIV(x) ((emu_state_t *) x->priv)
 
 /* Forward declarations for runtime support */
+typedef void (*semu_wfi_handler_t)(hart_t *hart);
+static void UNUSED wfi_handler_single_hart(hart_t *hart);
 #if !SEMU_HAS(THREADED)
 static void wfi_handler(hart_t *hart);
 static void hart_exec_loop(void *arg);
@@ -52,6 +54,8 @@ static void wfi_handler_threaded(hart_t *hart);
 static void *hart_thread_func(void *arg);
 static void *io_thread_func(void *arg);
 #endif
+static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu);
+static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu);
 static volatile sig_atomic_t signal_received = 0;
 static void semu_process_pending_rfence(hart_t *hart);
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
@@ -94,6 +98,28 @@ static inline void emu_peripheral_update_ctr_store(emu_state_t *emu,
                                                    uint32_t value)
 {
     __atomic_store_n(&emu->peripheral_update_ctr, value, __ATOMIC_RELAXED);
+}
+
+static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu)
+{
+#if SEMU_HAS(THREADED)
+    return emu->vm.n_hart > 1;
+#else
+    (void) emu;
+    return false;
+#endif
+}
+
+static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu)
+{
+#if SEMU_HAS(THREADED)
+    if (semu_should_use_threaded_runtime(emu))
+        return wfi_handler_threaded;
+    return wfi_handler_single_hart;
+#else
+    (void) emu;
+    return wfi_handler;
+#endif
 }
 
 static inline bool emu_peripheral_tick_due(emu_state_t *emu)
@@ -177,6 +203,12 @@ static void semu_signal_hart(emu_state_t *emu, uint32_t hartid)
 static bool UNUSED semu_hart_has_enabled_interrupt(hart_t *hart)
 {
     return (hart_sip_load(hart) & hart_sie_load(hart)) != 0;
+}
+
+static void UNUSED wfi_handler_single_hart(hart_t *hart)
+{
+    if (semu_hart_has_enabled_interrupt(hart))
+        hart_in_wfi_store(hart, false);
 }
 
 static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
@@ -1619,11 +1651,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         }
 
         newhart->vm = vm;
-#if SEMU_HAS(THREADED)
-        newhart->wfi = wfi_handler_threaded;
-#else
-        newhart->wfi = wfi_handler; /* Set WFI callback for coroutine support */
-#endif
+        newhart->wfi = semu_wfi_handler_for_config(emu);
         vm->hart[i] = newhart;
     }
 
@@ -2281,8 +2309,10 @@ static void semu_run_threaded(emu_state_t *emu)
 static void semu_run(emu_state_t *emu)
 {
 #if SEMU_HAS(THREADED)
-    semu_run_threaded(emu);
-    return;
+    if (semu_should_use_threaded_runtime(emu)) {
+        semu_run_threaded(emu);
+        return;
+    }
 #endif
     int ret;
     vm_t *vm = &emu->vm;
