@@ -14,6 +14,12 @@ OBJS_EXTRA :=
 
 LDFLAGS :=
 
+ENABLE_THREADED ?= 0
+$(call set-feature, THREADED)
+ifeq ($(call has, THREADED), 1)
+    LDFLAGS += -lpthread
+endif
+
 # external rootfs: boot from /dev/vda instead of unpacking initramfs.
 # Implies VIRTIOBLK and pulls the userland from rootfs.cpio into ext4.img.
 # Default-on. If fakeroot is missing or non-functional, fall back to the
@@ -217,6 +223,13 @@ endif
 
 BIN = semu
 all: $(BIN) minimal.dtb
+
+.PHONY: phase2-threading-contract-test
+phase2-threading-contract-test:
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase2-threading-contract-test.c -o /tmp/phase2-coroutine-contract-test
+	/tmp/phase2-coroutine-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -DENABLE_THREADED=1 tests/phase2-threading-contract-test.c -o /tmp/phase2-threaded-contract-test
+	/tmp/phase2-threaded-contract-test
 
 OBJS := \
 	riscv.o \
