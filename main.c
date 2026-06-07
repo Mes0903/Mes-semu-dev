@@ -960,6 +960,7 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
         target->x_regs[RV_R_A1] = opaque;
         target->pc = start_addr;
         target->s_mode = true;
+        hart_hsm_resume_pending_store(target, false);
         mmu_invalidate(target);
         hart_hsm_status_store(target, SBI_HSM_STATE_STARTED);
         semu_signal_hart(emu, hartid);
@@ -989,6 +990,7 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
         } else {
             return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
         }
+        hart_hsm_resume_pending_store(hart, true);
         hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
         hart->error = ERR_USER;
         return (sbi_ret_t) {SBI_SUCCESS, 0};
@@ -1834,8 +1836,13 @@ static void wfi_handler_threaded(hart_t *hart)
 
 static void handle_hsm_resume(hart_t *hart)
 {
-    if (hart->hsm_resume_is_ret)
+    if (!hart_hsm_resume_pending_load(hart))
         return;
+
+    if (hart->hsm_resume_is_ret) {
+        hart_hsm_resume_pending_store(hart, false);
+        return;
+    }
 
     hart->satp = 0;
     hart->sstatus_sie = false;
@@ -1844,21 +1851,26 @@ static void handle_hsm_resume(hart_t *hart)
     hart->x_regs[RV_R_A1] = hart->hsm_resume_opaque;
     hart->pc = hart->hsm_resume_pc;
     mmu_invalidate(hart);
+    hart_hsm_resume_pending_store(hart, false);
+}
+
+static void semu_process_hsm_resume_if_started(hart_t *hart)
+{
+    if (hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED)
+        handle_hsm_resume(hart);
 }
 
 static void wait_for_hart_start(emu_state_t *emu,
                                 hart_t *hart,
                                 int32_t initial_state)
 {
+    (void) initial_state;
 #if SEMU_HAS(THREADED)
     uint32_t id = hart->mhartid;
-    bool was_suspended = initial_state == SBI_HSM_STATE_SUSPENDED;
 
     pthread_mutex_lock(&emu->hart_wait[id].mutex);
     while (!emu_stopped_load(emu) &&
            hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
-        int32_t state = hart_hsm_status_load(hart);
-        was_suspended |= state == SBI_HSM_STATE_SUSPENDED;
         if (hart_pending_rfence_load(hart)) {
             pthread_mutex_unlock(&emu->hart_wait[id].mutex);
             semu_process_pending_rfence(hart);
@@ -1869,8 +1881,8 @@ static void wait_for_hart_start(emu_state_t *emu,
     }
     pthread_mutex_unlock(&emu->hart_wait[id].mutex);
 
-    if (!emu_stopped_load(emu) && was_suspended)
-        handle_hsm_resume(hart);
+    if (!emu_stopped_load(emu))
+        semu_process_hsm_resume_if_started(hart);
 #else
     (void) emu;
     (void) hart;
@@ -1893,12 +1905,14 @@ static void *hart_thread_func(void *arg)
             wait_for_hart_start(emu, hart, state);
             continue;
         }
+        semu_process_hsm_resume_if_started(hart);
 
         for (int i = 0; i < SEMU_SMP_BATCH_STEPS && !emu_stopped_load(emu);
              i += SEMU_SMP_SLICE_STEPS) {
             semu_process_pending_rfence(hart);
             if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED)
                 break;
+            semu_process_hsm_resume_if_started(hart);
 
             emu_tick_peripherals(emu);
             emu_update_timer_interrupt(hart);

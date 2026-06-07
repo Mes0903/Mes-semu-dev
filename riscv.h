@@ -181,6 +181,7 @@ struct __hart_internal {
 
     vm_t *vm;
     _Atomic int32_t hsm_status;
+    _Atomic bool hsm_resume_pending;
     bool hsm_resume_is_ret;
     int32_t hsm_resume_pc;
     int32_t hsm_resume_opaque;
@@ -282,6 +283,15 @@ static inline bool hart_hsm_status_compare_exchange(hart_t *hart,
                                        __ATOMIC_ACQUIRE);
 }
 
+static inline bool hart_hsm_resume_pending_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->hsm_resume_pending, __ATOMIC_ACQUIRE);
+}
+
+static inline void hart_hsm_resume_pending_store(hart_t *hart, bool value)
+{
+    __atomic_store_n(&hart->hsm_resume_pending, value, __ATOMIC_RELEASE);
+}
 
 void vm_init(hart_t *vm);
 
