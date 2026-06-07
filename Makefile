@@ -246,6 +246,11 @@ phase4-rfence-contract-test:
 	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase4-rfence-contract-test.c -o /tmp/phase4-rfence-contract-test
 	/tmp/phase4-rfence-contract-test
 
+.PHONY: phase5-hsm-contract-test
+phase5-hsm-contract-test:
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_THREADED=1 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
+	/tmp/phase5-hsm-contract-test
+
 OBJS := \
 	riscv.o \
 	ram.o \
