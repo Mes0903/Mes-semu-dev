@@ -427,6 +427,9 @@ typedef struct {
 } sswi_state_t;
 
 void aclint_sswi_update_interrupts(hart_t *hart, sswi_state_t *sswi);
+void aclint_swi_update_interrupts(hart_t *hart,
+                                  mswi_state_t *mswi,
+                                  sswi_state_t *sswi);
 void aclint_sswi_read(hart_t *hart,
                       sswi_state_t *sswi,
                       uint32_t addr,

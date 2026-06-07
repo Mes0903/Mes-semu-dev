@@ -1043,8 +1043,8 @@ static void op_sret(hart_t *vm)
      * by checking whether the switch to U mode has already occurred, we can
      * determine if the boot process has been completed.
      */
-    if (!boot_complete && !vm->s_mode)
-        boot_complete = true;
+    if (!semu_boot_complete_load() && !vm->s_mode)
+        semu_boot_complete_store(true);
 
     /* Reset stack */
     vm->sstatus_spp = false;

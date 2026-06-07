@@ -49,6 +49,7 @@ static int semu_run_chunk(emu_state_t *emu, int steps);
 
 enum {
     SEMU_SMP_SLICE_STEPS = 8,
+    SEMU_SMP_BATCH_STEPS = 4096,
     SEMU_SINGLE_SLICE_STEPS = 512,
     SEMU_SLIRP_SLICE_STEPS = 8,
 };
@@ -169,8 +170,7 @@ static void emu_update_timer_interrupt(hart_t *hart)
 static void emu_update_swi_interrupt(hart_t *hart)
 {
     emu_state_t *data = PRIV(hart);
-    aclint_mswi_update_interrupts(hart, &data->mswi);
-    aclint_sswi_update_interrupts(hart, &data->sswi);
+    aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi);
 }
 
 #if SEMU_HAS(VIRTIOSND)
@@ -203,7 +203,7 @@ static void emu_update_vfs_interrupts(vm_t *vm)
  *
  * Rationale:
  * 1. Non-blocking poll() is extremely cheap (~200ns syscall overhead)
- * 2. Inline polling provides lowest latency (checked every 64 instructions)
+ * 2. Inline polling provides lowest latency (checked every SMP slice)
  * 3. All harts share peripheral_update_ctr, ensuring frequent polling
  *    regardless of hart count (e.g., 4 harts = 4 polls per 256 instructions)
  * 4. Coroutine-based I/O would INCREASE latency by n_hart factor due to
@@ -398,11 +398,11 @@ static void mem_store(hart_t *hart,
             return;
         case 0x44: /* mswi */
             aclint_mswi_write(hart, &data->mswi, addr & 0xFFFFF, width, value);
-            aclint_mswi_update_interrupts(hart, &data->mswi);
+            aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi);
             return;
         case 0x45: /* sswi */
             aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width, value);
-            aclint_sswi_update_interrupts(hart, &data->sswi);
+            aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi);
             return;
 
 #if SEMU_HAS(VIRTIORNG)
@@ -536,11 +536,11 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
 static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
 {
     emu_state_t *data = PRIV(hart);
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     switch (fid) {
     case SBI_IPI__SEND_IPI:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
         if (hart_mask_base == UINT32_MAX) {
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
                 data->sswi.ssip[i] = 1;
@@ -561,12 +561,12 @@ static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
 
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
 {
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     uint32_t start_addr, size;
     switch (fid) {
     case SBI_RFENCE__I:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
 
         if (hart_mask_base == UINT32_MAX) {
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
@@ -581,8 +581,8 @@ static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_RFENCE__VMA:
     case SBI_RFENCE__VMA_ASID:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
         start_addr = hart->x_regs[RV_R_A2];
         size = hart->x_regs[RV_R_A3];
 
@@ -1162,14 +1162,14 @@ static void wfi_handler(hart_t *hart)
  * the scheduler to allow other harts and I/O coroutines to make progress.
  *
  * Execution model:
- * - Harts execute in batches of 64 instructions before yielding
- * - Peripheral polling and interrupt checks happen before each batch
+ * - Harts execute in batches before yielding to the scheduler
+ * - Peripheral polling and interrupt checks happen every SMP slice
  * - WFI instruction triggers immediate yield (via wfi_handler callback)
  * - Harts in HSM_STATE_STOPPED remain suspended until IPI wakes them
  *
  * This design balances responsiveness and throughput:
- * - Small batch size (64 insns) keeps latency low for I/O and IPI
- * - Cooperative scheduling avoids overhead of preemptive context switches
+ * - Small SMP slices keep latency low for I/O and IPI
+ * - Larger scheduler batches avoid excessive coroutine/poll overhead
  * - WFI-based blocking allows efficient idle when all harts are waiting
  */
 static void hart_exec_loop(void *arg)
@@ -1195,7 +1195,7 @@ static void hart_exec_loop(void *arg)
          * Keep peripheral polling at the original slice cadence so I/O and
          * external interrupt latency do not scale with the batch size.
          */
-        for (int i = 0; i < 64; i += SEMU_SMP_SLICE_STEPS) {
+        for (int i = 0; i < SEMU_SMP_BATCH_STEPS; i += SEMU_SMP_SLICE_STEPS) {
             emu_tick_peripherals(emu);
             emu_update_timer_interrupt(hart);
             emu_update_swi_interrupt(hart);
@@ -1424,8 +1424,7 @@ static void semu_run(emu_state_t *emu)
          * - Peripherals are polled inline during hart execution (see
          *   emu_tick_peripherals), not via separate coroutines
          * - Non-blocking poll() for network/disk I/O (~200ns overhead)
-         * - Inline polling provides lowest latency (checked every 64
-         * instructions)
+         * - Inline polling provides low latency by checking every SMP slice
          */
 #ifdef __APPLE__
         int kq = kqueue();
@@ -1731,7 +1730,8 @@ static void semu_run(emu_state_t *emu)
             break;
 #if SEMU_HAS(VIRTIONET)
         int i = 0;
-        if (emu->vnet.peer.type == NETDEV_IMPL_user && boot_complete) {
+        if (emu->vnet.peer.type == NETDEV_IMPL_user &&
+            semu_boot_complete_load()) {
             net_user_options_t *usr = (net_user_options_t *) emu->vnet.peer.op;
 
             uint32_t timeout = -1;

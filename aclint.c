@@ -110,16 +110,22 @@ void aclint_mtimer_write(hart_t *hart,
         vm_set_exception(hart, RV_EXC_STORE_FAULT, hart->exc_val);
 }
 
-/* ACLINT MSWI */
-void aclint_mswi_update_interrupts(hart_t *hart, mswi_state_t *mswi)
+static void aclint_set_swi_interrupt(hart_t *hart, bool pending)
 {
-    if (mswi->msip[hart->mhartid]) {
-        hart->sip |= RV_INT_SSI_BIT; /* Set Machine Software Interrupt */
+    if (pending) {
+        hart->sip |= RV_INT_SSI_BIT;
         /* Clear WFI flag when interrupt is injected */
         hart->in_wfi = false;
     } else {
-        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Machine Software Interrupt */
+        hart->sip &= ~RV_INT_SSI_BIT;
     }
+}
+
+/* ACLINT MSWI */
+void aclint_mswi_update_interrupts(hart_t *hart, mswi_state_t *mswi)
+{
+    if (mswi->msip[hart->mhartid])
+        aclint_set_swi_interrupt(hart, true);
 }
 
 static bool aclint_mswi_reg_read(mswi_state_t *mswi,
@@ -179,13 +185,16 @@ void aclint_mswi_write(hart_t *hart,
 /* ACLINT SSWI */
 void aclint_sswi_update_interrupts(hart_t *hart, sswi_state_t *sswi)
 {
-    if (sswi->ssip[hart->mhartid]) {
-        hart->sip |= RV_INT_SSI_BIT; /* Set Supervisor Software Interrupt */
-        /* Clear WFI flag when interrupt is injected */
-        hart->in_wfi = false;
-    } else {
-        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Supervisor Software Interrupt */
-    }
+    if (sswi->ssip[hart->mhartid])
+        aclint_set_swi_interrupt(hart, true);
+}
+
+void aclint_swi_update_interrupts(hart_t *hart,
+                                  mswi_state_t *mswi,
+                                  sswi_state_t *sswi)
+{
+    bool pending = mswi->msip[hart->mhartid] || sswi->ssip[hart->mhartid];
+    aclint_set_swi_interrupt(hart, pending);
 }
 
 static bool aclint_sswi_reg_read(sswi_state_t *sswi,
