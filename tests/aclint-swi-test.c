@@ -35,8 +35,8 @@ static void require_int(const char *name, uint32_t got, uint32_t want)
 
 static void test_mswi_pending_survives_sswi_clear(void)
 {
-    uint32_t msip[1] = {1};
-    uint32_t ssip[1] = {0};
+    _Atomic uint32_t msip[1] = {1};
+    _Atomic uint32_t ssip[1] = {0};
     hart_t hart = {.mhartid = 0};
     mswi_state_t mswi = {.msip = msip, .n_hart = 1};
     sswi_state_t sswi = {.ssip = ssip, .n_hart = 1};
@@ -44,22 +44,24 @@ static void test_mswi_pending_survives_sswi_clear(void)
     aclint_mswi_update_interrupts(&hart, &mswi);
     aclint_sswi_update_interrupts(&hart, &sswi);
 
-    require_int("MSWI pending keeps SSI set", hart.sip & RV_INT_SSI_BIT,
-                RV_INT_SSI_BIT);
+    require_int("MSWI pending keeps SSI set",
+                hart_sip_load(&hart) & RV_INT_SSI_BIT, RV_INT_SSI_BIT);
 }
 
 
 static void test_combined_swi_update_clears_when_no_source_pending(void)
 {
-    uint32_t msip[1] = {0};
-    uint32_t ssip[1] = {0};
-    hart_t hart = {.mhartid = 0, .sip = RV_INT_SSI_BIT};
+    _Atomic uint32_t msip[1] = {0};
+    _Atomic uint32_t ssip[1] = {0};
+    hart_t hart = {.mhartid = 0};
+    hart_sip_set_bits(&hart, RV_INT_SSI_BIT);
     mswi_state_t mswi = {.msip = msip, .n_hart = 1};
     sswi_state_t sswi = {.ssip = ssip, .n_hart = 1};
 
     aclint_swi_update_interrupts(&hart, &mswi, &sswi);
 
-    require_int("combined SWI clears SSI", hart.sip & RV_INT_SSI_BIT, 0);
+    require_int("combined SWI clears SSI",
+                hart_sip_load(&hart) & RV_INT_SSI_BIT, 0);
 }
 
 int main(void)

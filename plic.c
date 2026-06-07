@@ -60,11 +60,11 @@ void plic_update_interrupts(vm_t *vm, plic_state_t *plic)
     /* Send interrupt to target */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         if (plic->ip & plic->ie[i]) {
-            vm->hart[i]->sip |= RV_INT_SEI_BIT;
+            hart_sip_set_bits(vm->hart[i], RV_INT_SEI_BIT);
             /* Clear WFI flag when external interrupt is injected */
-            vm->hart[i]->in_wfi = false;
+            hart_in_wfi_store(vm->hart[i], false);
         } else {
-            vm->hart[i]->sip &= ~RV_INT_SEI_BIT;
+            hart_sip_clear_bits(vm->hart[i], RV_INT_SEI_BIT);
         }
     }
 }
