@@ -241,6 +241,11 @@ phase3-memory-contract-test:
 	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -I. -include common.h -D SEMU_FEATURE_THREADED=1 -D SEMU_BOOT_TARGET_TIME=10 tests/phase3-memory-contract-test.c riscv.c ram.c utils.c -o /tmp/phase3-memory-contract-test
 	/tmp/phase3-memory-contract-test
 
+.PHONY: phase4-rfence-contract-test
+phase4-rfence-contract-test:
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase4-rfence-contract-test.c -o /tmp/phase4-rfence-contract-test
+	/tmp/phase4-rfence-contract-test
+
 OBJS := \
 	riscv.o \
 	ram.o \
