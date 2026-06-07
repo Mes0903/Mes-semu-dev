@@ -231,6 +231,16 @@ phase2-threading-contract-test:
 	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -DENABLE_THREADED=1 tests/phase2-threading-contract-test.c -o /tmp/phase2-threaded-contract-test
 	/tmp/phase2-threaded-contract-test
 
+.PHONY: phase3-memory-model-contract-test
+phase3-memory-model-contract-test:
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase3-memory-model-contract-test.c -o /tmp/phase3-memory-model-contract-test
+	/tmp/phase3-memory-model-contract-test
+
+.PHONY: phase3-memory-contract-test
+phase3-memory-contract-test:
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -I. -include common.h -D SEMU_FEATURE_THREADED=1 -D SEMU_BOOT_TARGET_TIME=10 tests/phase3-memory-contract-test.c riscv.c ram.c utils.c -o /tmp/phase3-memory-contract-test
+	/tmp/phase3-memory-contract-test
+
 OBJS := \
 	riscv.o \
 	ram.o \
