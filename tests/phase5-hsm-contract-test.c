@@ -47,36 +47,42 @@ static void require_bool(const char *name, bool got, bool want)
 
 typedef struct {
     emu_state_t emu;
-    hart_t hart;
-    hart_t *hart_slots[1];
-    hart_wait_t hart_wait[1];
+    hart_t harts[2];
+    hart_t *hart_slots[2];
+    hart_wait_t hart_wait[2];
 } hsm_fixture_t;
 
 static void fixture_init(hsm_fixture_t *fixture)
 {
     memset(fixture, 0, sizeof(*fixture));
 
-    fixture->emu.vm.n_hart = 1;
+    fixture->emu.vm.n_hart = 2;
     fixture->emu.vm.hart = fixture->hart_slots;
     fixture->emu.hart_wait = fixture->hart_wait;
-    fixture->hart_slots[0] = &fixture->hart;
 
-    if (pthread_mutex_init(&fixture->hart_wait[0].mutex, NULL) != 0)
-        fail("hart wait mutex init failed");
-    if (pthread_cond_init(&fixture->hart_wait[0].cond, NULL) != 0)
-        fail("hart wait cond init failed");
+    for (uint32_t i = 0; i < fixture->emu.vm.n_hart; i++) {
+        fixture->hart_slots[i] = &fixture->harts[i];
+        if (pthread_mutex_init(&fixture->hart_wait[i].mutex, NULL) != 0)
+            fail("hart wait mutex init failed");
+        if (pthread_cond_init(&fixture->hart_wait[i].cond, NULL) != 0)
+            fail("hart wait cond init failed");
 
-    fixture->hart.priv = &fixture->emu;
-    fixture->hart.vm = &fixture->emu.vm;
-    fixture->hart.mhartid = 0;
-    fixture->hart.s_mode = true;
-    hart_hsm_status_store(&fixture->hart, SBI_HSM_STATE_STARTED);
+        fixture->harts[i].priv = &fixture->emu;
+        fixture->harts[i].vm = &fixture->emu.vm;
+        fixture->harts[i].mhartid = i;
+        fixture->harts[i].s_mode = true;
+        hart_hsm_status_store(&fixture->harts[i], SBI_HSM_STATE_STOPPED);
+    }
+
+    hart_hsm_status_store(&fixture->harts[0], SBI_HSM_STATE_STARTED);
 }
 
 static void fixture_destroy(hsm_fixture_t *fixture)
 {
-    pthread_cond_destroy(&fixture->hart_wait[0].cond);
-    pthread_mutex_destroy(&fixture->hart_wait[0].mutex);
+    for (uint32_t i = 0; i < fixture->emu.vm.n_hart; i++) {
+        pthread_cond_destroy(&fixture->hart_wait[i].cond);
+        pthread_mutex_destroy(&fixture->hart_wait[i].mutex);
+    }
 }
 
 static void prepare_hsm_ecall(hart_t *hart, uint32_t fid)
@@ -92,7 +98,7 @@ static void suspend_current_hart(hsm_fixture_t *fixture,
                                  uint32_t resume_addr,
                                  uint32_t opaque)
 {
-    hart_t *hart = &fixture->hart;
+    hart_t *hart = &fixture->harts[0];
 
     prepare_hsm_ecall(hart, SBI_HSM__HART_SUSPEND);
     hart->x_regs[RV_R_A0] = suspend_type;
@@ -110,11 +116,13 @@ static void suspend_current_hart(hsm_fixture_t *fixture,
 static void test_nonretentive_suspend_fast_resume_applies_resume_context(void)
 {
     hsm_fixture_t fixture;
-    hart_t *hart = &fixture.hart;
+    hart_t *hart = &fixture.harts[0];
     fixture_init(&fixture);
 
+    uint32_t stale_page_table = 0;
     hart->pc = 0x1004;
     hart->satp = 0xdeadbeef;
+    hart->page_table = &stale_page_table;
     hart->sstatus_sie = true;
     hart->s_mode = false;
     hart->x_regs[5] = 0xaaaa5555;
@@ -130,6 +138,8 @@ static void test_nonretentive_suspend_fast_resume_applies_resume_context(void)
     require_u32("non-retentive resume jumps to resume_addr", hart->pc,
                 0x81234000u);
     require_u32("non-retentive resume clears satp", hart->satp, 0);
+    require_bool("non-retentive resume clears page table",
+                 hart->page_table == NULL, true);
     require_bool("non-retentive resume clears SIE", hart->sstatus_sie, false);
     require_bool("non-retentive resume enters S-mode", hart->s_mode, true);
     require_u32("non-retentive resume passes hartid in a0",
@@ -143,7 +153,7 @@ static void test_nonretentive_suspend_fast_resume_applies_resume_context(void)
 static void test_retentive_suspend_fast_resume_preserves_context(void)
 {
     hsm_fixture_t fixture;
-    hart_t *hart = &fixture.hart;
+    hart_t *hart = &fixture.harts[0];
     fixture_init(&fixture);
 
     hart->pc = 0x2004;
@@ -167,9 +177,115 @@ static void test_retentive_suspend_fast_resume_preserves_context(void)
     fixture_destroy(&fixture);
 }
 
+static void test_suspend_pending_interrupt_resumes_after_finalize(void)
+{
+    hsm_fixture_t fixture;
+    hart_t *hart = &fixture.harts[0];
+    fixture_init(&fixture);
+
+    uint32_t stale_page_table = 0;
+    hart->pc = 0x3004;
+    hart->satp = 0x80000001u;
+    hart->page_table = &stale_page_table;
+    hart->sstatus_sie = true;
+    hart_sie_store(hart, RV_INT_SSI_BIT);
+    hart_sip_set_bits(hart, RV_INT_SSI_BIT);
+
+    prepare_hsm_ecall(hart, SBI_HSM__HART_SUSPEND);
+    hart->x_regs[RV_R_A0] = 0x80000000u;
+    hart->x_regs[RV_R_A1] = 0x91234000u;
+    hart->x_regs[RV_R_A2] = 0x1234abcd;
+
+    sbi_ret_t suspend_ret = handle_sbi_ecall_HSM(hart, SBI_HSM__HART_SUSPEND);
+    require_int("HART_SUSPEND handler returns success before parking",
+                suspend_ret.error, SBI_SUCCESS);
+    require_int("HART_SUSPEND enters suspend-pending",
+                hart_hsm_status_load(hart), SBI_HSM_STATE_SUSPEND_PENDING);
+    require_int("HART_SUSPEND asks execution loop to park", hart->error,
+                ERR_USER);
+
+    semu_finish_hsm_park(&fixture.emu, hart);
+    hart->error = ERR_NONE;
+    require_int("pending interrupt resumes finalized suspend",
+                hart_hsm_status_load(hart), SBI_HSM_STATE_STARTED);
+    require_bool("resume context remains pending after wake",
+                 hart_hsm_resume_pending_load(hart), true);
+
+    semu_process_hsm_resume_if_started(hart);
+    require_bool("started-slice hook clears interrupt wake pending flag",
+                 hart_hsm_resume_pending_load(hart), false);
+    require_u32("interrupt wake non-retentive resume jumps to resume_addr",
+                hart->pc, 0x91234000u);
+    require_u32("interrupt wake non-retentive resume clears satp", hart->satp,
+                0);
+    require_bool("interrupt wake non-retentive resume clears page table",
+                 hart->page_table == NULL, true);
+    require_bool("interrupt wake non-retentive resume clears SIE",
+                 hart->sstatus_sie, false);
+    require_u32("interrupt wake non-retentive resume passes opaque in a1",
+                hart->x_regs[RV_R_A1], 0x1234abcdu);
+
+    fixture_destroy(&fixture);
+}
+
+static void test_stop_pending_blocks_restart_until_stop_is_final(void)
+{
+    hsm_fixture_t fixture;
+    fixture_init(&fixture);
+
+    hart_t *starter = &fixture.harts[0];
+    hart_t *target = &fixture.harts[1];
+    hart_hsm_status_store(target, SBI_HSM_STATE_STARTED);
+    uint32_t stale_page_table = 0;
+    target->pc = 0x1004;
+    target->satp = 0x80000001u;
+    target->page_table = &stale_page_table;
+
+    sbi_ret_t stop_ret = handle_sbi_ecall_HSM(target, SBI_HSM__HART_STOP);
+    require_int("HART_STOP returns success before parking", stop_ret.error,
+                SBI_SUCCESS);
+    require_int("HART_STOP enters stop-pending", hart_hsm_status_load(target),
+                SBI_HSM_STATE_STOP_PENDING);
+    require_int("HART_STOP asks execution loop to park", target->error,
+                ERR_USER);
+
+    starter->x_regs[RV_R_A0] = target->mhartid;
+    starter->x_regs[RV_R_A1] = 0x81234000u;
+    starter->x_regs[RV_R_A2] = 0xabcdef01u;
+    sbi_ret_t early_start = handle_sbi_ecall_HSM(starter, SBI_HSM__HART_START);
+    require_int("HART_START rejects stop-pending target", early_start.error,
+                SBI_ERR_ALREADY_AVAILABLE);
+    require_int("early HART_START leaves target stop-pending",
+                hart_hsm_status_load(target), SBI_HSM_STATE_STOP_PENDING);
+    require_u32("early HART_START does not replace target pc", target->pc,
+                0x1004u);
+
+    semu_finish_hsm_park(&fixture.emu, target);
+    target->error = ERR_NONE;
+    require_int("stop finalize publishes STOPPED", hart_hsm_status_load(target),
+                SBI_HSM_STATE_STOPPED);
+
+    sbi_ret_t start_ret = handle_sbi_ecall_HSM(starter, SBI_HSM__HART_START);
+    require_int("HART_START succeeds after STOPPED is final", start_ret.error,
+                SBI_SUCCESS);
+    require_int("HART_START publishes STARTED", hart_hsm_status_load(target),
+                SBI_HSM_STATE_STARTED);
+    require_u32("HART_START installs start address", target->pc, 0x81234000u);
+    require_u32("HART_START clears satp", target->satp, 0);
+    require_bool("HART_START clears page table", target->page_table == NULL,
+                 true);
+    require_u32("HART_START passes hartid in a0", target->x_regs[RV_R_A0], 1);
+    require_u32("HART_START passes opaque in a1", target->x_regs[RV_R_A1],
+                0xabcdef01u);
+
+    fixture_destroy(&fixture);
+}
+
 int main(void)
 {
     test_nonretentive_suspend_fast_resume_applies_resume_context();
     test_retentive_suspend_fast_resume_preserves_context();
+    test_suspend_pending_interrupt_resumes_after_finalize();
+    test_stop_pending_blocks_restart_until_stop_is_final();
     return 0;
 }

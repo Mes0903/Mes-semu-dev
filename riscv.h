@@ -320,6 +320,9 @@ void hart_trap(hart_t *vm);
 /* Return a readable description for a RISC-V exception cause */
 void vm_error_report(const hart_t *vm);
 
+/* Set SATP and synchronize the derived page-table pointer/cache state. */
+void mmu_set_satp(hart_t *vm, uint32_t satp);
+
 /* Invalidate all MMU translation caches (fetch, load, store) */
 void mmu_invalidate(hart_t *vm);
 

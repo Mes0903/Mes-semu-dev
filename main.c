@@ -195,6 +195,23 @@ static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
 #endif
 }
 
+static void semu_finish_hsm_park(emu_state_t *emu, hart_t *hart)
+{
+    int32_t state = hart_hsm_status_load(hart);
+
+    if (state == SBI_HSM_STATE_STOP_PENDING) {
+        hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED);
+        return;
+    }
+
+    if (state != SBI_HSM_STATE_SUSPEND_PENDING)
+        return;
+
+    hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
+    if (semu_hart_has_enabled_interrupt(hart))
+        semu_resume_hart(emu, hart->mhartid);
+}
+
 static void semu_signal_all_harts(emu_state_t *emu)
 {
 #if SEMU_HAS(THREADED)
@@ -954,20 +971,19 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
 
         start_addr = hart->x_regs[RV_R_A1];
         opaque = hart->x_regs[RV_R_A2];
-        target->satp = 0;
+        mmu_set_satp(target, 0);
         target->sstatus_sie = false;
         target->x_regs[RV_R_A0] = hartid;
         target->x_regs[RV_R_A1] = opaque;
         target->pc = start_addr;
         target->s_mode = true;
         hart_hsm_resume_pending_store(target, false);
-        mmu_invalidate(target);
         hart_hsm_status_store(target, SBI_HSM_STATE_STARTED);
         semu_signal_hart(emu, hartid);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     }
     case SBI_HSM__HART_STOP:
-        hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED);
+        hart_hsm_status_store(hart, SBI_HSM_STATE_STOP_PENDING);
         hart->error = ERR_USER;
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_HSM__HART_GET_STATUS:
@@ -991,7 +1007,7 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
             return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
         }
         hart_hsm_resume_pending_store(hart, true);
-        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
+        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPEND_PENDING);
         hart->error = ERR_USER;
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
@@ -1844,13 +1860,12 @@ static void handle_hsm_resume(hart_t *hart)
         return;
     }
 
-    hart->satp = 0;
+    mmu_set_satp(hart, 0);
     hart->sstatus_sie = false;
     hart->s_mode = true;
     hart->x_regs[RV_R_A0] = hart->mhartid;
     hart->x_regs[RV_R_A1] = hart->hsm_resume_opaque;
     hart->pc = hart->hsm_resume_pc;
-    mmu_invalidate(hart);
     hart_hsm_resume_pending_store(hart, false);
 }
 
@@ -2066,6 +2081,7 @@ static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
         if (hart->error == ERR_EXCEPTION && hart->exc_cause == RV_EXC_ECALL_S) {
             handle_sbi_ecall(hart);
             if (hart->error == ERR_USER) {
+                semu_finish_hsm_park(emu, hart);
                 hart->error = ERR_NONE;
                 return 0;
             }
@@ -2075,6 +2091,7 @@ static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
         }
 
         if (hart->error == ERR_USER) {
+            semu_finish_hsm_park(emu, hart);
             hart->error = ERR_NONE;
             return 0;
         }
