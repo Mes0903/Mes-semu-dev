@@ -7,6 +7,7 @@
 #endif
 #include "riscv.h"
 #include "virtio.h"
+#include "mmio-bus.h"
 
 /* RAM */
 
@@ -582,6 +583,7 @@ typedef struct {
     uint32_t *ram;
     uint32_t *disk;
     vm_t vm;
+    struct semu_mmio_bus mmio_bus;
     plic_state_t plic;
     pthread_mutex_t plic_lock;
     u8250_state_t uart;

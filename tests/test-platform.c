@@ -259,6 +259,121 @@ static void test_registered_bus_lookup_matches_slots(void)
                  semu_mmio_bus_find(&bus, UINT64_C(0xF0100000), &off));
 }
 
+struct plic_window_capture {
+    uint64_t window_base;
+    uint64_t last_legacy_off;
+    uint32_t last_value;
+    uint8_t last_width;
+    uint32_t reads;
+    uint32_t writes;
+};
+
+struct plic_callback_context {
+    struct plic_window_capture window0;
+    struct plic_window_capture window2;
+};
+
+static bool capture_plic_read(hart_t *hart,
+                              void *opaque,
+                              uint64_t off,
+                              uint8_t width,
+                              uint32_t *value)
+{
+    struct plic_window_capture *capture = opaque;
+
+    (void) hart;
+    capture->last_legacy_off =
+        (capture->window_base & UINT64_C(0x03ffffff)) + off;
+    capture->last_width = width;
+    capture->reads++;
+    *value = 0xfeed0000U | capture->reads;
+    return true;
+}
+
+static bool capture_plic_write(hart_t *hart,
+                               void *opaque,
+                               uint64_t off,
+                               uint8_t width,
+                               uint32_t value)
+{
+    struct plic_window_capture *capture = opaque;
+
+    (void) hart;
+    capture->last_legacy_off =
+        (capture->window_base & UINT64_C(0x03ffffff)) + off;
+    capture->last_width = width;
+    capture->last_value = value;
+    capture->writes++;
+    return true;
+}
+
+static void configure_plic_callbacks(const struct semu_platform_device *device,
+                                     struct semu_mmio_region *region,
+                                     void *opaque)
+{
+    struct plic_callback_context *ctx = opaque;
+    struct plic_window_capture *capture = NULL;
+
+    if (device->base == SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE)
+        capture = &ctx->window0;
+    else if (device->base == SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE)
+        capture = &ctx->window2;
+
+    if (!capture)
+        return;
+
+    capture->window_base = device->base;
+    region->opaque = capture;
+    region->read = capture_plic_read;
+    region->write = capture_plic_write;
+}
+
+static void test_configured_registration_preserves_plic_legacy_offsets(void)
+{
+    struct semu_mmio_bus bus;
+    struct plic_callback_context ctx = { 0 };
+    uintptr_t hart_cookie = 0;
+    hart_t *hart = (hart_t *) &hart_cookie;
+    uint32_t value = 0;
+
+    semu_mmio_bus_init(&bus);
+    require_true(
+        "register fixed mmio configured",
+        semu_platform_register_fixed_mmio_configured(
+            &bus, configure_plic_callbacks, &ctx));
+
+    require_true(
+        "plic window 0 configured read",
+        semu_mmio_bus_read(&bus, hart,
+                           SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE + 0x24, 4,
+                           &value));
+    require_u64("plic window 0 legacy read offset",
+                ctx.window0.last_legacy_off, UINT64_C(0x24));
+    require_u32("plic window 0 read value", value, 0xfeed0001U);
+
+    require_true(
+        "plic window 2 configured read",
+        semu_mmio_bus_read(&bus, hart,
+                           SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE + 0xFF0, 4,
+                           &value));
+    require_u64("plic window 2 legacy read offset",
+                ctx.window2.last_legacy_off, UINT64_C(0x0200ff0));
+    require_u32("plic window 2 read value", value, 0xfeed0001U);
+
+    require_true(
+        "plic window 2 configured write",
+        semu_mmio_bus_write(&bus, hart,
+                            SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE + 0x800, 4,
+                            0x12345678U));
+    require_u64("plic window 2 legacy write offset",
+                ctx.window2.last_legacy_off, UINT64_C(0x0200800));
+    require_u32("plic window 2 write value", ctx.window2.last_value,
+                0x12345678U);
+
+    require_null("configured registration keeps plic gap unmapped",
+                 semu_mmio_bus_find(&bus, UINT64_C(0xF0100000), NULL));
+}
+
 static void test_registered_regions_have_no_callbacks_yet(void)
 {
     struct semu_mmio_bus bus;
@@ -287,6 +402,7 @@ int main(void)
     test_fixed_table_matches_current_mmio_map();
     test_register_fixed_mmio_populates_bus();
     test_registered_bus_lookup_matches_slots();
+    test_configured_registration_preserves_plic_legacy_offsets();
     test_registered_regions_have_no_callbacks_yet();
     return 0;
 }
