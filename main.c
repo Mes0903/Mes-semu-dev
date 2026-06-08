@@ -1888,6 +1888,8 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         return 1;
     }
 
+    ram_dma_init(&emu->ram_dma, emu->ram, RAM_SIZE, vm);
+
     emu->hart_wait = calloc(vm->n_hart, sizeof(*emu->hart_wait));
     emu->hart_threads = calloc(vm->n_hart, sizeof(*emu->hart_threads));
     if (!emu->hart_wait || !emu->hart_threads) {

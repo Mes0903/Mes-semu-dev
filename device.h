@@ -6,6 +6,7 @@
 #include "netdev.h"
 #endif
 #include "riscv.h"
+#include "ram_access.h"
 #include "virtio.h"
 #include "mmio-bus.h"
 
@@ -585,6 +586,7 @@ typedef struct emu_state {
     bool debug;
     _Atomic bool stopped;
     uint32_t *ram;
+    ram_dma_t ram_dma;
     uint32_t *disk;
     vm_t vm;
     struct semu_mmio_bus mmio_bus;
