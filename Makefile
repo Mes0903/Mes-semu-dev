@@ -283,6 +283,11 @@ test-ram-access:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-ram-access.c ram_access.c -o /tmp/test-ram-access $(HOST_TEST_LDLIBS)
 	/tmp/test-ram-access
 
+.PHONY: test-virtq
+test-virtq:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-virtq.c virtq.c ram_access.c -o /tmp/test-virtq $(HOST_TEST_LDLIBS)
+	/tmp/test-virtq
+
 .PHONY: test-semu-event
 test-semu-event:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-semu-event.c semu-event.c -o /tmp/test-semu-event $(HOST_TEST_LDLIBS)
@@ -314,7 +319,7 @@ test-debug-gate: mini-gdbstub/Makefile
 	/tmp/test-debug-gate
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-debug-gate
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-debug-gate
 
 OBJS := \
 	riscv.o \
