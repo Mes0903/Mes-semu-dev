@@ -157,6 +157,47 @@ static void *pause_safe_point_thread(void *arg)
     return NULL;
 }
 
+static void test_single_thread_scheduler_round_robins_started_harts(void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 3);
+    hart_hsm_status_store(emu.vm.hart[1], SBI_HSM_STATE_STOPPED);
+
+    uint32_t next_hart = 0;
+    hart_t *hart = NULL;
+    require_int(
+        "single-thread pick first started",
+        semu_single_thread_pick_next_started_hart(&emu, &next_hart, &hart),
+        true);
+    require_u32("single-thread first hart", hart->mhartid, 0);
+    require_u32("single-thread cursor after first", next_hart, 1);
+
+    require_int(
+        "single-thread skips stopped hart",
+        semu_single_thread_pick_next_started_hart(&emu, &next_hart, &hart),
+        true);
+    require_u32("single-thread second hart", hart->mhartid, 2);
+    require_u32("single-thread cursor wraps", next_hart, 0);
+
+    hart_hsm_status_store(emu.vm.hart[1], SBI_HSM_STATE_STARTED);
+    next_hart = 1;
+    require_int(
+        "single-thread sees HSM-started hart",
+        semu_single_thread_pick_next_started_hart(&emu, &next_hart, &hart),
+        true);
+    require_u32("single-thread HSM-started hart", hart->mhartid, 1);
+
+    hart_hsm_status_store(emu.vm.hart[0], SBI_HSM_STATE_STOPPED);
+    hart_hsm_status_store(emu.vm.hart[1], SBI_HSM_STATE_STOPPED);
+    hart_hsm_status_store(emu.vm.hart[2], SBI_HSM_STATE_STOPPED);
+    require_int(
+        "single-thread reports no started harts",
+        semu_single_thread_pick_next_started_hart(&emu, &next_hart, &hart),
+        false);
+
+    test_emu_destroy(&emu);
+}
+
 static void test_pause_targets_only_started_harts_captured_at_request(void)
 {
     emu_state_t emu;
@@ -267,7 +308,8 @@ static void test_hart_does_not_progress_after_pause_ack_until_resume(void)
     wait_until("initial progress", progress_at_least_three, &ctx);
 
     require_int("pause progressing hart", semu_pause_all_harts(&emu), 0);
-    uint32_t paused_progress = __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
+    uint32_t paused_progress =
+        __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
     ctx.resume_threshold = paused_progress;
     sleep_for_ns(20000000L);
     require_u64("progress stable while paused",
@@ -536,6 +578,7 @@ static void test_pause_wait_returns_if_stop_happens_during_wait(void)
 
 int main(void)
 {
+    test_single_thread_scheduler_round_robins_started_harts();
     test_pause_targets_only_started_harts_captured_at_request();
     test_pause_wakes_wfi_started_hart_and_acknowledges();
     test_hart_does_not_progress_after_pause_ack_until_resume();
