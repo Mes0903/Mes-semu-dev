@@ -113,10 +113,17 @@ static void test_single_hart_wfi_clears_wait_flag_with_interrupt(void)
 static int lifecycle_stop_start_calls;
 static int lifecycle_stop_request_stop_calls;
 static int lifecycle_stop_join_calls;
+static emu_state_t *lifecycle_stop_expected_emu;
 
 static int lifecycle_stop_start(struct emu_state *emu)
 {
     lifecycle_stop_start_calls++;
+    require_bool("runtime start gets expected emu",
+                 emu == lifecycle_stop_expected_emu, true);
+    require_int("runtime lifecycle running before executor start",
+                semu_vm_lifecycle_state(&emu->lifecycle), SEMU_VM_RUNNING);
+    require_bool("runtime accepting before executor start",
+                 semu_vm_accepting_device_work(&emu->lifecycle), true);
     semu_set_stopped(emu, true);
     return 0;
 }
@@ -139,14 +146,17 @@ static const struct hart_executor_ops lifecycle_stop_ops = {
     .join = lifecycle_stop_join,
 };
 
-static void test_threaded_shutdown_enters_stopped_lifecycle_state(void)
+static void test_runtime_enters_running_before_threaded_executor_start(void)
 {
     emu_state_t emu;
     memset(&emu, 0, sizeof(emu));
     require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
-    require_int("lifecycle running",
-                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    require_int("initial lifecycle created",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_CREATED);
+    require_bool("initial lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
     emu.executor.ops = &lifecycle_stop_ops;
+    lifecycle_stop_expected_emu = &emu;
     lifecycle_stop_start_calls = 0;
     lifecycle_stop_request_stop_calls = 0;
     lifecycle_stop_join_calls = 0;
@@ -168,6 +178,6 @@ int main(void)
     test_runtime_follows_explicit_executor_backend();
     test_single_hart_wfi_does_not_block_without_interrupt();
     test_single_hart_wfi_clears_wait_flag_with_interrupt();
-    test_threaded_shutdown_enters_stopped_lifecycle_state();
+    test_runtime_enters_running_before_threaded_executor_start();
     return 0;
 }

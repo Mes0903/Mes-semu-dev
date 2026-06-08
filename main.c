@@ -261,6 +261,15 @@ static bool semu_lifecycle_terminal(enum semu_vm_lifecycle_state state)
            state == SEMU_VM_FAILED;
 }
 
+static int semu_enter_runtime_running(emu_state_t *emu)
+{
+    if (!emu)
+        return -EINVAL;
+    if (semu_vm_accepting_device_work(&emu->lifecycle))
+        return 0;
+    return semu_vm_lifecycle_enter_running(&emu->lifecycle);
+}
+
 static void semu_lifecycle_notify(emu_state_t *emu)
 {
     pthread_mutex_lock(&emu->lifecycle.lock);
@@ -2816,7 +2825,16 @@ static void print_mmu_cache_stats(vm_t *vm)
 
 static void semu_run_threaded(emu_state_t *emu)
 {
-    int ret = hart_executor_start(emu);
+    int ret = semu_enter_runtime_running(emu);
+
+    if (ret < 0) {
+        errno = -ret;
+        perror("semu_vm_lifecycle_enter_running");
+        emu->exit_code = 1;
+        return;
+    }
+
+    ret = hart_executor_start(emu);
     if (ret < 0) {
         errno = -ret;
         perror("hart executor start");
@@ -2851,12 +2869,20 @@ static void semu_run_threaded(emu_state_t *emu)
 
 static void semu_run(emu_state_t *emu)
 {
+    int ret = semu_enter_runtime_running(emu);
+
+    if (ret < 0) {
+        errno = -ret;
+        perror("semu_vm_lifecycle_enter_running");
+        emu->exit_code = 1;
+        return;
+    }
+
     if (semu_should_use_threaded_runtime(emu)) {
         semu_run_threaded(emu);
         return;
     }
 
-    int ret;
     uint32_t next_hart = 0;
 
     /* Single-thread mode: one inline CPU executor schedules all active harts. */
@@ -3069,6 +3095,15 @@ static void semu_run_debug(emu_state_t *emu)
                       },
                       "127.0.0.1:1234")) {
         emu->exit_code = 1;
+        return;
+    }
+
+    int ret = semu_enter_runtime_running(emu);
+    if (ret < 0) {
+        errno = -ret;
+        perror("semu_vm_lifecycle_enter_running");
+        emu->exit_code = 1;
+        gdbstub_close(&gdbstub);
         return;
     }
 
