@@ -85,9 +85,8 @@ static void test_emu_init(emu_state_t *emu, uint32_t n_hart)
     emu->sswi.ssip = calloc(n_hart, sizeof(*emu->sswi.ssip));
     emu->sswi.n_hart = n_hart;
     emu->vm.hart = calloc(n_hart, sizeof(*emu->vm.hart));
-    emu->hart_wait = calloc(n_hart, sizeof(*emu->hart_wait));
     if (!emu->mtimer.mtimecmp || !emu->mswi.msip || !emu->sswi.ssip ||
-        !emu->vm.hart || !emu->hart_wait) {
+        !emu->vm.hart) {
         fprintf(stderr, "allocation failed\n");
         exit(1);
     }
@@ -107,22 +106,20 @@ static void test_emu_init(emu_state_t *emu, uint32_t n_hart)
                          __ATOMIC_RELAXED);
         emu->vm.hart[i] = hart;
 
-        if (pthread_mutex_init(&emu->hart_wait[i].mutex, NULL) != 0 ||
-            pthread_cond_init(&emu->hart_wait[i].cond, NULL) != 0) {
-            fprintf(stderr, "hart wait init failed\n");
-            exit(1);
-        }
     }
+
+    require_int("hart executor init",
+                hart_executor_init(emu, HART_EXEC_DEDICATED_THREADS, NULL, NULL,
+                                   NULL),
+                0);
 }
 
 static void test_emu_destroy(emu_state_t *emu)
 {
+    hart_executor_destroy(emu);
     for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
-        pthread_cond_destroy(&emu->hart_wait[i].cond);
-        pthread_mutex_destroy(&emu->hart_wait[i].mutex);
         free(emu->vm.hart[i]);
     }
-    free(emu->hart_wait);
     free(emu->vm.hart);
     free(emu->sswi.ssip);
     free(emu->mswi.msip);
