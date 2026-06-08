@@ -283,13 +283,18 @@ test-ram-access:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-ram-access.c ram_access.c -o /tmp/test-ram-access $(HOST_TEST_LDLIBS)
 	/tmp/test-ram-access
 
+.PHONY: test-semu-event
+test-semu-event:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-semu-event.c semu-event.c -o /tmp/test-semu-event $(HOST_TEST_LDLIBS)
+	/tmp/test-semu-event
+
 .PHONY: test-debug-gate
 test-debug-gate: mini-gdbstub/Makefile
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-debug-gate
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-debug-gate
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-semu-event test-debug-gate
 
 OBJS := \
 	riscv.o \
@@ -299,6 +304,7 @@ OBJS := \
 	plic.o \
 	irq-source.o \
 	hart-mailbox.o \
+	semu-event.o \
 	uart.o \
 	mmio-bus.o \
 	platform.o \
