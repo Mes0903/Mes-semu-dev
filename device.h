@@ -16,6 +16,7 @@
 #include "virtio-device.h"
 #include "virtio.h"
 #include "vm-lifecycle.h"
+#include "executor-config.h"
 
 /* RAM */
 
@@ -568,7 +569,7 @@ typedef struct {
     pthread_cond_t completion_cond;
 } rfence_request_t;
 
-typedef struct {
+typedef struct hart_wait {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } hart_wait_t;
@@ -578,6 +579,8 @@ typedef struct emu_state {
     bool debug;
     _Atomic bool stopped;
     struct semu_vm_lifecycle lifecycle;
+    enum semu_executor_mode executor_mode;
+    enum hart_executor_backend executor_backend;
     uint32_t *ram;
     ram_dma_t ram_dma;
     uint32_t *disk;
