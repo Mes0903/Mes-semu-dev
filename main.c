@@ -65,6 +65,7 @@ static int semu_service_hart_step(emu_state_t *emu, hart_t *hart);
 static bool semu_single_thread_pick_next_started_hart(emu_state_t *emu,
                                                       uint32_t *next_hart,
                                                       hart_t **hart_out);
+static void semu_single_thread_refresh_harts(emu_state_t *emu);
 static int semu_run_chunk(emu_state_t *emu, int steps, uint32_t *next_hart);
 
 enum {
@@ -2541,20 +2542,28 @@ static int semu_service_hart_step(emu_state_t *emu, hart_t *hart)
     return semu_service_hart_steps(emu, hart, 1);
 }
 
-static void semu_single_thread_idle_tick(emu_state_t *emu)
+static void semu_single_thread_refresh_harts(emu_state_t *emu)
 {
-    emu_tick_peripherals(emu);
     for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
         emu_update_timer_interrupt(emu->vm.hart[i]);
         emu_update_swi_interrupt(emu->vm.hart[i]);
         semu_wake_hart_if_interrupt_pending(emu, i);
     }
+}
+
+static void semu_single_thread_idle_tick(emu_state_t *emu)
+{
+    emu_tick_peripherals(emu);
+    semu_single_thread_refresh_harts(emu);
     poll(NULL, 0, 1);
 }
 
 static int semu_run_chunk(emu_state_t *emu, int steps, uint32_t *next_hart)
 {
     while (steps > 0 && !emu_stopped_load(emu)) {
+        emu_tick_peripherals(emu);
+        semu_single_thread_refresh_harts(emu);
+
         hart_t *hart;
         if (!semu_single_thread_pick_next_started_hart(emu, next_hart, &hart)) {
             semu_single_thread_idle_tick(emu);

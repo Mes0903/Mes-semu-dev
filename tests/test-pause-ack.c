@@ -195,6 +195,25 @@ static void test_single_thread_scheduler_round_robins_started_harts(void)
     test_emu_destroy(&emu);
 }
 
+
+static void test_single_thread_refresh_resumes_suspended_interrupt_hart(void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 2);
+    hart_t *active = emu.vm.hart[0];
+    hart_t *suspended = emu.vm.hart[1];
+    hart_hsm_status_store(active, SBI_HSM_STATE_STARTED);
+    hart_hsm_status_store(suspended, SBI_HSM_STATE_SUSPENDED);
+    hart_sie_store(suspended, RV_INT_SSI_BIT);
+    __atomic_store_n(&emu.sswi.ssip[1], 1, __ATOMIC_RELAXED);
+
+    semu_single_thread_refresh_harts(&emu);
+
+    require_int("single-thread refresh resumes interrupted suspended hart",
+                hart_hsm_status_load(suspended), SBI_HSM_STATE_STARTED);
+    test_emu_destroy(&emu);
+}
+
 static void test_pause_targets_only_started_harts_captured_at_request(void)
 {
     emu_state_t emu;
@@ -576,6 +595,7 @@ static void test_pause_wait_returns_if_stop_happens_during_wait(void)
 int main(void)
 {
     test_single_thread_scheduler_round_robins_started_harts();
+    test_single_thread_refresh_resumes_suspended_interrupt_hart();
     test_pause_targets_only_started_harts_captured_at_request();
     test_pause_wakes_wfi_started_hart_and_acknowledges();
     test_hart_does_not_progress_after_pause_ack_until_resume();
