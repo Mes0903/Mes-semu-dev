@@ -212,6 +212,7 @@ ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu.o
     OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += vgpu-display.o
+    OBJS_EXTRA += vgpu-rect.o
 endif
 
 ifneq ($(filter 1,$(call has, VIRTIOGPU) $(call has, VIRTIOINPUT)),)
@@ -323,13 +324,18 @@ test-virtio-input-config:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=1 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-input-config.c -Wl,--gc-sections -o /tmp/test-virtio-input-config $(HOST_TEST_LDLIBS)
 	/tmp/test-virtio-input-config
 
+.PHONY: test-vgpu-rect
+test-vgpu-rect:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-vgpu-rect.c vgpu-rect.c vgpu-display.c -o /tmp/test-vgpu-rect $(HOST_TEST_LDLIBS)
+	/tmp/test-vgpu-rect
+
 .PHONY: test-debug-gate
 test-debug-gate: mini-gdbstub/Makefile
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-debug-gate
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-virtio-input-config test-debug-gate
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-virtio-input-config test-vgpu-rect test-debug-gate
 
 OBJS := \
 	riscv.o \
