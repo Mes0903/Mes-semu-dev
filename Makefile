@@ -263,8 +263,13 @@ test-mmio-bus:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-mmio-bus.c mmio-bus.c -o /tmp/test-mmio-bus $(HOST_TEST_LDLIBS)
 	/tmp/test-mmio-bus
 
+.PHONY: test-platform
+test-platform:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-platform.c platform.c mmio-bus.c -o /tmp/test-platform $(HOST_TEST_LDLIBS)
+	/tmp/test-platform
+
 .PHONY: test-host
-test-host: test-mmio-bus
+test-host: test-mmio-bus test-platform
 
 OBJS := \
 	riscv.o \
@@ -273,6 +278,7 @@ OBJS := \
 	plic.o \
 	uart.o \
 	mmio-bus.o \
+	platform.o \
 	main.o \
 	aclint.o \
 	$(OBJS_EXTRA)
