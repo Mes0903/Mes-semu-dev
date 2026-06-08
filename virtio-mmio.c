@@ -1,5 +1,6 @@
 #include "virtio-mmio.h"
 
+#include "device.h"
 #include "virtio.h"
 
 #include <errno.h>
@@ -65,6 +66,49 @@ static void virtio_mmio_queue_cfg_reset(struct virtio_queue_common *cfg)
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->max_size = max_size;
+}
+
+static int virtio_mmio_lock_notify_lifecycle_gate(
+    struct virtio_device_common *common,
+    bool *locked)
+{
+    int ret;
+
+    *locked = false;
+    if (!common->emu) {
+        /* No emu means no VM lifecycle to consult; host tests and no-IRQ
+         * common users keep the legacy ungated QueueNotify behavior.
+         */
+        return 0;
+    }
+
+    ret = pthread_mutex_lock(&common->emu->lifecycle.lock);
+    if (ret != 0)
+        return -ret;
+
+    *locked = true;
+    return 0;
+}
+
+static bool virtio_mmio_notify_lifecycle_accepting(
+    const struct virtio_device_common *common,
+    bool locked)
+{
+    if (!locked)
+        return true;
+
+    /* Match semu_vm_accepting_device_work() while keeping the lifecycle
+     * decision serialized with transport-side notify request capture.
+     */
+    return common->emu->lifecycle.accepting_device_work;
+}
+
+static void virtio_mmio_unlock_notify_lifecycle_gate(
+    struct virtio_device_common *common,
+    bool locked)
+{
+    if (locked)
+        pthread_mutex_unlock(&common->emu->lifecycle.lock);
 }
 
 static bool virtio_mmio_all_queues_ready(
@@ -563,6 +607,7 @@ int virtio_mmio_write(struct virtio_device_common *common,
     uint16_t notify_queue = 0;
     uint64_t notify_generation = 0;
     bool notify_after_unlock = false;
+    bool notify_lifecycle_locked = false;
     int ret = 0;
 
     if (!common || !common->initialized)
@@ -587,6 +632,12 @@ int virtio_mmio_write(struct virtio_device_common *common,
         return -EINVAL;
     if (byte_offset == VIRTIO_MMIO_REG(Status) && value == 0)
         return virtio_device_common_reset(common);
+    if (byte_offset == VIRTIO_MMIO_REG(QueueNotify)) {
+        ret = virtio_mmio_lock_notify_lifecycle_gate(
+            common, &notify_lifecycle_locked);
+        if (ret < 0)
+            return ret;
+    }
 
     pthread_mutex_lock(&common->transport_lock);
     cfg = virtio_mmio_selected_queue_cfg(common);
@@ -637,6 +688,11 @@ int virtio_mmio_write(struct virtio_device_common *common,
     case VIRTIO_MMIO_REG(QueueNotify):
         if (value >= common->num_queues || !common->queues[value].ready) {
             ret = -EINVAL;
+            break;
+        }
+        if (!virtio_mmio_notify_lifecycle_accepting(
+                common, notify_lifecycle_locked)) {
+            ret = -ESHUTDOWN;
             break;
         }
         if (common->ops && common->ops->notify_queue) {
@@ -710,6 +766,7 @@ int virtio_mmio_write(struct virtio_device_common *common,
     }
 
     pthread_mutex_unlock(&common->transport_lock);
+    virtio_mmio_unlock_notify_lifecycle_gate(common, notify_lifecycle_locked);
     if (ret == 0 && activation_request.pending)
         ret = virtio_mmio_complete_activation(common, &activation_request);
     if (ret == 0 && notify_after_unlock)

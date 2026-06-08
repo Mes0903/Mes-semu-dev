@@ -316,7 +316,7 @@ test-virtio-irq:
 
 .PHONY: test-virtio-mmio
 test-virtio-mmio:
-	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-mmio.c virtio-mmio.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c -o /tmp/test-virtio-mmio $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-mmio.c virtio-mmio.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c vm-lifecycle.c -o /tmp/test-virtio-mmio $(HOST_TEST_LDLIBS)
 	/tmp/test-virtio-mmio
 
 .PHONY: test-virtio-input-config
