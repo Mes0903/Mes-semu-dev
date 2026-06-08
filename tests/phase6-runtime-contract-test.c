@@ -33,8 +33,7 @@ static void test_default_selector_maps_hart_count_to_executor_mode(void)
 {
     require_int("one hart defaults to single-thread",
                 semu_executor_default_mode(1), SEMU_EXECUTOR_SINGLE_THREAD);
-    require_int("SMP defaults to legacy gate",
-                semu_executor_default_mode(2),
+    require_int("SMP defaults to legacy gate", semu_executor_default_mode(2),
                 SEMU_EXECUTOR_THREADED_CPU_WITH_LEGACY_DEVICE_GATE);
     require_int("SMP default uses dedicated backend",
                 semu_executor_backend_for_mode(semu_executor_default_mode(2)),
@@ -110,11 +109,65 @@ static void test_single_hart_wfi_clears_wait_flag_with_interrupt(void)
                  hart_in_wfi_load(&hart), false);
 }
 
+
+static int lifecycle_stop_start_calls;
+static int lifecycle_stop_request_stop_calls;
+static int lifecycle_stop_join_calls;
+
+static int lifecycle_stop_start(struct emu_state *emu)
+{
+    lifecycle_stop_start_calls++;
+    semu_set_stopped(emu, true);
+    return 0;
+}
+
+static void lifecycle_stop_request_stop(struct emu_state *emu)
+{
+    lifecycle_stop_request_stop_calls++;
+    semu_set_stopped(emu, true);
+}
+
+static int lifecycle_stop_join(struct emu_state *emu UNUSED)
+{
+    lifecycle_stop_join_calls++;
+    return 0;
+}
+
+static const struct hart_executor_ops lifecycle_stop_ops = {
+    .start = lifecycle_stop_start,
+    .request_stop = lifecycle_stop_request_stop,
+    .join = lifecycle_stop_join,
+};
+
+static void test_threaded_shutdown_enters_stopped_lifecycle_state(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    require_int("lifecycle running",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    emu.executor.ops = &lifecycle_stop_ops;
+    lifecycle_stop_start_calls = 0;
+    lifecycle_stop_request_stop_calls = 0;
+    lifecycle_stop_join_calls = 0;
+
+    semu_run_threaded(&emu);
+
+    require_int("threaded start called", lifecycle_stop_start_calls, 1);
+    require_int("threaded request_stop called",
+                lifecycle_stop_request_stop_calls, 1);
+    require_int("threaded join called", lifecycle_stop_join_calls, 1);
+    require_int("threaded shutdown lifecycle stopped",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPED);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 int main(void)
 {
     test_default_selector_maps_hart_count_to_executor_mode();
     test_runtime_follows_explicit_executor_backend();
     test_single_hart_wfi_does_not_block_without_interrupt();
     test_single_hart_wfi_clears_wait_flag_with_interrupt();
+    test_threaded_shutdown_enters_stopped_lifecycle_state();
     return 0;
 }

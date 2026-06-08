@@ -105,13 +105,12 @@ static void test_emu_init(emu_state_t *emu, uint32_t n_hart)
         __atomic_store_n(&emu->mtimer.mtimecmp[i], UINT64_MAX,
                          __ATOMIC_RELAXED);
         emu->vm.hart[i] = hart;
-
     }
 
-    require_int("hart executor init",
-                hart_executor_init(emu, HART_EXEC_DEDICATED_THREADS, NULL, NULL,
-                                   NULL),
-                0);
+    require_int(
+        "hart executor init",
+        hart_executor_init(emu, HART_EXEC_DEDICATED_THREADS, NULL, NULL, NULL),
+        0);
 }
 
 static void test_emu_destroy(emu_state_t *emu)
@@ -211,6 +210,57 @@ static void test_single_thread_refresh_resumes_suspended_interrupt_hart(void)
 
     require_int("single-thread refresh resumes interrupted suspended hart",
                 hart_hsm_status_load(suspended), SBI_HSM_STATE_STARTED);
+    test_emu_destroy(&emu);
+}
+
+
+static int spy_pause_request_calls;
+static uint64_t spy_pause_request_seq;
+
+static int spy_request_pause(struct emu_state *emu,
+                             uint64_t pause_seq,
+                             const bool *targets)
+{
+    spy_pause_request_calls++;
+    spy_pause_request_seq = pause_seq;
+
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        if (targets[i])
+            hart_pause_request(emu->vm.hart[i], pause_seq);
+    }
+    return 0;
+}
+
+static const struct hart_executor_ops spy_pause_ops = {
+    .request_pause = spy_request_pause,
+};
+
+static void test_pause_all_harts_requests_through_executor_and_acknowledges(
+    void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 1);
+    emu.executor.ops = &spy_pause_ops;
+    spy_pause_request_calls = 0;
+    spy_pause_request_seq = 0;
+
+    struct pause_safe_point_ctx ctx = {.emu = &emu, .hart = emu.vm.hart[0]};
+    pthread_t thread;
+    pthread_create(&thread, NULL, pause_safe_point_thread, &ctx);
+
+    require_int("pause all harts via executor", semu_pause_all_harts(&emu), 0);
+    uint64_t seq = semu_vm_lifecycle_pause_seq(&emu.lifecycle);
+    require_int("executor pause request call count", spy_pause_request_calls,
+                1);
+    require_u64("executor pause request seq", spy_pause_request_seq, seq);
+    require_u64("executor pause ack seq",
+                hart_pause_ack_seq_load(emu.vm.hart[0]), seq);
+
+    require_int("resume lifecycle after executor pause",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    pthread_join(thread, NULL);
+    require_int("safe point thread ret after executor pause",
+                __atomic_load_n(&ctx.ret, __ATOMIC_ACQUIRE), 0);
     test_emu_destroy(&emu);
 }
 
@@ -324,8 +374,7 @@ static void test_hart_does_not_progress_after_pause_ack_until_resume(void)
     wait_until("initial progress", progress_at_least_three, &ctx);
 
     require_int("pause progressing hart", semu_pause_all_harts(&emu), 0);
-    uint32_t paused_progress =
-        __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
+    uint32_t paused_progress = __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
     ctx.resume_threshold = paused_progress;
     sleep_for_ns(20000000L);
     require_u64("progress stable while paused",
@@ -368,6 +417,59 @@ static bool coordinator_done(void *arg)
     return __atomic_load_n(&ctx->done, __ATOMIC_ACQUIRE);
 }
 
+
+static int spy_pause_park_request_calls;
+
+static int spy_request_pause_after_target_park(struct emu_state *emu,
+                                               uint64_t pause_seq,
+                                               const bool *targets)
+{
+    spy_pause_park_request_calls++;
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        if (!targets[i])
+            continue;
+        hart_hsm_status_store(emu->vm.hart[i], SBI_HSM_STATE_STOP_PENDING);
+        semu_finish_hsm_park(emu, emu->vm.hart[i]);
+        hart_pause_request(emu->vm.hart[i], pause_seq);
+    }
+    return 0;
+}
+
+static const struct hart_executor_ops spy_pause_park_ops = {
+    .request_pause = spy_request_pause_after_target_park,
+};
+
+static void test_pause_target_parked_before_publish_is_acknowledged(void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 1);
+    emu.executor.ops = &spy_pause_park_ops;
+    spy_pause_park_request_calls = 0;
+
+    struct coordinator_ctx ctx = {.emu = &emu};
+    pthread_t thread;
+    pthread_create(&thread, NULL, coordinator_thread, &ctx);
+    wait_until("park-before-publish pause completed", coordinator_done, &ctx);
+    pthread_join(thread, NULL);
+
+    uint64_t seq = semu_vm_lifecycle_pause_seq(&emu.lifecycle);
+    require_int("park-before-publish request call count",
+                spy_pause_park_request_calls, 1);
+    require_int("park-before-publish pause ret",
+                __atomic_load_n(&ctx.ret, __ATOMIC_ACQUIRE), 0);
+    require_int("park-before-publish hart stopped",
+                hart_hsm_status_load(emu.vm.hart[0]), SBI_HSM_STATE_STOPPED);
+    require_u64("park-before-publish request seq",
+                hart_pause_request_seq_load(emu.vm.hart[0]), seq);
+    require_u64("park-before-publish ack seq",
+                hart_pause_ack_seq_load(emu.vm.hart[0]), seq);
+    require_int("park-before-publish lifecycle paused",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_PAUSED);
+
+    semu_set_stopped(&emu, true);
+    test_emu_destroy(&emu);
+}
+
 static void test_paused_hart_services_rfence_without_guest_progress(void)
 {
     emu_state_t emu;
@@ -380,8 +482,7 @@ static void test_paused_hart_services_rfence_without_guest_progress(void)
 
     require_int("pause progressing hart for rfence", semu_pause_all_harts(&emu),
                 0);
-    uint32_t paused_progress =
-        __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
+    uint32_t paused_progress = __atomic_load_n(&ctx.progress, __ATOMIC_ACQUIRE);
 
     emu.rfence.start_addr = 0x1000;
     emu.rfence.size = 0x1000;
@@ -390,8 +491,7 @@ static void test_paused_hart_services_rfence_without_guest_progress(void)
     hart_pending_rfence_store(emu.vm.hart[0], true);
     semu_signal_hart(&emu, 0);
 
-    for (int i = 0; i < 2000 && semu_rfence_pending_count_load(&emu) != 0;
-         i++)
+    for (int i = 0; i < 2000 && semu_rfence_pending_count_load(&emu) != 0; i++)
         sleep_for_ns(1000000L);
 
     require_int("paused hart rfence ack", semu_rfence_pending_count_load(&emu),
@@ -410,6 +510,136 @@ static void test_paused_hart_services_rfence_without_guest_progress(void)
     test_emu_destroy(&emu);
 }
 
+
+
+static _Atomic int spy_rfence_request_calls;
+static int spy_rfence_fail_on_call;
+
+struct observed_rfence_ack_ctx {
+    emu_state_t *emu;
+    hart_t *hart;
+    _Atomic bool observed;
+    _Atomic bool allow_ack;
+    _Atomic bool done;
+};
+
+static bool rfence_target_pending(void *arg)
+{
+    return hart_pending_rfence_load(arg);
+}
+
+static void *observed_rfence_ack_thread(void *arg)
+{
+    struct observed_rfence_ack_ctx *ctx = arg;
+
+    wait_until("RFENCE target observed pending", rfence_target_pending,
+               ctx->hart);
+    __atomic_store_n(&ctx->observed, true, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&ctx->allow_ack, __ATOMIC_ACQUIRE))
+        sleep_for_ns(1000000L);
+
+    hart_pending_rfence_store(ctx->hart, false);
+    semu_rfence_ack(ctx->emu);
+    __atomic_store_n(&ctx->done, true, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static bool observed_rfence_seen(void *arg)
+{
+    struct observed_rfence_ack_ctx *ctx = arg;
+    return __atomic_load_n(&ctx->observed, __ATOMIC_ACQUIRE);
+}
+
+static bool rfence_second_request_seen(void *arg UNUSED)
+{
+    return __atomic_load_n(&spy_rfence_request_calls, __ATOMIC_ACQUIRE) >= 2;
+}
+
+static int spy_request_rfence_fail_after_publish(struct emu_state *emu,
+                                                 uint32_t hart_mask,
+                                                 uint32_t hart_mask_base,
+                                                 uint64_t rfence_seq UNUSED)
+{
+    int calls = __atomic_add_fetch(&spy_rfence_request_calls, 1,
+                                   __ATOMIC_ACQ_REL);
+    if (calls == spy_rfence_fail_on_call)
+        return -EIO;
+
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        if (!semu_rfence_targets_hart(i, hart_mask, hart_mask_base))
+            continue;
+        hart_pending_rfence_store(emu->vm.hart[i], true);
+    }
+    return 0;
+}
+
+static const struct hart_executor_ops spy_rfence_ops = {
+    .request_rfence = spy_request_rfence_fail_after_publish,
+};
+
+struct rfence_request_ctx {
+    hart_t *hart;
+    _Atomic bool done;
+    _Atomic int error;
+};
+
+static void *rfence_request_thread(void *arg)
+{
+    struct rfence_request_ctx *ctx = arg;
+    sbi_ret_t ret = semu_rfence_threaded(ctx->hart, SEMU_RFENCE_I,
+                                         UINT32_C(0x6), 0, 0, 0, 0);
+    __atomic_store_n(&ctx->error, ret.error, __ATOMIC_RELEASE);
+    __atomic_store_n(&ctx->done, true, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void test_threaded_rfence_failure_drains_published_ack(void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 3);
+    emu.executor.ops = &spy_rfence_ops;
+    __atomic_store_n(&spy_rfence_request_calls, 0, __ATOMIC_RELEASE);
+    spy_rfence_fail_on_call = 2;
+
+    struct observed_rfence_ack_ctx ack_ctx = {
+        .emu = &emu,
+        .hart = emu.vm.hart[1],
+    };
+    pthread_t ack_thread;
+    pthread_create(&ack_thread, NULL, observed_rfence_ack_thread, &ack_ctx);
+
+    struct rfence_request_ctx req_ctx = {.hart = emu.vm.hart[0]};
+    pthread_t req_thread;
+    pthread_create(&req_thread, NULL, rfence_request_thread, &req_ctx);
+
+    wait_until("RFENCE first target observed", observed_rfence_seen, &ack_ctx);
+    wait_until("RFENCE second request reached", rfence_second_request_seen, NULL);
+    sleep_for_ns(20000000L);
+    __atomic_store_n(&ack_ctx.allow_ack, true, __ATOMIC_RELEASE);
+
+    pthread_join(req_thread, NULL);
+    pthread_join(ack_thread, NULL);
+
+    require_int("RFENCE partial publish failure",
+                __atomic_load_n(&req_ctx.error, __ATOMIC_ACQUIRE),
+                SBI_ERR_FAILED);
+    require_int("RFENCE request calls before failure",
+                __atomic_load_n(&spy_rfence_request_calls, __ATOMIC_ACQUIRE),
+                2);
+    require_int("observed RFENCE ack completed",
+                __atomic_load_n(&ack_ctx.done, __ATOMIC_ACQUIRE), true);
+    require_int("RFENCE pending count drained",
+                semu_rfence_pending_count_load(&emu), 0);
+    require_int("RFENCE type cleared", semu_rfence_type_load(&emu),
+                SEMU_RFENCE_NONE);
+    require_int("published RFENCE flag cleared after ack",
+                hart_pending_rfence_load(emu.vm.hart[1]), false);
+    require_int("failed RFENCE target flag clear",
+                hart_pending_rfence_load(emu.vm.hart[2]), false);
+
+    test_emu_destroy(&emu);
+}
+
 static void test_hsm_start_rejected_while_pause_active(void)
 {
     emu_state_t emu;
@@ -418,8 +648,8 @@ static void test_hsm_start_rejected_while_pause_active(void)
     hart_t *target = emu.vm.hart[1];
     hart_hsm_status_store(target, SBI_HSM_STATE_STOPPED);
 
-    require_int("request pause for HSM start", semu_vm_lifecycle_request_pause(
-                    &emu.lifecycle), 0);
+    require_int("request pause for HSM start",
+                semu_vm_lifecycle_request_pause(&emu.lifecycle), 0);
     starter->x_regs[RV_R_A0] = 1;
     starter->x_regs[RV_R_A1] = 0x81234000u;
     starter->x_regs[RV_R_A2] = 0x55aa1234u;
@@ -484,10 +714,10 @@ static void test_hsm_start_holds_lifecycle_lock_until_started_publish(void)
     require_int("HART_START publish hook ran",
                 __atomic_load_n(&hsm_publish_hook_called, __ATOMIC_ACQUIRE),
                 true);
-    require_int("HART_START publish held lifecycle lock",
-                __atomic_load_n(&hsm_publish_saw_lifecycle_locked,
-                                __ATOMIC_ACQUIRE),
-                true);
+    require_int(
+        "HART_START publish held lifecycle lock",
+        __atomic_load_n(&hsm_publish_saw_lifecycle_locked, __ATOMIC_ACQUIRE),
+        true);
 
     semu_set_stopped(&emu, true);
     test_emu_destroy(&emu);
@@ -530,8 +760,8 @@ static void test_stop_pending_target_acknowledges_pause_on_park(void)
     test_emu_init(&emu, 1);
     hart_t *hart = emu.vm.hart[0];
 
-    require_int("request pause for stop park", semu_vm_lifecycle_request_pause(
-                    &emu.lifecycle), 0);
+    require_int("request pause for stop park",
+                semu_vm_lifecycle_request_pause(&emu.lifecycle), 0);
     uint64_t seq = semu_vm_lifecycle_pause_seq(&emu.lifecycle);
     hart_pause_request(hart, seq);
     hart_hsm_status_store(hart, SBI_HSM_STATE_STOP_PENDING);
@@ -542,7 +772,7 @@ static void test_stop_pending_target_acknowledges_pause_on_park(void)
                 SBI_HSM_STATE_STOPPED);
     require_u64("stop park acked pause", hart_pause_ack_seq_load(hart), seq);
     require_int("pause coordinator can enter paused after stop park",
-                semu_pause_wait_for_targets(&emu, (bool[]){true}, seq), 0);
+                semu_pause_wait_for_targets(&emu, (bool[]) {true}, seq), 0);
 
     semu_set_stopped(&emu, true);
     test_emu_destroy(&emu);
@@ -554,8 +784,8 @@ static void test_suspend_pending_target_acknowledges_pause_on_park(void)
     test_emu_init(&emu, 1);
     hart_t *hart = emu.vm.hart[0];
 
-    require_int("request pause for suspend park", semu_vm_lifecycle_request_pause(
-                    &emu.lifecycle), 0);
+    require_int("request pause for suspend park",
+                semu_vm_lifecycle_request_pause(&emu.lifecycle), 0);
     uint64_t seq = semu_vm_lifecycle_pause_seq(&emu.lifecycle);
     hart_pause_request(hart, seq);
     hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPEND_PENDING);
@@ -566,7 +796,7 @@ static void test_suspend_pending_target_acknowledges_pause_on_park(void)
                 SBI_HSM_STATE_SUSPENDED);
     require_u64("suspend park acked pause", hart_pause_ack_seq_load(hart), seq);
     require_int("pause coordinator can enter paused after suspend park",
-                semu_pause_wait_for_targets(&emu, (bool[]){true}, seq), 0);
+                semu_pause_wait_for_targets(&emu, (bool[]) {true}, seq), 0);
 
     semu_set_stopped(&emu, true);
     test_emu_destroy(&emu);
@@ -597,9 +827,12 @@ int main(void)
     test_single_thread_scheduler_round_robins_started_harts();
     test_single_thread_refresh_resumes_suspended_interrupt_hart();
     test_pause_targets_only_started_harts_captured_at_request();
+    test_pause_all_harts_requests_through_executor_and_acknowledges();
     test_pause_wakes_wfi_started_hart_and_acknowledges();
     test_hart_does_not_progress_after_pause_ack_until_resume();
+    test_pause_target_parked_before_publish_is_acknowledged();
     test_paused_hart_services_rfence_without_guest_progress();
+    test_threaded_rfence_failure_drains_published_ack();
     test_hsm_start_rejected_while_pause_active();
     test_hsm_start_holds_lifecycle_lock_until_started_publish();
     test_suspended_interrupt_resume_defers_while_paused();
