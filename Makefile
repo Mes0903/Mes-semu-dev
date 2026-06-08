@@ -278,8 +278,13 @@ test-hart-mailbox:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-hart-mailbox.c hart-mailbox.c -o /tmp/test-hart-mailbox $(HOST_TEST_LDLIBS)
 	/tmp/test-hart-mailbox
 
+.PHONY: test-debug-gate
+test-debug-gate: mini-gdbstub/Makefile
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
+	/tmp/test-debug-gate
+
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-debug-gate
 
 OBJS := \
 	riscv.o \
