@@ -293,13 +293,18 @@ test-vm-lifecycle:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-vm-lifecycle.c vm-lifecycle.c -o /tmp/test-vm-lifecycle $(HOST_TEST_LDLIBS)
 	/tmp/test-vm-lifecycle
 
+.PHONY: test-virtio-actor
+test-virtio-actor:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-virtio-actor.c virtio-actor.c semu-event.c -o /tmp/test-virtio-actor $(HOST_TEST_LDLIBS)
+	/tmp/test-virtio-actor
+
 .PHONY: test-debug-gate
 test-debug-gate: mini-gdbstub/Makefile
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-debug-gate
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-semu-event test-vm-lifecycle test-debug-gate
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-semu-event test-vm-lifecycle test-virtio-actor test-debug-gate
 
 OBJS := \
 	riscv.o \
@@ -311,6 +316,7 @@ OBJS := \
 	hart-mailbox.o \
 	semu-event.o \
 	vm-lifecycle.o \
+	virtio-actor.o \
 	uart.o \
 	mmio-bus.o \
 	platform.o \
