@@ -49,7 +49,6 @@ typedef struct {
     emu_state_t emu;
     hart_t harts[2];
     hart_t *hart_slots[2];
-    hart_wait_t hart_wait[2];
 } hsm_fixture_t;
 
 static void fixture_init(hsm_fixture_t *fixture)
@@ -58,14 +57,9 @@ static void fixture_init(hsm_fixture_t *fixture)
 
     fixture->emu.vm.n_hart = 2;
     fixture->emu.vm.hart = fixture->hart_slots;
-    fixture->emu.hart_wait = fixture->hart_wait;
 
     for (uint32_t i = 0; i < fixture->emu.vm.n_hart; i++) {
         fixture->hart_slots[i] = &fixture->harts[i];
-        if (pthread_mutex_init(&fixture->hart_wait[i].mutex, NULL) != 0)
-            fail("hart wait mutex init failed");
-        if (pthread_cond_init(&fixture->hart_wait[i].cond, NULL) != 0)
-            fail("hart wait cond init failed");
 
         fixture->harts[i].priv = &fixture->emu;
         fixture->harts[i].vm = &fixture->emu.vm;
@@ -75,14 +69,14 @@ static void fixture_init(hsm_fixture_t *fixture)
     }
 
     hart_hsm_status_store(&fixture->harts[0], SBI_HSM_STATE_STARTED);
+    if (hart_executor_init(&fixture->emu, HART_EXEC_DEDICATED_THREADS, NULL,
+                           NULL, NULL) != 0)
+        fail("hart executor init failed");
 }
 
 static void fixture_destroy(hsm_fixture_t *fixture)
 {
-    for (uint32_t i = 0; i < fixture->emu.vm.n_hart; i++) {
-        pthread_cond_destroy(&fixture->hart_wait[i].cond);
-        pthread_mutex_destroy(&fixture->hart_wait[i].mutex);
-    }
+    hart_executor_destroy(&fixture->emu);
 }
 
 static void prepare_hsm_ecall(hart_t *hart, uint32_t fid)

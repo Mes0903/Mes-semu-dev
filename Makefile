@@ -248,12 +248,12 @@ phase4-rfence-contract-test:
 
 .PHONY: phase5-hsm-contract-test
 phase5-hsm-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c hart-executor.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
 	/tmp/phase5-hsm-contract-test
 
 .PHONY: phase6-runtime-contract-test
 phase6-runtime-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c executor-config.c hart-executor.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
 	/tmp/phase6-runtime-contract-test
 
 HOST_TEST_CFLAGS := -std=c11 -O2 -g -Wall -Wextra -pthread -I. -include common.h $(DT_CFLAGS)

@@ -20,22 +20,54 @@ static void require_bool(const char *name, bool got, bool want)
     exit(1);
 }
 
-static void test_threaded_runtime_skips_single_hart(void)
+static void require_int(const char *name, int got, int want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %d, want %d\n", name, got, want);
+    exit(1);
+}
+
+static void test_default_selector_maps_hart_count_to_executor_mode(void)
+{
+    require_int("one hart defaults to single-thread",
+                semu_executor_default_mode(1), SEMU_EXECUTOR_SINGLE_THREAD);
+    require_int("SMP defaults to legacy gate",
+                semu_executor_default_mode(2),
+                SEMU_EXECUTOR_THREADED_CPU_WITH_LEGACY_DEVICE_GATE);
+    require_int("SMP default uses dedicated backend",
+                semu_executor_backend_for_mode(semu_executor_default_mode(2)),
+                HART_EXEC_DEDICATED_THREADS);
+}
+
+static void test_runtime_follows_explicit_executor_backend(void)
 {
     emu_state_t emu;
     memset(&emu, 0, sizeof(emu));
 
-    emu.vm.n_hart = 1;
-    require_bool("threaded runtime disabled for one hart",
+    emu.vm.n_hart = 2;
+    emu.executor_mode = SEMU_EXECUTOR_SINGLE_THREAD;
+    emu.executor_backend = semu_executor_backend_for_mode(emu.executor_mode);
+    require_bool("explicit single-thread disables threaded runtime",
                  semu_should_use_threaded_runtime(&emu), false);
-    require_bool("one hart selects single-hart WFI",
+    require_bool("explicit single-thread selects nonblocking WFI",
                  semu_wfi_handler_for_config(&emu) == wfi_handler_single_hart,
                  true);
 
-    emu.vm.n_hart = 2;
-    require_bool("threaded runtime enabled for SMP",
+    emu.executor_mode = SEMU_EXECUTOR_THREADED_CPU_WITH_LEGACY_DEVICE_GATE;
+    emu.executor_backend = semu_executor_backend_for_mode(emu.executor_mode);
+    require_bool("legacy gate enables threaded runtime",
                  semu_should_use_threaded_runtime(&emu), true);
-    require_bool("SMP selects threaded WFI",
+    require_bool("legacy gate selects threaded WFI",
+                 semu_wfi_handler_for_config(&emu) == wfi_handler_threaded,
+                 true);
+
+    emu.executor_mode = SEMU_EXECUTOR_THREADED_CPU_WITH_DEVICE_ACTORS;
+    emu.executor_backend = semu_executor_backend_for_mode(emu.executor_mode);
+    require_bool("actor mode enables threaded runtime",
+                 semu_should_use_threaded_runtime(&emu), true);
+    require_bool("actor mode selects threaded WFI",
                  semu_wfi_handler_for_config(&emu) == wfi_handler_threaded,
                  true);
 }
@@ -80,7 +112,8 @@ static void test_single_hart_wfi_clears_wait_flag_with_interrupt(void)
 
 int main(void)
 {
-    test_threaded_runtime_skips_single_hart();
+    test_default_selector_maps_hart_count_to_executor_mode();
+    test_runtime_follows_explicit_executor_backend();
     test_single_hart_wfi_does_not_block_without_interrupt();
     test_single_hart_wfi_clears_wait_flag_with_interrupt();
     return 0;
