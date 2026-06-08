@@ -366,24 +366,15 @@ static void device_lock_destroy(device_lock_t *lock)
 
 static void emu_device_lock(device_lock_t *lock)
 {
-#ifdef ENABLE_THREADED
     pthread_mutex_lock(&lock->mutex);
     atomic_fetch_add_explicit(&lock->lock_entries, 1, memory_order_relaxed);
-#else
-    (void) lock;
-#endif
 }
 
 static void emu_device_unlock(device_lock_t *lock)
 {
-#ifdef ENABLE_THREADED
     pthread_mutex_unlock(&lock->mutex);
-#else
-    (void) lock;
-#endif
 }
 
-#ifdef ENABLE_THREADED
 typedef struct {
     device_lock_t *lock;
     int *counter;
@@ -401,7 +392,6 @@ static void *device_worker(void *opaque)
 
     return NULL;
 }
-#endif
 
 static void test_device_lock_helper_build_mode_contract(void)
 {
@@ -411,7 +401,6 @@ static void test_device_lock_helper_build_mode_contract(void)
     emu_device_lock(&lock);
     emu_device_unlock(&lock);
 
-#ifdef ENABLE_THREADED
     require_int("threaded device lock helper takes real lock",
                 atomic_load_explicit(&lock.lock_entries, memory_order_relaxed),
                 1);
@@ -426,11 +415,6 @@ static void test_device_lock_helper_build_mode_contract(void)
     pthread_join(threads[1], NULL);
     require_int("threaded device lock serializes MMIO-style critical section",
                 counter, ITERATIONS * 2);
-#else
-    require_int("default device lock helper remains a no-op",
-                atomic_load_explicit(&lock.lock_entries, memory_order_relaxed),
-                0);
-#endif
 
     device_lock_destroy(&lock);
 }

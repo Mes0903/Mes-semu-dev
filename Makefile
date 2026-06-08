@@ -14,11 +14,8 @@ OBJS_EXTRA :=
 
 LDFLAGS :=
 
-ENABLE_THREADED ?= 0
-$(call set-feature, THREADED)
-ifeq ($(call has, THREADED), 1)
-    LDFLAGS += -lpthread
-endif
+CFLAGS += -pthread
+LDFLAGS += -pthread
 
 # external rootfs: boot from /dev/vda instead of unpacking initramfs.
 # Implies VIRTIOBLK and pulls the userland from rootfs.cpio into ext4.img.
@@ -226,10 +223,12 @@ all: $(BIN) minimal.dtb
 
 .PHONY: phase2-threading-contract-test
 phase2-threading-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase2-threading-contract-test.c -o /tmp/phase2-coroutine-contract-test
-	/tmp/phase2-coroutine-contract-test
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -DENABLE_THREADED=1 tests/phase2-threading-contract-test.c -o /tmp/phase2-threaded-contract-test
-	/tmp/phase2-threaded-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread tests/phase2-threading-contract-test.c -o /tmp/phase2-threading-contract-test
+	/tmp/phase2-threading-contract-test
+
+.PHONY: threaded-only-source-contract-test
+threaded-only-source-contract-test:
+	bash .ci/check-threaded-only-source.sh
 
 .PHONY: phase3-memory-model-contract-test
 phase3-memory-model-contract-test:
@@ -238,7 +237,7 @@ phase3-memory-model-contract-test:
 
 .PHONY: phase3-memory-contract-test
 phase3-memory-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -I. -include common.h -D SEMU_FEATURE_THREADED=1 -D SEMU_BOOT_TARGET_TIME=10 tests/phase3-memory-contract-test.c riscv.c ram.c utils.c -o /tmp/phase3-memory-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -I. -include common.h -D SEMU_BOOT_TARGET_TIME=10 tests/phase3-memory-contract-test.c riscv.c ram.c utils.c -o /tmp/phase3-memory-contract-test
 	/tmp/phase3-memory-contract-test
 
 .PHONY: phase4-rfence-contract-test
@@ -248,12 +247,12 @@ phase4-rfence-contract-test:
 
 .PHONY: phase5-hsm-contract-test
 phase5-hsm-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_THREADED=1 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
 	/tmp/phase5-hsm-contract-test
 
 .PHONY: phase6-runtime-contract-test
 phase6-runtime-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_THREADED=1 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
 	/tmp/phase6-runtime-contract-test
 
 OBJS := \
@@ -264,7 +263,6 @@ OBJS := \
 	uart.o \
 	main.o \
 	aclint.o \
-	coro.o \
 	$(OBJS_EXTRA)
 
 deps := $(OBJS:%.o=.%.o.d)

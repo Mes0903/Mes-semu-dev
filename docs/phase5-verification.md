@@ -48,10 +48,7 @@ make phase3-memory-model-contract-test
 make phase3-memory-contract-test
 make phase4-rfence-contract-test
 make clean && make semu
-make clean && ENABLE_THREADED=1 make semu
-ENABLE_THREADED=1 SMP=2 .ci/device-smoke/test-hsm-hotplug.sh
 SMP=2 .ci/device-smoke/test-hsm-hotplug.sh
-SEMU_DIRECTFB2_TEST=0 ENABLE_THREADED=1 SMP=2 bash .ci/device-smoke/test-gpu.sh
 SEMU_DIRECTFB2_TEST=0 SMP=2 bash .ci/device-smoke/test-gpu.sh
 ```
 

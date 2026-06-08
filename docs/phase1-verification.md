@@ -4,6 +4,10 @@ Scope: Phase 1 of `dev-docs/MesDevLog/AOS-SMP/smp-multithread-plan-en.md`.
 Phase 1 is a behavior-preserving state-separation phase; the coroutine path
 must continue to work while shared state becomes ready for OS-threaded harts.
 
+Current note (2026-06-08): this checklist records the Phase 1 landing gate.
+`smp-support` now builds threaded-only, so coroutine references below are
+historical and are not current runtime acceptance criteria.
+
 ## Focused Contract Tests
 
 Run the standalone contract test:

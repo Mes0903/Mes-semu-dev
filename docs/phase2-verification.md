@@ -1,14 +1,14 @@
 # Phase 2 Threading Verification
 
-Scope: Phase 2 threading infrastructure for `semu`, including the opt-in
-`ENABLE_THREADED=1` runtime, pthread hart lifecycle, per-device MMIO mutex
-activation, WFI/HSM wakeup plumbing, timer/SWI wake delivery, and regression
-coverage for the default coroutine path.
+Scope: Phase 2 threading infrastructure for `semu`, including pthread hart
+lifecycle, per-device MMIO mutex activation, WFI/HSM wakeup plumbing, and
+timer/SWI wake delivery. As of 2026-06-08, `smp-support` is threaded-only; the
+old `ENABLE_THREADED=1` opt-in and default coroutine runtime have been removed.
 
 ## Contract Test
 
-The `phase2-threading-contract-test` target builds and runs the model in both
-coroutine/default and threaded configurations:
+The `phase2-threading-contract-test` target builds and runs the threaded-only
+model:
 
 ```sh
 make phase2-threading-contract-test
@@ -24,33 +24,33 @@ Coverage:
   continue while the hart is not STARTED.
 - WFI missed-wakeup protocol: interrupt publication before/during the wait
   still releases the waiter and clears `in_wfi`.
-- Device lock helper is a no-op in the default build and a real serializing
-  lock in the threaded build.
+- Device lock helper is a real serializing lock in the mandatory threaded
+  build.
 - I/O stop/wake can release a scheduler wait without deadlock.
 - Signaling a suspended hart alone does not resume it; an enabled pending
   interrupt is required.
 
-Latest result: pass for both generated binaries.
+Latest result: pass.
 
 ## Integration Results
 
-Fresh local verification on 2026-06-07:
+Current threaded-only local verification gate:
 
 ```sh
 git diff --check
-clang-format-20 --dry-run --Werror   main.c riscv.c riscv.h device.h utils.c utils.h aclint.c uart.c   tests/phase2-threading-contract-test.c
+clang-format-20 --dry-run --Werror \
+  main.c uart.c riscv.c device.h feature.h \
+  tests/phase2-threading-contract-test.c
+make threaded-only-source-contract-test
 make phase2-threading-contract-test
 make clean
 make semu
-make clean
-ENABLE_THREADED=1 make semu
-SEMU_DIRECTFB2_TEST=0 ENABLE_THREADED=1 SMP=2 bash .ci/device-smoke/test-gpu.sh
-SEMU_TEST_TIMEOUT=300 ENABLE_THREADED=1 SMP=2 bash .ci/device-smoke/test-gpu.sh
-SMP=2 bash .ci/device-smoke/test-gpu.sh
-SEMU_TEST_TIMEOUT=240 SEMU_DIRECTFB2_TEST=0 ENABLE_THREADED=1 SMP=4 bash .ci/device-smoke/test-gpu.sh
+SEMU_DIRECTFB2_TEST=0 SMP=2 bash .ci/device-smoke/test-gpu.sh
+SEMU_TEST_TIMEOUT=300 SMP=2 bash .ci/device-smoke/test-gpu.sh
+SEMU_TEST_TIMEOUT=240 SEMU_DIRECTFB2_TEST=0 SMP=4 bash .ci/device-smoke/test-gpu.sh
 ```
 
-All commands above pass. The GPU smoke logs still contain the known local TAP
+The commands above are the current acceptance gate. The GPU smoke logs still contain the known local TAP
 and ALSA warnings; they are non-fatal. The successful guest checks include
 boot/login, `/dev/dri/card0`, `virtio_gpu` binding, and DirectFB2
 `DRMKMS/System` for the full GPU runs.

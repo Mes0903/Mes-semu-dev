@@ -2,6 +2,9 @@
 
 Phase 1 keeps the coroutine execution path intact. The mutex fields added to `emu_state_t` are placeholders for Phase 2 and are initialized during `semu_init()`, but MMIO locking remains a no-op until hart execution moves to OS threads.
 
+Current note (2026-06-08): this audit records Phase 1 history. `smp-support`
+now builds threaded-only, and MMIO locking is active unconditionally.
+
 ## Device State
 
 - PLIC: `plic_state_t` is owned by the emulator state. Hart MMIO and peripheral interrupt refresh both update `ip`, `ie`, `masked`, and `active`; Phase 2 should guard these paths with `plic_lock`.

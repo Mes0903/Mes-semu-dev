@@ -13,8 +13,8 @@ checks:
 - LR/SC check, store, and reservation invalidation are one critical section.
 - Same-word regular stores invalidate active LR reservations before a later SC.
 
-The `phase3-memory-contract-test` target links against `riscv.c` with
-`SEMU_FEATURE_THREADED=1` and executes real encoded guest instructions for:
+The `phase3-memory-contract-test` target links against `riscv.c` in the
+mandatory threaded build and executes real encoded guest instructions for:
 
 - AMOADD.W on RAM from two host threads.
 - LR.W/SC.W invalidation by SW, SH, and SB.
@@ -39,8 +39,6 @@ clang-format-20 --dry-run --Werror \
 make phase3-memory-model-contract-test
 make phase3-memory-contract-test
 make clean && make semu
-make clean && ENABLE_THREADED=1 make semu
-SEMU_DIRECTFB2_TEST=0 ENABLE_THREADED=1 SMP=2 bash .ci/device-smoke/test-gpu.sh
 SEMU_DIRECTFB2_TEST=0 SMP=2 bash .ci/device-smoke/test-gpu.sh
 ```
 

@@ -1,8 +1,7 @@
 # Phase 4 Verification
 
 Phase 4 implements cross-hart RFENCE delivery for the threaded SMP runtime.
-The default coroutine runtime keeps synchronous direct invalidation because harts
-do not execute concurrently there.
+As of 2026-06-08, this threaded path is the only SMP runtime on `smp-support`.
 
 ## Focused Contract Test
 
@@ -47,8 +46,6 @@ make phase3-memory-model-contract-test
 make phase3-memory-contract-test
 make phase4-rfence-contract-test
 make clean && make semu
-make clean && ENABLE_THREADED=1 make semu
-SEMU_DIRECTFB2_TEST=0 ENABLE_THREADED=1 SMP=2 bash .ci/device-smoke/test-gpu.sh
 SEMU_DIRECTFB2_TEST=0 SMP=2 bash .ci/device-smoke/test-gpu.sh
 ```
 
