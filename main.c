@@ -19,6 +19,7 @@
 #endif
 
 #include "device.h"
+#include "irq-source.h"
 #include "mini-gdbstub/include/gdbstub.h"
 #include "mmio-bus.h"
 #include "platform.h"
@@ -212,7 +213,7 @@ static void semu_wake_hart_if_interrupt_pending(emu_state_t *emu,
         semu_resume_hart(emu, hartid);
 }
 
-static void semu_wake_interruptible_harts(emu_state_t *emu)
+void semu_wake_interruptible_harts(emu_state_t *emu)
 {
     for (uint32_t i = 0; i < emu->vm.n_hart; i++)
         semu_wake_hart_if_interrupt_pending(emu, i);
@@ -353,12 +354,11 @@ static void UNUSED semu_lock_rfence_issue(emu_state_t *emu, hart_t *requester)
     }
 }
 
-static void emu_update_plic_irq(emu_state_t *emu, uint32_t irq_bit, bool active)
+static void emu_update_plic_irq(emu_state_t *emu,
+                                enum semu_irq_source source,
+                                bool active)
 {
-    EMU_DEVICE_CALL(emu->plic_lock, if (active) emu->plic.active |= irq_bit;
-                    else emu->plic.active &= ~irq_bit;
-                    plic_update_interrupts(&emu->vm, &emu->plic));
-    semu_wake_interruptible_harts(emu);
+    semu_irq_source_set(emu, source, active);
 }
 
 /* Define fetch separately since it is simpler (fixed width, already checked
@@ -391,7 +391,7 @@ static void UNUSED emu_update_uart_interrupts(vm_t *vm)
 
     EMU_DEVICE_CALL(data->uart_lock, u8250_update_interrupts(&data->uart);
                     pending = data->uart.pending_ints != 0);
-    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_UART, pending);
 }
 
 #if SEMU_HAS(VIRTIONET)
@@ -401,7 +401,7 @@ static void UNUSED emu_update_vnet_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vnet_lock, pending = data->vnet.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VNET, pending);
 }
 #endif
 
@@ -412,7 +412,7 @@ static void UNUSED emu_update_vblk_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vblk_lock, pending = data->vblk.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VBLK, pending);
 }
 #endif
 
@@ -423,7 +423,7 @@ static void UNUSED emu_update_vrng_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vrng_lock, pending = data->vrng.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VRNG, pending);
 }
 #endif
 
@@ -435,7 +435,7 @@ static void UNUSED emu_update_vinput_keyboard_interrupts(vm_t *vm)
 
     EMU_DEVICE_CALL(data->vkeyboard_lock,
                     pending = virtio_input_irq_pending(&data->vkeyboard));
-    emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VINPUT_KEYBOARD, pending);
 }
 
 static void UNUSED emu_update_vinput_mouse_interrupts(vm_t *vm)
@@ -445,7 +445,7 @@ static void UNUSED emu_update_vinput_mouse_interrupts(vm_t *vm)
 
     EMU_DEVICE_CALL(data->vmouse_lock,
                     pending = virtio_input_irq_pending(&data->vmouse));
-    emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VINPUT_MOUSE, pending);
 }
 #endif
 
@@ -456,7 +456,7 @@ static void UNUSED emu_update_vgpu_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vgpu_lock, pending = data->vgpu.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VGPU, pending);
 }
 #endif
 
@@ -482,7 +482,7 @@ static void UNUSED emu_update_vsnd_interrupts(vm_t *vm)
     EMU_DEVICE_CALL(data->vsnd_lock,
                     pending = __atomic_load_n(&data->vsnd.InterruptStatus,
                                               __ATOMIC_ACQUIRE) != 0);
-    emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VSND, pending);
 }
 #endif
 
@@ -493,7 +493,7 @@ static void UNUSED emu_update_vfs_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vfs_lock, pending = data->vfs.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VFS, pending);
 }
 #endif
 
@@ -524,34 +524,34 @@ static void io_poll_peripherals(emu_state_t *emu)
                     u8250_flush_out(&emu->uart);
                     u8250_update_interrupts(&emu->uart);
                     pending = emu->uart.pending_ints != 0);
-    emu_update_plic_irq(emu, IRQ_UART_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_UART, pending);
 
 #if SEMU_HAS(VIRTIONET)
     EMU_DEVICE_CALL(emu->vnet_lock, virtio_net_refresh_queue(&emu->vnet);
                     pending = emu->vnet.InterruptStatus != 0);
-    emu_update_plic_irq(emu, IRQ_VNET_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VNET, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOBLK)
     EMU_DEVICE_CALL(emu->vblk_lock, pending = emu->vblk.InterruptStatus != 0);
-    emu_update_plic_irq(emu, IRQ_VBLK_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VBLK, pending);
 #endif
 
 #if SEMU_HAS(VIRTIORNG)
     EMU_DEVICE_CALL(emu->vrng_lock, pending = emu->vrng.InterruptStatus != 0);
-    emu_update_plic_irq(emu, IRQ_VRNG_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VRNG, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
     EMU_DEVICE_CALL(emu->vsnd_lock,
                     pending = __atomic_load_n(&emu->vsnd.InterruptStatus,
                                               __ATOMIC_ACQUIRE) != 0);
-    emu_update_plic_irq(emu, IRQ_VSND_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VSND, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
     EMU_DEVICE_CALL(emu->vfs_lock, pending = emu->vfs.InterruptStatus != 0);
-    emu_update_plic_irq(emu, IRQ_VFS_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VFS, pending);
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
     /* The empty path is common during CI and boot workloads, so only
@@ -568,11 +568,11 @@ static void io_poll_peripherals(emu_state_t *emu)
 
     EMU_DEVICE_CALL(emu->vkeyboard_lock,
                     pending = virtio_input_irq_pending(&emu->vkeyboard));
-    emu_update_plic_irq(emu, IRQ_VINPUT_KEYBOARD_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VINPUT_KEYBOARD, pending);
 
     EMU_DEVICE_CALL(emu->vmouse_lock,
                     pending = virtio_input_irq_pending(&emu->vmouse));
-    emu_update_plic_irq(emu, IRQ_VINPUT_MOUSE_BIT, pending);
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VINPUT_MOUSE, pending);
 #endif
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     /* A closed window is treated like a frontend shutdown request. */
@@ -702,7 +702,7 @@ static bool semu_mmio_uart_read(hart_t *hart,
                                value);
                     u8250_update_interrupts(&data->uart);
                     pending = data->uart.pending_ints != 0);
-    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_UART, pending);
     return true;
 }
 
@@ -720,7 +720,7 @@ static bool semu_mmio_uart_write(hart_t *hart,
                                 value);
                     u8250_update_interrupts(&data->uart);
                     pending = data->uart.pending_ints != 0);
-    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_UART, pending);
     return true;
 }
 
@@ -752,7 +752,7 @@ static bool semu_mmio_vnet_write(hart_t *hart,
                     virtio_net_write(hart, &data->vnet, (uint32_t) off, width,
                                      value);
                     pending = data->vnet.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VNET, pending);
     return true;
 }
 #endif
@@ -785,7 +785,7 @@ static bool semu_mmio_vblk_write(hart_t *hart,
                     virtio_blk_write(hart, &data->vblk, (uint32_t) off, width,
                                      value);
                     pending = data->vblk.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VBLK, pending);
     return true;
 }
 #endif
@@ -929,7 +929,7 @@ static bool semu_mmio_vrng_write(hart_t *hart,
                     virtio_rng_write(hart, &data->vrng, (uint32_t) off, width,
                                      value);
                     pending = data->vrng.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VRNG, pending);
     return true;
 }
 #endif
@@ -963,7 +963,7 @@ static bool semu_mmio_vsnd_write(hart_t *hart,
                                      value);
                     pending = __atomic_load_n(&data->vsnd.InterruptStatus,
                                               __ATOMIC_ACQUIRE) != 0);
-    emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VSND, pending);
     return true;
 }
 #endif
@@ -996,7 +996,7 @@ static bool semu_mmio_vfs_write(hart_t *hart,
                     virtio_fs_write(hart, &data->vfs, (uint32_t) off, width,
                                     value);
                     pending = data->vfs.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VFS, pending);
     return true;
 }
 #endif
@@ -1029,7 +1029,7 @@ static bool semu_mmio_vkeyboard_write(hart_t *hart,
                     virtio_input_write(hart, &data->vkeyboard, (uint32_t) off,
                                        width, value);
                     pending = virtio_input_irq_pending(&data->vkeyboard));
-    emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VINPUT_KEYBOARD, pending);
     return true;
 }
 
@@ -1060,7 +1060,7 @@ static bool semu_mmio_vmouse_write(hart_t *hart,
                     virtio_input_write(hart, &data->vmouse, (uint32_t) off,
                                        width, value);
                     pending = virtio_input_irq_pending(&data->vmouse));
-    emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VINPUT_MOUSE, pending);
     return true;
 }
 #endif
@@ -1093,7 +1093,7 @@ static bool semu_mmio_vgpu_write(hart_t *hart,
                     virtio_gpu_write(hart, &data->vgpu, (uint32_t) off, width,
                                      value);
                     pending = data->vgpu.InterruptStatus != 0);
-    emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
+    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VGPU, pending);
     return true;
 }
 #endif
