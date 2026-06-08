@@ -288,18 +288,40 @@ static inline bool hart_hsm_status_compare_exchange(hart_t *hart,
 
 static inline bool hart_hsm_resume_pending_load(const hart_t *hart)
 {
-    return semu_hart_mailbox_has(&hart->mailbox,
-                                 SEMU_HART_MAILBOX_HSM_RESUME);
+    return semu_hart_mailbox_has(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
 }
 
 static inline void hart_hsm_resume_pending_store(hart_t *hart, bool value)
 {
     if (value)
-        semu_hart_mailbox_request(&hart->mailbox,
-                                  SEMU_HART_MAILBOX_HSM_RESUME);
+        semu_hart_mailbox_request(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
     else
-        semu_hart_mailbox_clear(&hart->mailbox,
-                                SEMU_HART_MAILBOX_HSM_RESUME);
+        semu_hart_mailbox_clear(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
+}
+
+static inline bool hart_pause_pending_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_has(&hart->mailbox, SEMU_HART_MAILBOX_PAUSE);
+}
+
+static inline uint64_t hart_pause_request_seq_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_pause_request_seq(&hart->mailbox);
+}
+
+static inline uint64_t hart_pause_ack_seq_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_pause_ack_seq(&hart->mailbox);
+}
+
+static inline void hart_pause_request(hart_t *hart, uint64_t seq)
+{
+    semu_hart_mailbox_pause_request(&hart->mailbox, seq);
+}
+
+static inline void hart_pause_ack(hart_t *hart, uint64_t seq)
+{
+    semu_hart_mailbox_pause_ack(&hart->mailbox, seq);
 }
 
 void vm_init(hart_t *vm);
