@@ -41,11 +41,13 @@ struct vgpu_sw_resource_2d {
     struct list_head list;
 };
 
-/* Process-wide singleton: semu currently assumes at most one software
- * virtio-gpu backend instance per process.
- */
-static LIST_HEAD(g_vgpu_sw_res_2d_list);
-static size_t g_vgpu_sw_hostmem;
+#define SW(vgpu) (&((vgpu)->sw_backend))
+
+void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu)
+{
+    INIT_LIST_HEAD(&SW(vgpu)->res_2d_list);
+    SW(vgpu)->hostmem = 0;
+}
 
 static size_t vgpu_sw_iov_to_buf(const struct iovec *iov,
                                  unsigned int iov_cnt,
@@ -197,19 +199,22 @@ static bool vgpu_sw_copy_image_from_pages(
     return true;
 }
 
-static void vgpu_sw_destroy_resource_2d(struct vgpu_sw_resource_2d *res_2d)
+static void vgpu_sw_destroy_resource_2d(virtio_gpu_state_t *vgpu,
+                                        struct vgpu_sw_resource_2d *res_2d)
 {
     list_del(&res_2d->list);
-    g_vgpu_sw_hostmem -= res_2d->image_size;
+    SW(vgpu)->hostmem -= res_2d->image_size;
     free(res_2d->image);
     free(res_2d->iovec);
     free(res_2d);
 }
 
-static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(uint32_t resource_id)
+static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(
+    virtio_gpu_state_t *vgpu,
+    uint32_t resource_id)
 {
     struct vgpu_sw_resource_2d *res_2d;
-    list_for_each_entry (res_2d, &g_vgpu_sw_res_2d_list, list) {
+    list_for_each_entry (res_2d, &SW(vgpu)->res_2d_list, list) {
         if (res_2d->resource_id == resource_id)
             return res_2d;
     }
@@ -226,6 +231,74 @@ static struct virtio_gpu_scanout_info *vgpu_sw_get_scanout(
 
     struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[scanout_id];
     return scanout->enabled ? scanout : NULL;
+}
+
+static bool vgpu_sw_can_publish_command(virtio_gpu_state_t *vgpu)
+{
+    return virtio_gpu_actor_drain_current(vgpu);
+}
+
+static bool vgpu_sw_can_publish_frame(virtio_gpu_state_t *vgpu)
+{
+    return vgpu_sw_can_publish_command(vgpu) && vgpu_display_can_publish();
+}
+
+static void vgpu_sw_publish_primary_clear(virtio_gpu_state_t *vgpu,
+                                          uint32_t scanout_id)
+{
+    if (!virtio_gpu_begin_actor_completion(vgpu))
+        return;
+    vgpu_display_publish_primary_clear(scanout_id);
+    virtio_gpu_end_actor_completion(vgpu);
+}
+
+static void vgpu_sw_publish_cursor_clear(virtio_gpu_state_t *vgpu,
+                                         uint32_t scanout_id)
+{
+    if (!virtio_gpu_begin_actor_completion(vgpu))
+        return;
+    vgpu_display_publish_cursor_clear(scanout_id);
+    virtio_gpu_end_actor_completion(vgpu);
+}
+
+static void vgpu_sw_publish_primary_set(virtio_gpu_state_t *vgpu,
+                                        uint32_t scanout_id,
+                                        struct vgpu_display_payload *payload)
+{
+    if (!virtio_gpu_begin_actor_completion(vgpu)) {
+        free(payload);
+        return;
+    }
+    vgpu_display_publish_primary_set(scanout_id, payload);
+    virtio_gpu_end_actor_completion(vgpu);
+}
+
+static bool vgpu_sw_publish_cursor_set(virtio_gpu_state_t *vgpu,
+                                       uint32_t scanout_id,
+                                       struct vgpu_display_payload *payload,
+                                       int32_t x,
+                                       int32_t y,
+                                       uint32_t hot_x,
+                                       uint32_t hot_y)
+{
+    if (!virtio_gpu_begin_actor_completion(vgpu)) {
+        free(payload);
+        return false;
+    }
+    vgpu_display_publish_cursor_set(scanout_id, payload, x, y, hot_x, hot_y);
+    virtio_gpu_end_actor_completion(vgpu);
+    return true;
+}
+
+static void vgpu_sw_publish_cursor_move(virtio_gpu_state_t *vgpu,
+                                        uint32_t scanout_id,
+                                        int32_t x,
+                                        int32_t y)
+{
+    if (!virtio_gpu_begin_actor_completion(vgpu))
+        return;
+    vgpu_display_publish_cursor_move(scanout_id, x, y);
+    virtio_gpu_end_actor_completion(vgpu);
 }
 
 static struct vgpu_display_payload *vgpu_sw_create_window_payload(
@@ -361,11 +434,11 @@ static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
     }
 
     struct list_head *curr, *next;
-    list_for_each_safe (curr, next, &g_vgpu_sw_res_2d_list) {
+    list_for_each_safe (curr, next, &SW(vgpu)->res_2d_list) {
         struct vgpu_sw_resource_2d *res_2d =
             list_entry(curr, struct vgpu_sw_resource_2d, list);
 
-        vgpu_sw_destroy_resource_2d(res_2d);
+        vgpu_sw_destroy_resource_2d(vgpu, res_2d);
     }
 }
 
@@ -426,7 +499,7 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
      * confuse later 'TRANSFER' / 'FLUSH' / 'UNREF' requests that target the
      * same id. Spec explicitly allows the device to fail this.
      */
-    if (vgpu_sw_get_resource_2d(request->resource_id)) {
+    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX "%s(): resource id %u already in use\n",
                 __func__, request->resource_id);
@@ -523,7 +596,7 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     }
 
     if (image_size > VGPU_SW_MAX_HOSTMEM ||
-        g_vgpu_sw_hostmem > VGPU_SW_MAX_HOSTMEM - image_size) {
+        SW(vgpu)->hostmem > VGPU_SW_MAX_HOSTMEM - image_size) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): image memory limit exceeded (%zu bytes)\n",
@@ -551,8 +624,8 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
         return;
     }
     res_2d->image_size = image_size;
-    g_vgpu_sw_hostmem += image_size;
-    list_push(&res_2d->list, &g_vgpu_sw_res_2d_list);
+    SW(vgpu)->hostmem += image_size;
+    list_push(&res_2d->list, &SW(vgpu)->res_2d_list);
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -581,7 +654,7 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
     }
 
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -606,16 +679,16 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
             scanout->primary_resource_id = 0;
             scanout->src_x = scanout->src_y = 0;
             scanout->src_w = scanout->src_h = 0;
-            vgpu_display_publish_primary_clear(i);
+            vgpu_sw_publish_primary_clear(vgpu, i);
         }
 
         if (scanout->cursor_resource_id == request->resource_id) {
             scanout->cursor_resource_id = 0;
-            vgpu_display_publish_cursor_clear(i);
+            vgpu_sw_publish_cursor_clear(vgpu, i);
         }
     }
 
-    vgpu_sw_destroy_resource_2d(res_2d);
+    vgpu_sw_destroy_resource_2d(vgpu, res_2d);
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -667,13 +740,13 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         scanout->primary_resource_id = 0;
         scanout->src_x = scanout->src_y = 0;
         scanout->src_w = scanout->src_h = 0;
-        vgpu_display_publish_primary_clear(request->scanout_id);
+        vgpu_sw_publish_primary_clear(vgpu, request->scanout_id);
         goto leave;
     }
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, request->resource_id);
@@ -756,7 +829,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, request->resource_id);
@@ -799,7 +872,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
          * snapshot allocation fails below, this flush frame for scanout 'i' is
          * dropped and the frontend keeps showing its previous published frame.
          */
-        if (!vgpu_display_can_publish())
+        if (!vgpu_sw_can_publish_frame(vgpu))
             continue;
 
         struct vgpu_display_payload *payload =
@@ -811,7 +884,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
          * scanout. 'request->r' is not used here to further trim the payload
          * for now.
          */
-        vgpu_display_publish_primary_set(i, payload);
+        vgpu_sw_publish_primary_set(vgpu, i, payload);
     }
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
@@ -842,7 +915,7 @@ static void vgpu_sw_cmd_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(req->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, req->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, req->resource_id);
@@ -1048,7 +1121,7 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
     }
 
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(backing_info->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, backing_info->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, backing_info->resource_id);
@@ -1159,7 +1232,7 @@ static void vgpu_sw_cmd_resource_detach_backing_handler(
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
 
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
@@ -1259,14 +1332,14 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
      */
     if (cursor->resource_id == 0) {
         scanout->cursor_resource_id = 0;
-        vgpu_display_publish_cursor_clear(cursor->pos.scanout_id);
+        vgpu_sw_publish_cursor_clear(vgpu, cursor->pos.scanout_id);
         *plen = 0;
         return;
     }
 
     /* Update cursor image */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(cursor->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, cursor->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, cursor->resource_id);
@@ -1290,7 +1363,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
      * still visible and is used by RESOURCE_UNREF to decide whether to publish
      * a clear.
      */
-    if (!vgpu_display_can_publish()) {
+    if (!vgpu_sw_can_publish_frame(vgpu)) {
         *plen = 0;
         return;
     }
@@ -1304,11 +1377,11 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
-    scanout->cursor_resource_id = cursor->resource_id;
-    vgpu_display_publish_cursor_set(cursor->pos.scanout_id, payload,
-                                    vgpu_sw_decode_cursor_coord(cursor->pos.x),
-                                    vgpu_sw_decode_cursor_coord(cursor->pos.y),
-                                    cursor->hot_x, cursor->hot_y);
+    if (vgpu_sw_publish_cursor_set(vgpu, cursor->pos.scanout_id, payload,
+                                   vgpu_sw_decode_cursor_coord(cursor->pos.x),
+                                   vgpu_sw_decode_cursor_coord(cursor->pos.y),
+                                   cursor->hot_x, cursor->hot_y))
+        scanout->cursor_resource_id = cursor->resource_id;
 
     *plen = 0;
 }
@@ -1354,9 +1427,9 @@ static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
     }
 
     /* Move cursor to new position */
-    vgpu_display_publish_cursor_move(
-        cursor->pos.scanout_id, vgpu_sw_decode_cursor_coord(cursor->pos.x),
-        vgpu_sw_decode_cursor_coord(cursor->pos.y));
+    vgpu_sw_publish_cursor_move(vgpu, cursor->pos.scanout_id,
+                                vgpu_sw_decode_cursor_coord(cursor->pos.x),
+                                vgpu_sw_decode_cursor_coord(cursor->pos.y));
 
     *plen = 0;
 }

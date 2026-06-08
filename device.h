@@ -1,6 +1,8 @@
 #pragma once
 
 #include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
@@ -8,6 +10,8 @@
 #include "mmio-bus.h"
 #include "ram_access.h"
 #include "riscv.h"
+#include "utils.h"
+#include "virtio-actor.h"
 #include "virtio-device.h"
 #include "virtio.h"
 #include "vm-lifecycle.h"
@@ -291,8 +295,17 @@ bool virtio_input_irq_pending(virtio_input_state_t *vinput);
 #define IRQ_VGPU 9
 #define IRQ_VGPU_BIT (1 << IRQ_VGPU)
 
+struct virtio_gpu_sw_backend_state {
+    struct list_head res_2d_list;
+    size_t hostmem;
+};
+
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    struct virtio_gpu_sw_backend_state sw_backend;
+    uint64_t actor_drain_generation;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */

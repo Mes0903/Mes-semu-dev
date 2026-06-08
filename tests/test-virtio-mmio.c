@@ -47,9 +47,16 @@ struct backend_state {
     struct virtq *activate_queues;
     uint16_t activate_num_queues;
     struct virtio_irq *activate_irq;
+    int prepare_reset_count;
+    uint64_t prepare_reset_old_generation;
+    uint64_t prepare_reset_new_generation;
+    bool prepare_reset_queue_ready;
+    uint16_t prepare_reset_last_avail;
     int reset_count;
     uint64_t reset_old_generation;
     uint64_t reset_new_generation;
+    bool reset_queue_ready;
+    uint16_t reset_last_avail;
     int notify_count;
     uint16_t notify_queue;
     uint64_t notify_generation;
@@ -60,6 +67,8 @@ struct backend_state {
     uint32_t last_config_write_offset;
     uint32_t last_config_write_size;
     uint32_t last_config_write_value;
+    int notify_ret;
+    bool notify_saw_backend_lock_held;
 };
 
 static int backend_activate(void *opaque,
@@ -76,6 +85,21 @@ static int backend_activate(void *opaque,
     return state->activate_ret;
 }
 
+static int backend_prepare_reset(void *opaque,
+                                 uint64_t old_generation,
+                                 uint64_t new_generation)
+{
+    struct backend_state *state = opaque;
+    struct virtio_device_common *common = state->activate_common;
+
+    state->prepare_reset_count++;
+    state->prepare_reset_old_generation = old_generation;
+    state->prepare_reset_new_generation = new_generation;
+    state->prepare_reset_queue_ready = common->queues[0].ready;
+    state->prepare_reset_last_avail = common->queues[0].last_avail;
+    return 0;
+}
+
 static int backend_reset(void *opaque,
                          uint64_t old_generation,
                          uint64_t new_generation)
@@ -85,18 +109,26 @@ static int backend_reset(void *opaque,
     state->reset_count++;
     state->reset_old_generation = old_generation;
     state->reset_new_generation = new_generation;
+    state->reset_queue_ready = state->activate_common->queues[0].ready;
+    state->reset_last_avail = state->activate_common->queues[0].last_avail;
     return 0;
 }
 
-static void backend_notify_queue(void *opaque,
-                                 uint16_t queue_index,
-                                 uint64_t generation)
+static int backend_notify_queue(void *opaque,
+                                uint16_t queue_index,
+                                uint64_t generation)
 {
     struct backend_state *state = opaque;
+    int lock_ret;
 
     state->notify_count++;
     state->notify_queue = queue_index;
     state->notify_generation = generation;
+    lock_ret = pthread_mutex_trylock(&state->activate_common->backend_lock);
+    state->notify_saw_backend_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&state->activate_common->backend_lock);
+    return state->notify_ret;
 }
 
 static uint32_t backend_read_config(void *opaque,
@@ -126,6 +158,7 @@ static void backend_write_config(void *opaque,
 
 static const struct virtio_device_ops backend_ops = {
     .activate = backend_activate,
+    .prepare_reset = backend_prepare_reset,
     .reset = backend_reset,
     .notify_queue = backend_notify_queue,
     .read_config = backend_read_config,
@@ -240,6 +273,7 @@ static void init_common(struct virtio_device_common *common,
 
     memset(backend, 0, sizeof(*backend));
     require_int("common init", virtio_device_common_init(common, &config), 0);
+    backend->activate_common = common;
 }
 
 static uint32_t read_reg(struct virtio_device_common *common, uint32_t reg)
@@ -460,9 +494,35 @@ static void test_queue_notify_does_not_drain_queue(void)
     require_u16("notify queue", backend.notify_queue, 0);
     require_u64("notify generation", backend.notify_generation,
                 common.generation);
+    require_true("notify runs under backend lock",
+                 backend.notify_saw_backend_lock_held);
     require_u16("notify did not drain", common.queues[0].last_avail, 0);
     require_int("notify invalid queue",
                 virtio_mmio_write(&common, REG(QueueNotify), 4, 1), -EINVAL);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
+static void test_queue_notify_propagates_async_enqueue_failure(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    const uint16_t queue_max_sizes[] = {8};
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+
+    backend.notify_ret = -EAGAIN;
+    require_int("notify async enqueue failure",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), -EAGAIN);
+    require_int("notify attempted once", backend.notify_count, 1);
 
     virtio_device_common_destroy(&common);
     destroy_test_emu(&emu);
@@ -620,16 +680,30 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
     write_reg(&common, REG(Status), VIRTIO_STATUS__DRIVER_OK);
     virtio_irq_trigger(&common.irq, VIRTIO_INT__USED_RING);
     common.config_generation = 7;
+    common.queues[0].last_avail = 5;
     old_generation = common.generation;
 
     write_reg(&common, REG(Status), 0);
     require_u32("reset status", read_reg(&common, REG(Status)), 0);
     require_u64("reset generation", common.generation, old_generation + 1);
+    require_int("prepare reset callback count", backend.prepare_reset_count, 1);
+    require_u64("prepare reset callback old",
+                backend.prepare_reset_old_generation, old_generation);
+    require_u64("prepare reset callback new",
+                backend.prepare_reset_new_generation, old_generation + 1);
+    require_true("prepare reset sees queue ready",
+                 backend.prepare_reset_queue_ready);
+    require_u16("prepare reset sees old last_avail",
+                backend.prepare_reset_last_avail, 5);
     require_int("reset callback count", backend.reset_count, 1);
     require_u64("reset callback old", backend.reset_old_generation,
                 old_generation);
     require_u64("reset callback new", backend.reset_new_generation,
                 old_generation + 1);
+    require_false("reset callback sees queue cleared",
+                  backend.reset_queue_ready);
+    require_u16("reset callback sees last_avail cleared",
+                backend.reset_last_avail, 0);
     require_false("reset clears queue ready", common.queues[0].ready);
     require_u32("reset clears QueueReady", read_reg(&common, REG(QueueReady)),
                 0);
@@ -732,6 +806,7 @@ int main(void)
     test_features_ok_validation_and_immutability();
     test_queue_selection_and_ready_freezes_config();
     test_queue_notify_does_not_drain_queue();
+    test_queue_notify_propagates_async_enqueue_failure();
     test_status_order_rejects_bare_driver_ok();
     test_driver_ok_activation_edge();
     test_activation_failure_marks_needs_reset();

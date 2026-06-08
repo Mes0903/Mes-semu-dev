@@ -177,6 +177,7 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                        uint64_t generation)
 {
     bool still_current;
+    int ret;
 
     pthread_mutex_lock(&common->backend_lock);
     pthread_mutex_lock(&common->transport_lock);
@@ -190,9 +191,9 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
         return -ECANCELED;
     }
 
-    ops->notify_queue(opaque, queue_index, generation);
+    ret = ops->notify_queue(opaque, queue_index, generation);
     pthread_mutex_unlock(&common->backend_lock);
-    return 0;
+    return ret;
 }
 
 static int virtio_mmio_set_status_locked(
@@ -374,6 +375,25 @@ int virtio_device_common_reset(struct virtio_device_common *common)
     old_generation = common->generation;
     new_generation = old_generation + 1;
     common->generation = new_generation;
+    ops = common->ops;
+    opaque = common->opaque;
+    pthread_mutex_unlock(&common->transport_lock);
+
+    if (ops && ops->prepare_reset) {
+        ret = ops->prepare_reset(opaque, old_generation, new_generation);
+        if (ret < 0) {
+            pthread_mutex_lock(&common->transport_lock);
+            common->activated = false;
+            atomic_fetch_or_explicit(&common->status,
+                                     VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                                     memory_order_release);
+            pthread_mutex_unlock(&common->transport_lock);
+            pthread_mutex_unlock(&common->backend_lock);
+            return ret;
+        }
+    }
+
+    pthread_mutex_lock(&common->transport_lock);
     common->driver_features = 0;
     common->device_features_sel = 0;
     common->driver_features_sel = 0;
@@ -387,8 +407,6 @@ int virtio_device_common_reset(struct virtio_device_common *common)
     }
     if (common->irq_initialized)
         virtio_irq_ack(&common->irq, UINT32_MAX);
-    ops = common->ops;
-    opaque = common->opaque;
     pthread_mutex_unlock(&common->transport_lock);
 
     if (ops && ops->reset)

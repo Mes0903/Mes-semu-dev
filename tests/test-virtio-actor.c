@@ -480,6 +480,55 @@ static void test_reset_waits_for_claimed_backend_mutation(void)
     backend_destroy(&backend);
 }
 
+static void test_completion_section_blocks_reset(void)
+{
+    struct virtio_actor actor;
+    struct test_backend backend;
+    struct reset_args args = {0};
+    pthread_t thread;
+
+    backend_init(&backend);
+    require_int("init", virtio_actor_init(&actor, &test_ops, &backend, 4), 0);
+    require_int("configure", virtio_actor_enter_configuring(&actor), 0);
+    require_int("activate", virtio_actor_activate(&actor), 0);
+    require_true("begin completion", virtio_actor_begin_completion(&actor, 0));
+
+    args.actor = &actor;
+    args.backend = &backend;
+    args.ret = -EAGAIN;
+    require_int("reset thread create",
+                pthread_create(&thread, NULL, reset_thread, &args), 0);
+    sleep_ms(30);
+    require_false(
+        "reset waits for completion section",
+        atomic_load_explicit(&backend.reset_done, memory_order_acquire));
+
+    require_int("end completion", virtio_actor_end_completion(&actor), 0);
+    require_int("reset thread join", pthread_join(thread, NULL), 0);
+    require_int("reset ret", args.ret, 0);
+    require_u64("reset generation", virtio_actor_generation(&actor), 1);
+
+    virtio_actor_destroy(&actor);
+    backend_destroy(&backend);
+}
+
+static void test_completion_begin_fails_after_reset_wins(void)
+{
+    struct virtio_actor actor;
+    struct test_backend backend;
+
+    backend_init(&backend);
+    require_int("init", virtio_actor_init(&actor, &test_ops, &backend, 4), 0);
+    require_int("configure", virtio_actor_enter_configuring(&actor), 0);
+    require_int("activate", virtio_actor_activate(&actor), 0);
+    require_int("reset", virtio_actor_reset(&actor), 0);
+    require_false("old generation completion rejected",
+                  virtio_actor_begin_completion(&actor, 0));
+
+    virtio_actor_destroy(&actor);
+    backend_destroy(&backend);
+}
+
 static void test_stop_wakes_sleeping_or_paused_actor(void)
 {
     struct virtio_actor actor;
@@ -657,6 +706,8 @@ int main(void)
     test_clear_recheck_prevents_lost_wakeup();
     test_reset_while_paused_does_not_deadlock();
     test_reset_waits_for_claimed_backend_mutation();
+    test_completion_section_blocks_reset();
+    test_completion_begin_fails_after_reset_wins();
     test_stop_wakes_sleeping_or_paused_actor();
     test_fail_marks_failed_and_wakes_waiters();
     test_wait_until_returns_error_on_failed_state();
