@@ -672,7 +672,10 @@ static void test_config_and_unimplemented_common_registers(void)
     require_u32("config write size", backend.last_config_write_size, 1);
     require_u32("config write value", backend.last_config_write_value, 0x55);
 
-    require_u32("SHM len low", read_reg(&common, REG(SHMLenLow)), 0);
+    require_u32("missing SHM len low", read_reg(&common, REG(SHMLenLow)),
+                UINT32_MAX);
+    require_u32("missing SHM len high", read_reg(&common, REG(SHMLenHigh)),
+                UINT32_MAX);
     require_u32("SHM base high", read_reg(&common, REG(SHMBaseHigh)), 0);
     require_u32("QueueReset read", read_reg(&common, REG(QueueReset)), 0);
     write_reg(&common, REG(QueueReset), 1);

@@ -24,8 +24,11 @@ enum {
 
 typedef struct {
     uint32_t ram[TEST_RAM_WORDS];
+    vm_t *machine;
+    bool check_mmio_store_lock;
     unsigned mmio_loads;
     unsigned mmio_stores;
+    unsigned mmio_store_lock_held;
 } test_mem_t;
 
 typedef struct {
@@ -102,6 +105,12 @@ static void test_mem_store(hart_t *hart,
     test_mem_t *mem = hart->priv;
 
     if (addr == TEST_MMIO_ADDR && width == RV_MEM_SW) {
+        if (mem->check_mmio_store_lock && mem->machine) {
+            if (pthread_mutex_trylock(&mem->machine->reservation_lock) == 0)
+                pthread_mutex_unlock(&mem->machine->reservation_lock);
+            else
+                mem->mmio_store_lock_held++;
+        }
         mem->mmio_stores++;
         return;
     }
@@ -193,6 +202,32 @@ static void test_mmio_amo_faults_without_callback_rmw(void)
                 0);
     require_u32("out-of-RAM AMO does not call store callback", mem.mmio_stores,
                 0);
+
+    destroy_machine(&machine);
+}
+
+static void test_mmio_store_callback_runs_without_reservation_lock(void)
+{
+    test_mem_t mem = {0};
+    vm_t machine;
+    reservation_entry_t reservations[1];
+    hart_t hart;
+    hart_t *harts[] = {&hart};
+
+    init_machine(&machine, reservations, harts, 1);
+    init_hart(&hart, &machine, &mem, 0);
+    mem.machine = &machine;
+    mem.check_mmio_store_lock = true;
+
+    mem.ram[0] = encode_store(RV_MEM_SW, 2, 1, 0);
+    hart.x_regs[1] = TEST_MMIO_ADDR;
+    hart.x_regs[2] = STORE_VALUE;
+
+    step_expect_ok(&hart, "MMIO store callback lock scope");
+
+    require_u32("MMIO store callback runs", mem.mmio_stores, 1);
+    require_u32("MMIO store callback is outside reservation lock",
+                mem.mmio_store_lock_held, 0);
 
     destroy_machine(&machine);
 }
@@ -316,6 +351,7 @@ static void test_amoadd_w_is_atomic_under_threads(void)
 int main(void)
 {
     test_mmio_amo_faults_without_callback_rmw();
+    test_mmio_store_callback_runs_without_reservation_lock();
     test_lr_sc_regular_store_invalidation();
     test_amoadd_w_is_atomic_under_threads();
     return 0;
