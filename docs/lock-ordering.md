@@ -56,13 +56,15 @@ released before the callback so actor-backed callbacks can take actor mailbox
 locks in order, while status-zero reset cannot increment the device generation
 between the final revalidation and actor enqueue.
 
-Reset and activation are not fully enforced by this step. In particular,
-`virtio_mmio_complete_activation()` and `virtio_device_common_reset()` still use
-`backend_lock` before `transport_lock` for generation/status checks and state
-publication. `virtio_device_common_reset()` also calls `prepare_reset()` while
-holding `backend_lock`; vgpu's prepare-reset callback reaches
-`virtio_actor_reset()`, which can wait for actor acknowledgement. That is a known
-Step 5.5 / Step 2.12 blocker, not a blessed lock-order pattern. Refactoring it
-requires a wider activation/reset protocol split so reset can stop new work,
-carry generation state, and wait for actors without holding backend or transport
-locks.
+Activation is not fully enforced by this step. `virtio_mmio_complete_activation()`
+still uses `backend_lock` before `transport_lock` while it revalidates and runs
+the activation callback, but it now rejects `reset_in_progress` during both
+pre-callback and post-callback revalidation. Reset has been split:
+`virtio_device_common_reset()` uses `backend_lock` only as a short barrier,
+publishes a new generation plus `reset_in_progress` under `transport_lock`,
+releases both common locks before callbacks that may wait for actors, clears
+transport/queue/ISR/status state, calls backend reset after transport state
+has been cleared, and keeps the reset gate set until backend reset returns.
+While that gate is set, status-zero reset is idempotent, QueueNotify is accepted
+as reset-canceled work, and other MMIO writes are rejected so guest setup,
+activation, and config writes cannot race the reset callbacks.

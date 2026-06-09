@@ -24,6 +24,64 @@
 #define AVAIL_ADDR 0x200
 #define USED_ADDR 0x300
 
+struct callback_waitpoint {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool entered;
+    bool release;
+};
+
+static void callback_waitpoint_init(struct callback_waitpoint *waitpoint)
+{
+    int ret = pthread_mutex_init(&waitpoint->lock, NULL);
+
+    if (ret != 0) {
+        fprintf(stderr, "waitpoint mutex init: got %d, want 0\n", ret);
+        exit(1);
+    }
+    ret = pthread_cond_init(&waitpoint->cond, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "waitpoint cond init: got %d, want 0\n", ret);
+        exit(1);
+    }
+    waitpoint->entered = false;
+    waitpoint->release = false;
+}
+
+static void callback_waitpoint_destroy(struct callback_waitpoint *waitpoint)
+{
+    pthread_cond_destroy(&waitpoint->cond);
+    pthread_mutex_destroy(&waitpoint->lock);
+}
+
+static void callback_waitpoint_enter_and_wait(
+    struct callback_waitpoint *waitpoint)
+{
+    pthread_mutex_lock(&waitpoint->lock);
+    waitpoint->entered = true;
+    pthread_cond_broadcast(&waitpoint->cond);
+    while (!waitpoint->release)
+        pthread_cond_wait(&waitpoint->cond, &waitpoint->lock);
+    pthread_mutex_unlock(&waitpoint->lock);
+}
+
+static void callback_waitpoint_wait_entered(
+    struct callback_waitpoint *waitpoint)
+{
+    pthread_mutex_lock(&waitpoint->lock);
+    while (!waitpoint->entered)
+        pthread_cond_wait(&waitpoint->cond, &waitpoint->lock);
+    pthread_mutex_unlock(&waitpoint->lock);
+}
+
+static void callback_waitpoint_release(struct callback_waitpoint *waitpoint)
+{
+    pthread_mutex_lock(&waitpoint->lock);
+    waitpoint->release = true;
+    pthread_cond_broadcast(&waitpoint->cond);
+    pthread_mutex_unlock(&waitpoint->lock);
+}
+
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static ram_dma_t dma;
 static unsigned wake_count;
@@ -56,6 +114,7 @@ struct backend_state {
     uint16_t prepare_reset_last_avail;
     bool prepare_reset_saw_backend_lock_held;
     bool prepare_reset_saw_transport_lock_held;
+    struct callback_waitpoint *prepare_reset_waitpoint;
     int reset_count;
     uint64_t reset_old_generation;
     uint64_t reset_new_generation;
@@ -63,6 +122,7 @@ struct backend_state {
     uint16_t reset_last_avail;
     bool reset_saw_backend_lock_held;
     bool reset_saw_transport_lock_held;
+    struct callback_waitpoint *reset_waitpoint;
     int notify_count;
     uint16_t notify_queue;
     uint64_t notify_generation;
@@ -114,6 +174,8 @@ static int backend_prepare_reset(void *opaque,
     state->prepare_reset_saw_transport_lock_held = lock_ret == EBUSY;
     if (lock_ret == 0)
         pthread_mutex_unlock(&common->transport_lock);
+    if (state->prepare_reset_waitpoint)
+        callback_waitpoint_enter_and_wait(state->prepare_reset_waitpoint);
     return 0;
 }
 
@@ -137,6 +199,8 @@ static int backend_reset(void *opaque,
     state->reset_saw_transport_lock_held = lock_ret == EBUSY;
     if (lock_ret == 0)
         pthread_mutex_unlock(&state->activate_common->transport_lock);
+    if (state->reset_waitpoint)
+        callback_waitpoint_enter_and_wait(state->reset_waitpoint);
     return 0;
 }
 
@@ -365,11 +429,24 @@ struct notify_thread_args {
     int ret;
 };
 
+struct reset_thread_args {
+    struct virtio_device_common *common;
+    int ret;
+};
+
 static void *notify_thread_main(void *opaque)
 {
     struct notify_thread_args *args = opaque;
 
     args->ret = virtio_mmio_write(args->common, REG(QueueNotify), 4, 0);
+    return NULL;
+}
+
+static void *reset_thread_main(void *opaque)
+{
+    struct reset_thread_args *args = opaque;
+
+    args->ret = virtio_device_common_reset(args->common);
     return NULL;
 }
 
@@ -1006,13 +1083,12 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
                  backend.prepare_reset_queue_ready);
     require_u16("prepare reset sees old last_avail",
                 backend.prepare_reset_last_avail, 5);
-    require_true("prepare reset remains serialized by backend lock",
-                 backend.prepare_reset_saw_backend_lock_held);
-    /* Step 2.11 only locks in the currently guaranteed reset boundary:
-     * callbacks that may wait are not entered while transport_lock is held.
-     * The broader backend_lock/actor reset wait split remains Step 5.5/2.12
-     * work and is intentionally not hidden by this smoke test.
+    /* Step 5.5 reset callbacks may wait for actors, so common reset must not
+     * enter them while holding transport or backend locks. New QueueNotify
+     * work is blocked by common reset state until transport state is cleared.
      */
+    require_false("prepare reset does not hold backend lock",
+                  backend.prepare_reset_saw_backend_lock_held);
     require_false("prepare reset does not hold transport lock",
                   backend.prepare_reset_saw_transport_lock_held);
     require_int("reset callback count", backend.reset_count, 1);
@@ -1024,8 +1100,8 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
                   backend.reset_queue_ready);
     require_u16("reset callback sees last_avail cleared",
                 backend.reset_last_avail, 0);
-    require_true("reset remains serialized by backend lock",
-                 backend.reset_saw_backend_lock_held);
+    require_false("reset callback does not hold backend lock",
+                  backend.reset_saw_backend_lock_held);
     require_false("reset callback does not hold transport lock",
                   backend.reset_saw_transport_lock_held);
     require_false("reset clears queue ready", common.queues[0].ready);
@@ -1036,6 +1112,155 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
     require_u32("reset clears isr", read_reg(&common, REG(InterruptStatus)), 0);
     require_u32("config generation not decremented",
                 read_reg(&common, REG(ConfigGeneration)), 7);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
+static void test_reset_prepare_waits_without_common_locks(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    struct reset_thread_args args = {.common = &common, .ret = -EAGAIN};
+    struct callback_waitpoint prepare_waitpoint;
+    pthread_t thread;
+    const uint16_t queue_max_sizes[] = {8};
+    uint64_t old_generation;
+    int lock_ret;
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+    common.queues[0].last_avail = 3;
+    old_generation = common.generation;
+
+    callback_waitpoint_init(&prepare_waitpoint);
+    backend.prepare_reset_waitpoint = &prepare_waitpoint;
+
+    require_int("start reset thread",
+                pthread_create(&thread, NULL, reset_thread_main, &args), 0);
+    callback_waitpoint_wait_entered(&prepare_waitpoint);
+
+    lock_ret = pthread_mutex_trylock(&common.backend_lock);
+    require_int("backend lock available while prepare waits", lock_ret, 0);
+    require_int("unlock backend probe",
+                pthread_mutex_unlock(&common.backend_lock), 0);
+    lock_ret = pthread_mutex_trylock(&common.transport_lock);
+    require_int("transport lock available while prepare waits", lock_ret, 0);
+    require_u64("generation published before prepare wait", common.generation,
+                old_generation + 1);
+    require_int("unlock transport probe",
+                pthread_mutex_unlock(&common.transport_lock), 0);
+
+    require_int("QueueNotify ignored while reset prepares",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
+    require_int("blocked reset suppresses new notify work",
+                backend.notify_count, 0);
+
+    callback_waitpoint_release(&prepare_waitpoint);
+    require_int("join reset thread", pthread_join(thread, NULL), 0);
+    require_int("reset thread result", args.ret, 0);
+    require_false("reset clears queue ready", common.queues[0].ready);
+    require_u16("reset clears last_avail", common.queues[0].last_avail, 0);
+    callback_waitpoint_destroy(&prepare_waitpoint);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
+static void test_reset_gate_covers_blocked_backend_reset(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    struct reset_thread_args args = {.common = &common, .ret = -EAGAIN};
+    struct callback_waitpoint reset_waitpoint;
+    pthread_t thread;
+    const uint16_t queue_max_sizes[] = {8};
+    uint64_t reset_generation;
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0x1, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+    write_reg(&common, REG(Status),
+              VIRTIO_STATUS__ACKNOWLEDGE | VIRTIO_STATUS__DRIVER);
+    write_reg(&common, REG(Status), VIRTIO_STATUS__FEATURES_OK);
+
+    callback_waitpoint_init(&reset_waitpoint);
+    backend.reset_waitpoint = &reset_waitpoint;
+
+    require_int("start reset thread",
+                pthread_create(&thread, NULL, reset_thread_main, &args), 0);
+    callback_waitpoint_wait_entered(&reset_waitpoint);
+    reset_generation = common.generation;
+
+    require_false("backend reset does not hold backend lock",
+                  backend.reset_saw_backend_lock_held);
+    require_false("backend reset does not hold transport lock",
+                  backend.reset_saw_transport_lock_held);
+    require_u32("transport status cleared before backend reset",
+                read_reg(&common, REG(Status)), 0);
+
+    require_int("feature selector blocked while reset waits",
+                virtio_mmio_write(&common, REG(DriverFeaturesSel), 4, 1),
+                -EBUSY);
+    require_int("feature write blocked while reset waits",
+                virtio_mmio_write(&common, REG(DriverFeatures), 4, 1),
+                -EBUSY);
+    require_int("queue select blocked while reset waits",
+                virtio_mmio_write(&common, REG(QueueSel), 4, 0), -EBUSY);
+    require_int("queue num blocked while reset waits",
+                virtio_mmio_write(&common, REG(QueueNum), 4, 8), -EBUSY);
+    require_int("queue desc blocked while reset waits",
+                virtio_mmio_write(&common, REG(QueueDescLow), 4, DESC_ADDR),
+                -EBUSY);
+    require_int("queue ready blocked while reset waits",
+                virtio_mmio_write(&common, REG(QueueReady), 4, 1), -EBUSY);
+    require_int("status write blocked while reset waits",
+                virtio_mmio_write(&common, REG(Status), 4,
+                                  VIRTIO_STATUS__ACKNOWLEDGE),
+                -EBUSY);
+    require_int("activation blocked while reset waits",
+                virtio_mmio_write(&common, REG(Status), 4,
+                                  VIRTIO_STATUS__DRIVER_OK),
+                -EBUSY);
+    require_int("activation skipped while reset waits", backend.activate_count,
+                0);
+    require_u32("status remains cleared while reset waits",
+                read_reg(&common, REG(Status)), 0);
+    require_int("config write blocked while reset waits",
+                virtio_mmio_write(&common, REG(Config) + 8, 1, 0x55),
+                -EBUSY);
+    require_int("config write skipped while reset waits",
+                backend.config_write_count, 0);
+
+
+    require_int("QueueNotify ignored while backend reset waits",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
+    require_int("blocked backend reset suppresses notify", backend.notify_count,
+                0);
+
+    backend.reset_waitpoint = NULL;
+    require_int("second status-zero reset is idempotent",
+                virtio_mmio_write(&common, REG(Status), 4, 0), 0);
+    require_u64("idempotent reset keeps generation", common.generation,
+                reset_generation);
+    require_int("idempotent reset does not reenter backend reset",
+                backend.reset_count, 1);
+
+    callback_waitpoint_release(&reset_waitpoint);
+    require_int("join reset thread", pthread_join(thread, NULL), 0);
+    require_int("reset thread result", args.ret, 0);
+    callback_waitpoint_destroy(&reset_waitpoint);
 
     virtio_device_common_destroy(&common);
     destroy_test_emu(&emu);
@@ -1142,6 +1367,8 @@ int main(void)
     test_activation_failure_marks_needs_reset();
     test_interrupt_status_and_ack();
     test_reset_clears_transport_without_decrementing_config_generation();
+    test_reset_prepare_waits_without_common_locks();
+    test_reset_gate_covers_blocked_backend_reset();
     test_config_and_unimplemented_common_registers();
     test_requested_irq_init_failure_is_reported();
 
