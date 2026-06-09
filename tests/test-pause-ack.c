@@ -765,6 +765,54 @@ static void test_hsm_start_holds_lifecycle_lock_until_started_publish(void)
 }
 
 
+struct interrupt_wake_ctx {
+    emu_state_t *emu;
+    bool done;
+};
+
+static void *interrupt_wake_thread(void *opaque)
+{
+    struct interrupt_wake_ctx *ctx = opaque;
+
+    semu_wake_hart_if_interrupt_pending(ctx->emu, 0);
+    __atomic_store_n(&ctx->done, true, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void test_started_interrupt_wake_does_not_wait_for_lifecycle_lock(void)
+{
+    emu_state_t emu;
+    pthread_t thread;
+    struct interrupt_wake_ctx ctx = {0};
+    bool returned = false;
+
+    test_emu_init(&emu, 1);
+    hart_t *hart = emu.vm.hart[0];
+    hart_sie_store(hart, RV_INT_SSI_BIT);
+    hart_sip_set_bits(hart, RV_INT_SSI_BIT);
+
+    pthread_mutex_lock(&emu.lifecycle.lock);
+    ctx.emu = &emu;
+    require_int("interrupt wake thread create",
+                pthread_create(&thread, NULL, interrupt_wake_thread, &ctx), 0);
+
+    for (int i = 0; i < 200; i++) {
+        if (__atomic_load_n(&ctx.done, __ATOMIC_ACQUIRE)) {
+            returned = true;
+            break;
+        }
+        sleep_for_ns(1000000L);
+    }
+
+    pthread_mutex_unlock(&emu.lifecycle.lock);
+    pthread_join(thread, NULL);
+    require_int("started interrupt wake returns with lifecycle locked",
+                returned ? 1 : 0, 1);
+
+    semu_set_stopped(&emu, true);
+    test_emu_destroy(&emu);
+}
+
 static void test_suspended_interrupt_resume_defers_while_paused(void)
 {
     emu_state_t emu;
@@ -877,6 +925,7 @@ int main(void)
     test_dma_invalidation_callback_does_not_issue_blocking_rfence();
     test_hsm_start_rejected_while_pause_active();
     test_hsm_start_holds_lifecycle_lock_until_started_publish();
+    test_started_interrupt_wake_does_not_wait_for_lifecycle_lock();
     test_suspended_interrupt_resume_defers_while_paused();
     test_stop_pending_target_acknowledges_pause_on_park();
     test_suspend_pending_target_acknowledges_pause_on_park();

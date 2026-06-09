@@ -6,6 +6,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../riscv_private.h"
+
 static ssize_t test_read(int fd, void *buf, size_t count);
 
 #define read test_read
@@ -22,6 +24,20 @@ static const struct read_step *read_steps;
 static size_t read_step_count;
 static size_t read_step_index;
 static size_t read_call_count;
+static unsigned wake_count;
+
+void vm_set_exception(hart_t *hart, uint32_t cause, uint32_t val)
+{
+    hart->error = ERR_EXCEPTION;
+    hart->exc_cause = cause;
+    hart->exc_val = val;
+}
+
+void semu_wake_interruptible_harts(emu_state_t *emu)
+{
+    (void) emu;
+    wake_count++;
+}
 
 static ssize_t test_read(int fd, void *buf, size_t count)
 {
@@ -72,6 +88,15 @@ static void require_size(const char *name, size_t got, size_t want)
         return;
 
     fprintf(stderr, "%s: got %zu, want %zu\n", name, got, want);
+    exit(1);
+}
+
+static void require_int(const char *name, int got, int want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %d, want %d\n", name, got, want);
     exit(1);
 }
 
@@ -197,18 +222,25 @@ static void test_short_read_completes_actual_length(void)
     require_u8("entropy byte 2", buf[2], 0x5a);
 }
 
+static void init_test_emu(emu_state_t *emu, hart_t *hart, hart_t **harts);
+static void destroy_test_emu(emu_state_t *emu);
+
 static void test_init_opens_entropy_fd_nonblocking(void)
 {
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
     int flags;
 
     rng_fd = -1;
-    virtio_rng_init();
+    init_test_emu(&emu, &hart, harts);
+    virtio_rng_init(&emu.vrng, &emu);
 
     flags = fcntl(rng_fd, F_GETFL);
     require_bool("rng fd flags readable", flags >= 0, true);
-    require_bool("rng fd nonblocking flag", (flags & O_NONBLOCK) != 0,
-                 true);
+    require_bool("rng fd nonblocking flag", (flags & O_NONBLOCK) != 0, true);
 
+    destroy_test_emu(&emu);
     close(rng_fd);
     rng_fd = -1;
 }
@@ -221,49 +253,131 @@ static void test_init_opens_entropy_fd_nonblocking(void)
 #define DATA_LEN 8
 
 static uint32_t queue_ram[TEST_RAM_WORDS];
+static ram_dma_t queue_dma;
 
-static uint16_t read_high16(uint32_t word)
+static uint16_t read_u16(guest_paddr_t addr)
 {
-    return (uint16_t) (word >> 16);
+    uint16_t value;
+
+    require_bool("read u16",
+                 ram_dma_read(&queue_dma, addr, &value, sizeof(value)), true);
+    return value;
 }
 
-static void init_notify_queue(virtio_rng_state_t *vrng)
+static uint32_t read_u32(guest_paddr_t addr)
 {
-    struct virtq_desc *desc;
+    uint32_t value;
+
+    require_bool("read u32",
+                 ram_dma_read(&queue_dma, addr, &value, sizeof(value)), true);
+    return value;
+}
+
+static void write_u16(guest_paddr_t addr, uint16_t value)
+{
+    require_bool("write u16",
+                 ram_dma_write(&queue_dma, addr, &value, sizeof(value)), true);
+}
+
+static void write_desc(guest_paddr_t addr, const struct virtq_desc *desc)
+{
+    require_bool("write desc",
+                 ram_dma_write(&queue_dma, addr, desc, sizeof(*desc)), true);
+}
+
+static void init_test_emu(emu_state_t *emu, hart_t *hart, hart_t **harts)
+{
+    memset(emu, 0, sizeof(*emu));
+    memset(hart, 0, sizeof(*hart));
+    hart->vm = &emu->vm;
+    harts[0] = hart;
+    emu->vm.n_hart = 1;
+    emu->vm.hart = harts;
+    emu->ram = queue_ram;
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu->lifecycle), 0);
+    require_int("lifecycle running",
+                semu_vm_lifecycle_enter_running(&emu->lifecycle), 0);
+    require_int("plic lock init", pthread_mutex_init(&emu->plic_lock, NULL), 0);
+    ram_dma_init(&emu->ram_dma, queue_ram, sizeof(queue_ram), NULL);
+    queue_dma = emu->ram_dma;
+    wake_count = 0;
+}
+
+static void destroy_test_emu(emu_state_t *emu)
+{
+    virtio_device_common_destroy(&emu->vrng.common);
+    pthread_mutex_destroy(&emu->plic_lock);
+    semu_vm_lifecycle_destroy(&emu->lifecycle);
+}
+
+static bool source_asserted(emu_state_t *emu, enum semu_irq_source source)
+{
+    return (emu->plic.active & semu_irq_source_plic_bit(source)) != 0;
+}
+
+static void write_rng_reg(virtio_rng_state_t *vrng,
+                          uint32_t reg,
+                          uint32_t value)
+{
+    require_int("rng mmio write",
+                virtio_mmio_write(&vrng->common, reg, 4, value), 0);
+}
+
+static uint32_t read_rng_reg(virtio_rng_state_t *vrng, uint32_t reg)
+{
+    uint32_t value;
+
+    require_int("rng mmio read",
+                virtio_mmio_read(&vrng->common, reg, 4, &value), 0);
+    return value;
+}
+
+static void init_notify_queue(emu_state_t *emu,
+                              hart_t *hart,
+                              hart_t **harts,
+                              virtio_rng_state_t **vrng)
+{
+    struct virtq_desc desc;
 
     memset(queue_ram, 0, sizeof(queue_ram));
-    memset(vrng, 0, sizeof(*vrng));
-    vrng->ram = queue_ram;
-    vrng->Status = VIRTIO_STATUS__DRIVER_OK;
-    vrng->QueueSel = 0;
-    vrng->queues[0].QueueNum = 2;
-    vrng->queues[0].QueueDesc = DESC_ADDR / 4;
-    vrng->queues[0].QueueAvail = AVAIL_ADDR / 4;
-    vrng->queues[0].QueueUsed = USED_ADDR / 4;
-    vrng->queues[0].ready = true;
-    vrng->queues[0].last_avail = 0;
+    init_test_emu(emu, hart, harts);
+    virtio_rng_init(&emu->vrng, emu);
+    *vrng = &emu->vrng;
 
-    desc = (struct virtq_desc *) &queue_ram[DESC_ADDR / 4];
-    desc->addr = DATA_ADDR;
-    desc->len = DATA_LEN;
-    desc->flags = VIRTIO_DESC_F_WRITE;
+    desc = (struct virtq_desc) {
+        .addr = DATA_ADDR,
+        .len = DATA_LEN,
+        .flags = VIRTIO_DESC_F_WRITE,
+    };
+    write_desc(DESC_ADDR, &desc);
 
-    queue_ram[AVAIL_ADDR / 4] = 1u << 16;
-    queue_ram[AVAIL_ADDR / 4 + 1] = 0;
+    write_rng_reg(*vrng, VIRTIO_Status << 2, VIRTIO_STATUS__ACKNOWLEDGE);
+    write_rng_reg(*vrng, VIRTIO_Status << 2, VIRTIO_STATUS__DRIVER);
+    write_rng_reg(*vrng, VIRTIO_DriverFeaturesSel << 2, 1);
+    write_rng_reg(*vrng, VIRTIO_DriverFeatures << 2, 1);
+    write_rng_reg(*vrng, VIRTIO_Status << 2, VIRTIO_STATUS__FEATURES_OK);
+    write_rng_reg(*vrng, VIRTIO_QueueSel << 2, 0);
+    write_rng_reg(*vrng, VIRTIO_QueueNum << 2, 2);
+    write_rng_reg(*vrng, VIRTIO_QueueDescLow << 2, DESC_ADDR);
+    write_rng_reg(*vrng, VIRTIO_QueueDriverLow << 2, AVAIL_ADDR);
+    write_rng_reg(*vrng, VIRTIO_QueueDeviceLow << 2, USED_ADDR);
+    write_rng_reg(*vrng, VIRTIO_QueueReady << 2, 1);
+    write_rng_reg(*vrng, VIRTIO_Status << 2, VIRTIO_STATUS__DRIVER_OK);
+
+    write_u16(AVAIL_ADDR + 4, 0);
+    write_u16(AVAIL_ADDR + 2, 1);
 }
 
-static void require_used_completion(const char *name,
-                                    uint16_t id,
-                                    uint32_t len)
+static void require_used_completion(const char *name, uint16_t id, uint32_t len)
 {
     char label[128];
 
     snprintf(label, sizeof(label), "%s used idx", name);
-    require_u16(label, read_high16(queue_ram[USED_ADDR / 4]), 1);
+    require_u16(label, read_u16(USED_ADDR + 2), 1);
     snprintf(label, sizeof(label), "%s used id", name);
-    require_u32(label, queue_ram[USED_ADDR / 4 + 1], id);
+    require_u32(label, read_u32(USED_ADDR + 4), id);
     snprintf(label, sizeof(label), "%s used len", name);
-    require_u32(label, queue_ram[USED_ADDR / 4 + 2], len);
+    require_u32(label, read_u32(USED_ADDR + 8), len);
 }
 
 static void test_queue_notify_transient_zero_completion_without_reset(int err)
@@ -271,18 +385,36 @@ static void test_queue_notify_transient_zero_completion_without_reset(int err)
     const struct read_step steps[] = {
         {.result = -1, .err = err},
     };
-    virtio_rng_state_t vrng;
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    virtio_rng_state_t *vrng;
 
-    init_notify_queue(&vrng);
+    init_notify_queue(&emu, &hart, harts, &vrng);
     set_read_script(steps, ARRAY_SIZE(steps));
-    virtio_queue_notify_handler(&vrng, &vrng.queues[0]);
+    write_rng_reg(vrng, VIRTIO_QueueNotify << 2, 0);
 
     require_size("notify transient read call count", read_call_count, 1);
     require_used_completion("notify transient", 0, 0);
-    require_u32("notify transient status", vrng.Status,
-                VIRTIO_STATUS__DRIVER_OK);
-    require_u32("notify transient interrupt", vrng.InterruptStatus,
+    require_u32("notify transient status needs-reset",
+                read_rng_reg(vrng, VIRTIO_Status << 2) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+    require_u32(
+        "notify transient status driver-ok",
+        read_rng_reg(vrng, VIRTIO_Status << 2) & VIRTIO_STATUS__DRIVER_OK,
+        VIRTIO_STATUS__DRIVER_OK);
+    require_u32("notify transient interrupt",
+                read_rng_reg(vrng, VIRTIO_InterruptStatus << 2),
                 VIRTIO_INT__USED_RING);
+    require_bool("notify transient irq line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VRNG), true);
+    require_bool("notify transient pending helper",
+                 virtio_rng_irq_pending(vrng), true);
+    write_rng_reg(vrng, VIRTIO_InterruptACK << 2, VIRTIO_INT__USED_RING);
+    require_bool("notify transient irq ack line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VRNG), false);
+    destroy_test_emu(&emu);
 }
 
 static void test_queue_notify_eio_marks_needs_reset_and_conf_change(void)
@@ -290,19 +422,31 @@ static void test_queue_notify_eio_marks_needs_reset_and_conf_change(void)
     const struct read_step steps[] = {
         {.result = -1, .err = EIO},
     };
-    virtio_rng_state_t vrng;
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    virtio_rng_state_t *vrng;
 
-    init_notify_queue(&vrng);
+    init_notify_queue(&emu, &hart, harts, &vrng);
     set_read_script(steps, ARRAY_SIZE(steps));
-    virtio_queue_notify_handler(&vrng, &vrng.queues[0]);
+    write_rng_reg(vrng, VIRTIO_QueueNotify << 2, 0);
 
     require_size("notify eio read call count", read_call_count, 1);
     require_used_completion("notify eio", 0, 0);
-    require_u32("notify eio status", vrng.Status,
-                VIRTIO_STATUS__DRIVER_OK |
-                    VIRTIO_STATUS__DEVICE_NEEDS_RESET);
-    require_u32("notify eio interrupt", vrng.InterruptStatus,
+    require_u32("notify eio status needs-reset",
+                read_rng_reg(vrng, VIRTIO_Status << 2) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    require_u32(
+        "notify eio status driver-ok",
+        read_rng_reg(vrng, VIRTIO_Status << 2) & VIRTIO_STATUS__DRIVER_OK,
+        VIRTIO_STATUS__DRIVER_OK);
+    require_u32("notify eio interrupt",
+                read_rng_reg(vrng, VIRTIO_InterruptStatus << 2),
                 VIRTIO_INT__CONF_CHANGE | VIRTIO_INT__USED_RING);
+    require_bool("notify eio irq line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VRNG), true);
+    destroy_test_emu(&emu);
 }
 
 int main(void)
