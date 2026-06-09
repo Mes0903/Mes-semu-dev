@@ -337,17 +337,19 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                                             &lifecycle_gate);
             return ret;
         }
+        ret =
+            semu_lock_order_mutex_unlock(&common->backend_lock, &backend_order);
+        if (ret < 0) {
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return ret;
+        }
 
-        /* Hold lifecycle through the notify scheduling decision so stop-new-
-         * device-work cannot interleave. Common notify_queue callbacks must
-         * stay short/non-blocking; migrating legacy blocking devices remains
-         * a later actor work item.
+        /* backend_lock is only a reset/activation barrier here. Actor-backed
+         * notify_queue callbacks may take actor->lock, so they must run after
+         * releasing backend rank while lifecycle still blocks stop-new-work.
          */
         ret = ops->notify_queue(opaque, queue_index, generation);
-        unlock_ret =
-            semu_lock_order_mutex_unlock(&common->backend_lock, &backend_order);
-        if (ret == 0 && unlock_ret < 0)
-            ret = unlock_ret;
         unlock_ret =
             virtio_mmio_unlock_notify_lifecycle_gate(common, &lifecycle_gate);
         if (ret == 0 && unlock_ret < 0)

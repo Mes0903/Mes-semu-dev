@@ -513,8 +513,8 @@ static void test_queue_notify_does_not_drain_queue(void)
     require_u16("notify queue", backend.notify_queue, 0);
     require_u64("notify generation", backend.notify_generation,
                 common.generation);
-    require_true("notify runs under backend lock",
-                 backend.notify_saw_backend_lock_held);
+    require_false("notify does not run under backend lock",
+                  backend.notify_saw_backend_lock_held);
     require_u16("notify did not drain", common.queues[0].last_avail, 0);
     require_int("notify invalid queue",
                 virtio_mmio_write(&common, REG(QueueNotify), 4, 1), -EINVAL);

@@ -47,14 +47,19 @@ coverage on the participating paths.
 
 ## Current Coverage And Follow-Ups
 
-The common VirtIO MMIO `QueueNotify` lifecycle path is the first enforced path:
-it tracks lifecycle -> transport -> backend ordering and deliberately drops the
-lifecycle rank before waiting on a busy backend lock.
+The common VirtIO MMIO `QueueNotify` lifecycle path is the first enforced path.
+It tracks lifecycle -> transport ordering, uses `backend_lock` only as a
+reset/activation barrier, drops the lifecycle rank before waiting on a busy
+backend lock, and releases backend rank before calling `notify_queue()` so
+actor-backed callbacks can take actor mailbox locks in order.
 
-Known transitional exception: `virtio_mmio_complete_activation()` and
-`virtio_device_common_reset()` still serialize backend callbacks with
-`backend_lock` before taking `transport_lock` for generation/status checks and
-state publication. Refactoring those callbacks needs a wider activation/reset
-protocol change so the backend callback exclusion and generation revalidation
-can be kept without backend -> transport nesting. Do not mechanically wrap those
-paths until that protocol is split.
+Reset and activation are not fully enforced by this step. In particular,
+`virtio_mmio_complete_activation()` and `virtio_device_common_reset()` still use
+`backend_lock` before `transport_lock` for generation/status checks and state
+publication. `virtio_device_common_reset()` also calls `prepare_reset()` while
+holding `backend_lock`; vgpu's prepare-reset callback reaches
+`virtio_actor_reset()`, which can wait for actor acknowledgement. That is a known
+Step 5.5 / Step 2.12 blocker, not a blessed lock-order pattern. Refactoring it
+requires a wider activation/reset protocol split so reset can stop new work,
+carry generation state, and wait for actors without holding backend or transport
+locks.
