@@ -45,6 +45,15 @@ static void require_u64(const char *name, uint64_t got, uint64_t want)
     exit(1);
 }
 
+static void require_size(const char *name, size_t got, size_t want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %zu, want %zu\n", name, got, want);
+    exit(1);
+}
+
 static void require_bytes(const char *name,
                           const uint8_t *got,
                           const uint8_t *want,
@@ -68,6 +77,25 @@ static void init_machine(vm_t *machine,
     __atomic_store_n(&machine->any_reservation_active, false, __ATOMIC_RELAXED);
     if (pthread_mutex_init(&machine->reservation_lock, NULL) != 0)
         fail("reservation lock init failed");
+}
+
+struct dma_callback_log {
+    size_t calls;
+    void *opaque_seen;
+    guest_paddr_t addr;
+    guest_size_t len;
+};
+
+static void record_dma_write_invalidation(void *opaque,
+                                          guest_paddr_t addr,
+                                          guest_size_t len)
+{
+    struct dma_callback_log *log = opaque;
+
+    log->calls++;
+    log->opaque_seen = opaque;
+    log->addr = addr;
+    log->len = len;
 }
 
 static void destroy_machine(vm_t *machine)
@@ -149,6 +177,74 @@ static void test_zero_length_access_is_noop_success(void)
                   ram_dma_dirty_range(&dma, &dirty_start, &dirty_end));
 }
 
+static void test_dma_write_invalidation_callback_records_metadata(void)
+{
+    uint32_t words[2] = {0};
+    uint8_t src[3] = {0x11, 0x22, 0x33};
+    struct dma_callback_log log = {0};
+    ram_dma_t dma;
+
+    ram_dma_init(&dma, words, sizeof(words), NULL);
+    ram_dma_set_write_invalidate_callback(
+        &dma, record_dma_write_invalidation, &log);
+
+    require_true("DMA write with invalidation callback succeeds",
+                 ram_dma_write(&dma, 3, src, sizeof(src)));
+    require_size("DMA write invalidation callback fires once", log.calls, 1);
+    require_true("DMA write invalidation callback receives opaque",
+                 log.opaque_seen == &log);
+    require_u64("DMA write invalidation callback addr", log.addr, 3);
+    require_u64("DMA write invalidation callback len", log.len, sizeof(src));
+    require_u64("callback write still records dirty byte count",
+                ram_dma_dirty_bytes(&dma), sizeof(src));
+}
+
+static void test_dma_note_write_invalidation_callback_records_metadata(void)
+{
+    uint32_t words[2] = {0};
+    struct dma_callback_log log = {0};
+    ram_dma_t dma;
+
+    ram_dma_init(&dma, words, sizeof(words), NULL);
+    ram_dma_set_write_invalidate_callback(
+        &dma, record_dma_write_invalidation, &log);
+
+    ram_note_dma_write(&dma, 2, 4);
+
+    require_size("DMA note invalidation callback fires once", log.calls, 1);
+    require_true("DMA note invalidation callback receives opaque",
+                 log.opaque_seen == &log);
+    require_u64("DMA note invalidation callback addr", log.addr, 2);
+    require_u64("DMA note invalidation callback len", log.len, 4);
+}
+
+static void test_dma_invalidation_callback_ignores_invalid_writes(void)
+{
+    uint32_t words[1] = {0x11223344U};
+    uint8_t byte = 0xaa;
+    struct dma_callback_log log = {0};
+    guest_paddr_t dirty_start = 0;
+    guest_paddr_t dirty_end = 0;
+    ram_dma_t dma;
+
+    ram_dma_init(&dma, words, sizeof(words), NULL);
+    ram_dma_set_write_invalidate_callback(
+        &dma, record_dma_write_invalidation, &log);
+
+    require_true("zero-length callback write succeeds",
+                 ram_dma_write(&dma, 4, &byte, 0));
+    ram_note_dma_write(&dma, 4, 0);
+    require_false("OOB callback write fails", ram_dma_write(&dma, 4, &byte, 1));
+    ram_note_dma_write(&dma, 4, 1);
+
+    require_size("invalid DMA writes do not call callback", log.calls, 0);
+    require_u32("invalid callback writes leave RAM", words[0], 0x11223344U);
+    require_u64("invalid callback writes leave dirty byte count",
+                ram_dma_dirty_bytes(&dma), 0);
+    require_false("invalid callback writes leave dirty range empty",
+                  ram_dma_dirty_range(&dma, &dirty_start, &dirty_end));
+}
+
 static void test_dma_write_invalidates_overlapping_lr_reservations(void)
 {
     uint32_t words[4] = {0};
@@ -213,6 +309,9 @@ int main(void)
     test_dma_unaligned_round_trip_preserves_neighbors();
     test_oob_access_fails_without_side_effects();
     test_zero_length_access_is_noop_success();
+    test_dma_write_invalidation_callback_records_metadata();
+    test_dma_note_write_invalidation_callback_records_metadata();
+    test_dma_invalidation_callback_ignores_invalid_writes();
     test_dma_write_invalidates_overlapping_lr_reservations();
     test_dirty_tracking_accumulates_range_and_resets();
     return 0;

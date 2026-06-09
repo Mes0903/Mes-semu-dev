@@ -59,6 +59,20 @@ static void ram_dma_mark_dirty(ram_dma_t *dma,
     __atomic_fetch_add(&dma->dirty_bytes, len, __ATOMIC_RELEASE);
 }
 
+static void ram_dma_notify_write_invalidate(ram_dma_t *dma,
+                                            guest_paddr_t addr,
+                                            guest_size_t len)
+{
+    ram_dma_write_invalidate_cb_t cb;
+
+    if (!dma || len == 0)
+        return;
+
+    cb = dma->write_invalidate_cb;
+    if (cb)
+        cb(dma->write_invalidate_opaque, addr, len);
+}
+
 static void ram_dma_recompute_any_reservation_locked(vm_t *machine)
 {
     bool any_active = false;
@@ -127,6 +141,19 @@ void ram_dma_init(ram_dma_t *dma,
     __atomic_store_n(&dma->dirty_start, RAM_DMA_NO_DIRTY_START,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&dma->dirty_end, 0, __ATOMIC_RELAXED);
+    dma->write_invalidate_cb = NULL;
+    dma->write_invalidate_opaque = NULL;
+}
+
+void ram_dma_set_write_invalidate_callback(ram_dma_t *dma,
+                                           ram_dma_write_invalidate_cb_t cb,
+                                           void *opaque)
+{
+    if (!dma)
+        return;
+
+    dma->write_invalidate_cb = cb;
+    dma->write_invalidate_opaque = opaque;
 }
 
 bool ram_dma_read(const ram_dma_t *dma,
@@ -182,12 +209,13 @@ bool ram_dma_write(ram_dma_t *dma,
     if (lock_reservations)
         pthread_mutex_unlock(&dma->machine->reservation_lock);
 
+    ram_dma_notify_write_invalidate(dma, addr, len);
     return true;
 }
 
 void ram_note_dma_write(ram_dma_t *dma, guest_paddr_t addr, guest_size_t len)
 {
-    if (!dma || len == 0)
+    if (!ram_dma_bounds_ok(dma, addr, len) || len == 0)
         return;
 
     if (dma->machine)
@@ -197,6 +225,8 @@ void ram_note_dma_write(ram_dma_t *dma, guest_paddr_t addr, guest_size_t len)
 
     if (dma->machine)
         pthread_mutex_unlock(&dma->machine->reservation_lock);
+
+    ram_dma_notify_write_invalidate(dma, addr, len);
 }
 
 uint64_t ram_dma_dirty_bytes(const ram_dma_t *dma)

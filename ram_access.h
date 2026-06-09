@@ -7,6 +7,10 @@
 
 typedef struct __vm_internel vm_t;
 
+typedef void (*ram_dma_write_invalidate_cb_t)(void *opaque,
+                                              guest_paddr_t addr,
+                                              guest_size_t len);
+
 typedef struct ram_dma {
     uint32_t *words;
     guest_size_t byte_size;
@@ -14,12 +18,17 @@ typedef struct ram_dma {
     _Atomic uint64_t dirty_bytes;
     _Atomic guest_paddr_t dirty_start;
     _Atomic guest_paddr_t dirty_end;
+    ram_dma_write_invalidate_cb_t write_invalidate_cb;
+    void *write_invalidate_opaque;
 } ram_dma_t;
 
 void ram_dma_init(ram_dma_t *dma,
                   uint32_t *words,
                   guest_size_t byte_size,
                   vm_t *machine);
+void ram_dma_set_write_invalidate_callback(ram_dma_t *dma,
+                                           ram_dma_write_invalidate_cb_t cb,
+                                           void *opaque);
 bool ram_dma_read(const ram_dma_t *dma,
                   guest_paddr_t addr,
                   void *dst,
