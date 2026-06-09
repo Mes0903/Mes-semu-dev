@@ -434,6 +434,23 @@ static void *reset_thread(void *arg)
     return NULL;
 }
 
+struct stop_args {
+    struct virtio_actor *actor;
+    atomic_bool done;
+    int ret;
+};
+
+static void *stop_thread(void *arg)
+{
+    struct stop_args *args = arg;
+
+    args->ret = virtio_actor_stop(args->actor);
+    atomic_store_explicit(&args->done, true, memory_order_release);
+    return NULL;
+}
+
+static void require_thread_joins(const char *name, pthread_t thread);
+
 static void test_reset_waits_for_claimed_backend_mutation(void)
 {
     struct virtio_actor actor;
@@ -493,6 +510,129 @@ static void test_reset_waits_for_claimed_backend_mutation(void)
     require_u64("new generation drain", backend.last_generation, 1);
 
     require_int("stop", virtio_actor_stop(&actor), 0);
+    virtio_actor_destroy(&actor);
+    backend_destroy(&backend);
+}
+
+static void test_stop_waits_for_claimed_backend_mutation(void)
+{
+    struct virtio_actor actor;
+    struct test_backend backend;
+    struct stop_args args = {0};
+    pthread_t thread;
+
+    backend_init(&backend);
+    require_int("init", virtio_actor_init(&actor, &test_ops, &backend, 4), 0);
+    require_int("start thread", virtio_actor_start(&actor), 0);
+    require_int("configure", virtio_actor_enter_configuring(&actor), 0);
+    require_int("activate", virtio_actor_activate(&actor), 0);
+
+    pthread_mutex_lock(&backend.lock);
+    backend.block_drain_queue = true;
+    pthread_mutex_unlock(&backend.lock);
+    require_int("notify", virtio_actor_notify_queue(&actor, 0), 0);
+    backend_wait_until_drain_entered(&backend);
+
+    args.actor = &actor;
+    args.ret = -EAGAIN;
+    atomic_init(&args.done, false);
+    require_int("stop thread create",
+                pthread_create(&thread, NULL, stop_thread, &args), 0);
+    wait_for_actor_state(&actor, VIRTIO_ACTOR_STOPPING);
+    require_int("notify while stopping", virtio_actor_notify_queue(&actor, 1),
+                -EAGAIN);
+    require_u32("stopping notify leaves no pending",
+                virtio_actor_pending_mask(&actor), 0);
+    sleep_ms(30);
+    require_false("stop waits for backend exit",
+                  atomic_load_explicit(&args.done, memory_order_acquire));
+
+    pthread_mutex_lock(&backend.lock);
+    backend.allow_drain_exit = true;
+    pthread_cond_broadcast(&backend.cond);
+    pthread_mutex_unlock(&backend.lock);
+    require_thread_joins("blocked stop thread", thread);
+    require_int("stop ret", args.ret, 0);
+    require_state("stopped", virtio_actor_get_state(&actor),
+                  VIRTIO_ACTOR_STOPPED);
+    require_u32("stop clears pending", virtio_actor_pending_mask(&actor), 0);
+
+    virtio_actor_destroy(&actor);
+    backend_destroy(&backend);
+}
+
+static void test_fail_while_backend_operation_sleeps_clears_pending(void)
+{
+    struct virtio_actor actor;
+    struct test_backend backend;
+    struct stop_args stop = {0};
+    pthread_t thread;
+
+    backend_init(&backend);
+    require_int("init", virtio_actor_init(&actor, &test_ops, &backend, 4), 0);
+    require_int("start thread", virtio_actor_start(&actor), 0);
+    require_int("configure", virtio_actor_enter_configuring(&actor), 0);
+    require_int("activate", virtio_actor_activate(&actor), 0);
+
+    pthread_mutex_lock(&backend.lock);
+    backend.block_drain_queue = true;
+    pthread_mutex_unlock(&backend.lock);
+    require_int("notify", virtio_actor_notify_queue(&actor, 0), 0);
+    backend_wait_until_drain_entered(&backend);
+    require_u32("blocked drain keeps pending bit",
+                virtio_actor_pending_mask(&actor), 1u);
+
+    require_int("fail while backend blocked", virtio_actor_fail(&actor), 0);
+    require_state("failed", virtio_actor_get_state(&actor),
+                  VIRTIO_ACTOR_FAILED);
+    require_u64("failed generation", virtio_actor_generation(&actor), 1);
+    require_u32("fail clears pending", virtio_actor_pending_mask(&actor), 0);
+    require_int("notify after failed", virtio_actor_notify_queue(&actor, 0),
+                -EIO);
+    pthread_mutex_lock(&backend.lock);
+    require_int("failed callback count", (int) backend.failed_callback_count,
+                1);
+    require_false("failed callback outside actor lock",
+                  backend.failed_callback_lock_held);
+    pthread_mutex_unlock(&backend.lock);
+
+    pthread_mutex_lock(&backend.lock);
+    backend.allow_drain_exit = true;
+    pthread_cond_broadcast(&backend.cond);
+    pthread_mutex_unlock(&backend.lock);
+    stop.actor = &actor;
+    stop.ret = -EAGAIN;
+    atomic_init(&stop.done, false);
+    require_int("stop after failed thread create",
+                pthread_create(&thread, NULL, stop_thread, &stop), 0);
+    require_thread_joins("failed actor stop thread", thread);
+    require_int("stop after failed", stop.ret, 0);
+
+    virtio_actor_destroy(&actor);
+    backend_destroy(&backend);
+}
+
+static void test_queue_notify_after_stop_is_rejected(void)
+{
+    struct virtio_actor actor;
+    struct test_backend backend;
+
+    backend_init(&backend);
+    require_int("init", virtio_actor_init(&actor, &test_ops, &backend, 4), 0);
+    require_int("start thread", virtio_actor_start(&actor), 0);
+    require_int("configure", virtio_actor_enter_configuring(&actor), 0);
+    require_int("activate", virtio_actor_activate(&actor), 0);
+    require_int("stop", virtio_actor_stop(&actor), 0);
+    require_state("stopped", virtio_actor_get_state(&actor),
+                  VIRTIO_ACTOR_STOPPED);
+    require_int("notify after stopped", virtio_actor_notify_queue(&actor, 0),
+                -EAGAIN);
+    require_u32("stopped notify leaves no pending",
+                virtio_actor_pending_mask(&actor), 0);
+    sleep_ms(30);
+    require_int("stopped actor does not drain",
+                (int) backend_total_drains(&backend), 0);
+
     virtio_actor_destroy(&actor);
     backend_destroy(&backend);
 }
@@ -737,6 +877,9 @@ int main(void)
     test_clear_recheck_prevents_lost_wakeup();
     test_reset_while_paused_does_not_deadlock();
     test_reset_waits_for_claimed_backend_mutation();
+    test_stop_waits_for_claimed_backend_mutation();
+    test_fail_while_backend_operation_sleeps_clears_pending();
+    test_queue_notify_after_stop_is_rejected();
     test_completion_section_blocks_reset();
     test_completion_begin_fails_after_reset_wins();
     test_stop_wakes_sleeping_or_paused_actor();
