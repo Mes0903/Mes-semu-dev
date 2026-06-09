@@ -390,6 +390,47 @@ static void test_window_loop_return_closes_device_work_before_join(void)
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
+static void test_window_loop_return_before_runtime_running_remains_startable(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    require_int("initial lifecycle created",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_CREATED);
+    require_bool("created lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+
+    semu_runtime_window_loop_returned(&emu);
+
+    require_int("early window return keeps lifecycle created",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_CREATED);
+    require_int("runtime can still enter running after early window return",
+                semu_enter_runtime_running(&emu), 0);
+    require_int("runtime entered running after early window return",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_RUNNING);
+    semu_runtime_enter_stopped(&emu);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
+static void test_debug_window_loop_return_leaves_debug_runtime_running(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    require_int("lifecycle running",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    emu.debug = true;
+
+    semu_runtime_window_loop_returned(&emu);
+
+    require_int("debug window return leaves lifecycle running",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_RUNNING);
+    require_bool("debug window return leaves device work unchanged",
+                 semu_vm_accepting_device_work(&emu.lifecycle), true);
+    semu_runtime_enter_stopped(&emu);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 int main(void)
 {
     test_default_selector_maps_hart_count_to_executor_mode();
@@ -403,5 +444,7 @@ int main(void)
     test_debug_init_failure_fails_lifecycle();
     test_runtime_enters_running_before_threaded_executor_start();
     test_window_loop_return_closes_device_work_before_join();
+    test_window_loop_return_before_runtime_running_remains_startable();
+    test_debug_window_loop_return_leaves_debug_runtime_running();
     return 0;
 }

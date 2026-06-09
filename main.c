@@ -304,6 +304,22 @@ static void semu_runtime_enter_stopped(emu_state_t *emu)
 
 static void UNUSED semu_runtime_window_loop_returned(emu_state_t *emu)
 {
+    if (!emu || emu->debug)
+        return;
+
+    /* The main-thread window loop can return before the emulator thread has
+     * entered RUNNING. Only publish STOPPING once the runtime is accepting
+     * device work; CREATED is already closed to device work and must remain
+     * startable so the emulator thread can observe the closed window and exit
+     * through the normal runtime path.
+     *
+     * Debug/gdbstub idle waits are not window-close interruptible here because
+     * the gdbstub handle is local to the emulator thread. Leave that path
+     * unchanged until debug shutdown has an explicit wake/close primitive.
+     */
+    if (!semu_vm_accepting_device_work(&emu->lifecycle))
+        return;
+
     semu_runtime_enter_stopping(emu);
 }
 
@@ -3299,8 +3315,9 @@ int main(int argc, char **argv)
 
         /* Main thread runs window event loop. Returns either because the user
          * closed the window ('SDL_QUIT') or because the emulator called
-         * 'window_shutdown()'. Publish STOPPING before joining the emulator
-         * thread so new device work is rejected during shutdown wait/teardown.
+         * 'window_shutdown()'. For non-debug runtimes that have reached
+         * RUNNING, publish STOPPING before joining the emulator thread so new
+         * device work is rejected during shutdown wait/teardown.
          */
         g_window.window_main_loop();
         semu_runtime_window_loop_returned(&emu);
