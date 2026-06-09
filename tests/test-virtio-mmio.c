@@ -54,11 +54,15 @@ struct backend_state {
     uint64_t prepare_reset_new_generation;
     bool prepare_reset_queue_ready;
     uint16_t prepare_reset_last_avail;
+    bool prepare_reset_saw_backend_lock_held;
+    bool prepare_reset_saw_transport_lock_held;
     int reset_count;
     uint64_t reset_old_generation;
     uint64_t reset_new_generation;
     bool reset_queue_ready;
     uint16_t reset_last_avail;
+    bool reset_saw_backend_lock_held;
+    bool reset_saw_transport_lock_held;
     int notify_count;
     uint16_t notify_queue;
     uint64_t notify_generation;
@@ -95,12 +99,21 @@ static int backend_prepare_reset(void *opaque,
 {
     struct backend_state *state = opaque;
     struct virtio_device_common *common = state->activate_common;
+    int lock_ret;
 
     state->prepare_reset_count++;
     state->prepare_reset_old_generation = old_generation;
     state->prepare_reset_new_generation = new_generation;
     state->prepare_reset_queue_ready = common->queues[0].ready;
     state->prepare_reset_last_avail = common->queues[0].last_avail;
+    lock_ret = pthread_mutex_trylock(&common->backend_lock);
+    state->prepare_reset_saw_backend_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&common->backend_lock);
+    lock_ret = pthread_mutex_trylock(&common->transport_lock);
+    state->prepare_reset_saw_transport_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&common->transport_lock);
     return 0;
 }
 
@@ -109,12 +122,21 @@ static int backend_reset(void *opaque,
                          uint64_t new_generation)
 {
     struct backend_state *state = opaque;
+    int lock_ret;
 
     state->reset_count++;
     state->reset_old_generation = old_generation;
     state->reset_new_generation = new_generation;
     state->reset_queue_ready = state->activate_common->queues[0].ready;
     state->reset_last_avail = state->activate_common->queues[0].last_avail;
+    lock_ret = pthread_mutex_trylock(&state->activate_common->backend_lock);
+    state->reset_saw_backend_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&state->activate_common->backend_lock);
+    lock_ret = pthread_mutex_trylock(&state->activate_common->transport_lock);
+    state->reset_saw_transport_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&state->activate_common->transport_lock);
     return 0;
 }
 
@@ -984,6 +1006,15 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
                  backend.prepare_reset_queue_ready);
     require_u16("prepare reset sees old last_avail",
                 backend.prepare_reset_last_avail, 5);
+    require_true("prepare reset remains serialized by backend lock",
+                 backend.prepare_reset_saw_backend_lock_held);
+    /* Step 2.11 only locks in the currently guaranteed reset boundary:
+     * callbacks that may wait are not entered while transport_lock is held.
+     * The broader backend_lock/actor reset wait split remains Step 5.5/2.12
+     * work and is intentionally not hidden by this smoke test.
+     */
+    require_false("prepare reset does not hold transport lock",
+                  backend.prepare_reset_saw_transport_lock_held);
     require_int("reset callback count", backend.reset_count, 1);
     require_u64("reset callback old", backend.reset_old_generation,
                 old_generation);
@@ -993,6 +1024,10 @@ static void test_reset_clears_transport_without_decrementing_config_generation(
                   backend.reset_queue_ready);
     require_u16("reset callback sees last_avail cleared",
                 backend.reset_last_avail, 0);
+    require_true("reset remains serialized by backend lock",
+                 backend.reset_saw_backend_lock_held);
+    require_false("reset callback does not hold transport lock",
+                  backend.reset_saw_transport_lock_held);
     require_false("reset clears queue ready", common.queues[0].ready);
     require_u32("reset clears QueueReady", read_reg(&common, REG(QueueReady)),
                 0);

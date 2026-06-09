@@ -324,6 +324,9 @@ test-lock-order:
 	$(CC) $(HOST_TEST_CFLAGS) tests/test-lock-order.c lock-order.c -o /tmp/test-lock-order $(HOST_TEST_LDLIBS)
 	/tmp/test-lock-order
 
+.PHONY: phase2-substrate-test
+phase2-substrate-test: test-virtio-actor test-virtio-irq test-virtio-mmio test-ram-access test-lock-order
+
 .PHONY: test-virtio-input-config
 test-virtio-input-config:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=1 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-input-config.c -Wl,--gc-sections -o /tmp/test-virtio-input-config $(HOST_TEST_LDLIBS)

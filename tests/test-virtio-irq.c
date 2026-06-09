@@ -93,6 +93,34 @@ static bool source_asserted(emu_state_t *emu, enum semu_irq_source source)
     return (emu->plic.active & semu_irq_source_plic_bit(source)) != 0;
 }
 
+static void ack_irq_and_require_level(struct virtio_irq *irq,
+                                      emu_state_t *emu,
+                                      enum semu_irq_source source,
+                                      uint32_t bits,
+                                      uint32_t want_status,
+                                      bool want_asserted)
+{
+    virtio_irq_ack(irq, bits);
+    require_u32("ordered ack status", virtio_irq_read_status(irq),
+                want_status);
+    require_true("ordered ack level",
+                 source_asserted(emu, source) == want_asserted);
+}
+
+static void trigger_irq_and_require_level(struct virtio_irq *irq,
+                                          emu_state_t *emu,
+                                          enum semu_irq_source source,
+                                          uint32_t bits,
+                                          uint32_t want_status,
+                                          bool want_asserted)
+{
+    virtio_irq_trigger(irq, bits);
+    require_u32("ordered trigger status", virtio_irq_read_status(irq),
+                want_status);
+    require_true("ordered trigger level",
+                 source_asserted(emu, source) == want_asserted);
+}
+
 static void test_init_read_zero_and_invalid_inputs_are_safe(void)
 {
     emu_state_t emu;
@@ -209,6 +237,40 @@ static void test_repeated_trigger_coalesces_status_and_line(void)
     destroy_test_emu(&emu);
 }
 
+static void test_ordered_trigger_ack_interleavings_keep_level_consistent(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_irq irq;
+    enum semu_irq_source source = SEMU_IRQ_SOURCE_VSND;
+
+    init_test_emu(&emu, &hart, harts);
+    require_int("irq init", virtio_irq_init(&irq, &emu, source), 0);
+
+    trigger_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__USED_RING,
+                                  VIRTIO_INT__USED_RING, true);
+    ack_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__USED_RING, 0,
+                              false);
+    trigger_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__CONF_CHANGE,
+                                  VIRTIO_INT__CONF_CHANGE, true);
+    ack_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__CONF_CHANGE, 0,
+                              false);
+
+    trigger_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__USED_RING,
+                                  VIRTIO_INT__USED_RING, true);
+    trigger_irq_and_require_level(
+        &irq, &emu, source, VIRTIO_INT__CONF_CHANGE,
+        VIRTIO_INT__USED_RING | VIRTIO_INT__CONF_CHANGE, true);
+    ack_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__USED_RING,
+                              VIRTIO_INT__CONF_CHANGE, true);
+    ack_irq_and_require_level(&irq, &emu, source, VIRTIO_INT__CONF_CHANGE, 0,
+                              false);
+
+    virtio_irq_destroy(&irq);
+    destroy_test_emu(&emu);
+}
+
 struct race_gate {
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -320,6 +382,7 @@ int main(void)
     test_trigger_ors_status_and_asserts_source();
     test_ack_clears_selected_bits_and_deasserts_only_at_zero();
     test_repeated_trigger_coalesces_status_and_line();
+    test_ordered_trigger_ack_interleavings_keep_level_consistent();
     test_trigger_racing_with_ack_keeps_status_and_line_consistent();
     return 0;
 }
