@@ -363,6 +363,12 @@ test-vgpu-error-policy:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c vgpu-display.c vgpu-rect.c -Wl,--gc-sections -o /tmp/test-vgpu-error-policy $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-error-policy
 
+VGPU_COPY_BENCH_SCALE ?= 1
+.PHONY: bench-vgpu-copy
+bench-vgpu-copy:
+	$(CC) $(HOST_TEST_CFLAGS) tests/bench-vgpu-copy.c -o /tmp/bench-vgpu-copy $(HOST_TEST_LDLIBS)
+	VGPU_COPY_BENCH_SCALE=$(VGPU_COPY_BENCH_SCALE) /tmp/bench-vgpu-copy
+
 .PHONY: test-debug-gate
 test-debug-gate: mini-gdbstub/Makefile
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
