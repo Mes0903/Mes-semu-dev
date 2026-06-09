@@ -71,6 +71,8 @@ struct backend_state {
     uint32_t last_config_write_value;
     int notify_ret;
     bool notify_saw_backend_lock_held;
+    bool notify_saw_transport_lock_held;
+    bool notify_saw_lifecycle_lock_held;
 };
 
 static int backend_activate(void *opaque,
@@ -130,6 +132,17 @@ static int backend_notify_queue(void *opaque,
     state->notify_saw_backend_lock_held = lock_ret == EBUSY;
     if (lock_ret == 0)
         pthread_mutex_unlock(&state->activate_common->backend_lock);
+    lock_ret = pthread_mutex_trylock(&state->activate_common->transport_lock);
+    state->notify_saw_transport_lock_held = lock_ret == EBUSY;
+    if (lock_ret == 0)
+        pthread_mutex_unlock(&state->activate_common->transport_lock);
+    if (state->activate_common->emu) {
+        lock_ret =
+            pthread_mutex_trylock(&state->activate_common->emu->lifecycle.lock);
+        state->notify_saw_lifecycle_lock_held = lock_ret == EBUSY;
+        if (lock_ret == 0)
+            pthread_mutex_unlock(&state->activate_common->emu->lifecycle.lock);
+    }
     return state->notify_ret;
 }
 
@@ -515,6 +528,10 @@ static void test_queue_notify_does_not_drain_queue(void)
                 common.generation);
     require_false("notify does not run under backend lock",
                   backend.notify_saw_backend_lock_held);
+    require_true("notify runs under transport lock",
+                 backend.notify_saw_transport_lock_held);
+    require_true("notify runs under lifecycle lock",
+                 backend.notify_saw_lifecycle_lock_held);
     require_u16("notify did not drain", common.queues[0].last_avail, 0);
     require_int("notify invalid queue",
                 virtio_mmio_write(&common, REG(QueueNotify), 4, 1), -EINVAL);

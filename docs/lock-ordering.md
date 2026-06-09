@@ -50,8 +50,11 @@ coverage on the participating paths.
 The common VirtIO MMIO `QueueNotify` lifecycle path is the first enforced path.
 It tracks lifecycle -> transport ordering, uses `backend_lock` only as a
 reset/activation barrier, drops the lifecycle rank before waiting on a busy
-backend lock, and releases backend rank before calling `notify_queue()` so
-actor-backed callbacks can take actor mailbox locks in order.
+backend lock, then revalidates generation/readiness under transport before
+calling `notify_queue()` under lifecycle -> transport. The backend rank is
+released before the callback so actor-backed callbacks can take actor mailbox
+locks in order, while status-zero reset cannot increment the device generation
+between the final revalidation and actor enqueue.
 
 Reset and activation are not fully enforced by this step. In particular,
 `virtio_mmio_complete_activation()` and `virtio_device_common_reset()` still use

@@ -345,11 +345,52 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
             return ret;
         }
 
+        ret = semu_lock_order_mutex_lock(&common->transport_lock,
+                                         SEMU_LOCK_RANK_DEVICE_TRANSPORT,
+                                         &transport_order);
+        if (ret < 0) {
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return ret;
+        }
+        still_current = common->generation == generation &&
+                        queue_index < common->num_queues &&
+                        common->queues[queue_index].ready;
+        lifecycle_accepting =
+            virtio_mmio_notify_lifecycle_accepting(common, &lifecycle_gate);
+        if (!still_current) {
+            unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                      &transport_order);
+            if (unlock_ret < 0) {
+                (void) virtio_mmio_unlock_notify_lifecycle_gate(
+                    common, &lifecycle_gate);
+                return unlock_ret;
+            }
+            unlock_ret = virtio_mmio_unlock_notify_lifecycle_gate(
+                common, &lifecycle_gate);
+            return unlock_ret < 0 ? unlock_ret : -ECANCELED;
+        }
+        if (!lifecycle_accepting) {
+            unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                      &transport_order);
+            if (unlock_ret < 0) {
+                (void) virtio_mmio_unlock_notify_lifecycle_gate(
+                    common, &lifecycle_gate);
+                return unlock_ret;
+            }
+            return virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+        }
+
         /* backend_lock is only a reset/activation barrier here. Actor-backed
-         * notify_queue callbacks may take actor->lock, so they must run after
-         * releasing backend rank while lifecycle still blocks stop-new-work.
+         * notify_queue callbacks may take actor->lock, so run them under
+         * lifecycle -> transport but after releasing backend rank.
          */
         ret = ops->notify_queue(opaque, queue_index, generation);
+        unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                  &transport_order);
+        if (ret == 0 && unlock_ret < 0)
+            ret = unlock_ret;
         unlock_ret =
             virtio_mmio_unlock_notify_lifecycle_gate(common, &lifecycle_gate);
         if (ret == 0 && unlock_ret < 0)
