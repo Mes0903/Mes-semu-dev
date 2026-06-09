@@ -209,6 +209,8 @@ uint32_t *virtio_blk_init(virtio_blk_state_t *vblk, char *disk_file);
 
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
 } virtio_rng_state_t;
@@ -227,6 +229,7 @@ void virtio_rng_write(hart_t *vm,
 
 bool virtio_rng_irq_pending(virtio_rng_state_t *vrng);
 void virtio_rng_init(virtio_rng_state_t *vrng, emu_state_t *emu);
+void virtio_rng_destroy(virtio_rng_state_t *vrng);
 #endif /* SEMU_HAS(VIRTIORNG) */
 
 /* VirtIO Input */

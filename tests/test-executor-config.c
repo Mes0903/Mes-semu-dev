@@ -90,7 +90,7 @@ static void test_virtio_host_io_policy_table(void)
     static const struct expected_policy expected[] = {
         {"virtio-gpu", SEMU_HAS(VIRTIOGPU), true},
         {"virtio-input", SEMU_HAS(VIRTIOINPUT), false},
-        {"virtio-rng", SEMU_HAS(VIRTIORNG), false},
+        {"virtio-rng", SEMU_HAS(VIRTIORNG), true},
         {"virtio-blk", SEMU_HAS(VIRTIOBLK), false},
         {"virtio-fs", SEMU_HAS(VIRTIOFS), false},
         {"virtio-net", SEMU_HAS(VIRTIONET), false},
@@ -164,7 +164,7 @@ static void test_actor_gate_names_legacy_devices(void)
                "actor gate unsupported list follows policy table order");
 
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIONET) || SEMU_HAS(VIRTIOBLK) || \
-    SEMU_HAS(VIRTIORNG) || SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS)
+    SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS)
     check_true(!gate.allowed, "actor mode rejects legacy devices");
 #if SEMU_HAS(VIRTIOBLK)
     check_true(strstr(gate.unsupported_devices, "virtio-blk") != NULL,
@@ -179,8 +179,8 @@ static void test_actor_gate_names_legacy_devices(void)
                "gate names virtio-net when enabled");
 #endif
 #if SEMU_HAS(VIRTIORNG)
-    check_true(strstr(gate.unsupported_devices, "virtio-rng") != NULL,
-               "gate names virtio-rng when enabled");
+    check_true(strstr(gate.unsupported_devices, "virtio-rng") == NULL,
+               "gate does not name virtio-rng when enabled");
 #endif
 #if SEMU_HAS(VIRTIOSND)
     check_true(strstr(gate.unsupported_devices, "virtio-snd") != NULL,

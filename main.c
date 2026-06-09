@@ -2424,6 +2424,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu->vrng);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -2444,6 +2447,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
+#endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu->vrng);
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -3344,6 +3350,9 @@ int main(int argc, char **argv)
             virtio_gpu_destroy(&emu.vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu.vrng);
+#endif
             g_window.window_cleanup();
             return 1;
         }
@@ -3378,6 +3387,10 @@ int main(int argc, char **argv)
     vgpu_display_shutdown_after_producer_stopped();
 #endif
     g_window.window_cleanup();
+#endif
+
+#if SEMU_HAS(VIRTIORNG)
+    virtio_rng_destroy(&emu.vrng);
 #endif
 
 #ifdef MMU_CACHE_STATS
