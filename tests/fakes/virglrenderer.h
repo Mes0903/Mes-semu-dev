@@ -78,4 +78,5 @@ void virgl_renderer_resource_detach_iov(int res_handle,
                                         struct iovec **iov,
                                         int *num_iovs);
 void virgl_renderer_resource_unref(uint32_t res_handle);
+int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw);
 void virgl_renderer_reset(void);

@@ -61,6 +61,11 @@ static struct iovec *fake_last_detached_iov;
 static int fake_last_resource_detach_iov_count;
 static int fake_resource_unref_count;
 static uint32_t fake_last_resource_unref_handle;
+static int fake_submit_cmd_count;
+static int fake_last_submit_cmd_ctx_id;
+static int fake_last_submit_cmd_ndw;
+static uint32_t fake_last_submit_cmd_words[16];
+static int fake_submit_cmd_result;
 static int wake_renderer_count;
 static int wake_frontend_count;
 static int fake_cookie_marker;
@@ -212,6 +217,24 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
     fake_last_resource_unref_handle = res_handle;
 }
 
+int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
+{
+    fake_submit_cmd_count++;
+    fake_last_submit_cmd_ctx_id = ctx_id;
+    fake_last_submit_cmd_ndw = ndw;
+    memset(fake_last_submit_cmd_words, 0, sizeof(fake_last_submit_cmd_words));
+    if (buffer && ndw > 0) {
+        int copy_ndw = ndw;
+        if (copy_ndw > (int) (sizeof(fake_last_submit_cmd_words) /
+                              sizeof(fake_last_submit_cmd_words[0])))
+            copy_ndw = (int) (sizeof(fake_last_submit_cmd_words) /
+                              sizeof(fake_last_submit_cmd_words[0]));
+        memcpy(fake_last_submit_cmd_words, buffer,
+               (size_t) copy_ndw * sizeof(uint32_t));
+    }
+    return fake_submit_cmd_result;
+}
+
 void virgl_renderer_reset(void)
 {
     fake_reset_count++;
@@ -301,6 +324,11 @@ static void reset_test_state(uint64_t generation)
     fake_last_resource_detach_iov_count = 0;
     fake_resource_unref_count = 0;
     fake_last_resource_unref_handle = 0;
+    fake_submit_cmd_count = 0;
+    fake_last_submit_cmd_ctx_id = 0;
+    fake_last_submit_cmd_ndw = 0;
+    memset(fake_last_submit_cmd_words, 0, sizeof(fake_last_submit_cmd_words));
+    fake_submit_cmd_result = 0;
     wake_renderer_count = 0;
     wake_frontend_count = 0;
     fake_window_create_count = 0;
@@ -1302,6 +1330,75 @@ static void test_reset_detaches_attached_resource_iov(void)
     CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
 }
 
+
+static void test_ctrl_request_executes_submit_3d_completion(void)
+{
+    reset_test_state(41);
+
+    uint32_t command_stream[3] = {0x01020304, 0x11121314, 0x21222324};
+    struct vgpu_renderer_ctrl_payload submit_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_SUBMIT_3D, .ctx_id = 77},
+        .cmd.submit_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_SUBMIT_3D, .ctx_id = 77},
+                .size = sizeof(command_stream),
+            },
+        .submit_data = command_stream,
+        .submit_data_size = sizeof(command_stream),
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 41},
+        .command_type = VIRTIO_GPU_CMD_SUBMIT_3D,
+        .payload = &submit_payload,
+        .payload_size = sizeof(submit_payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(fake_submit_cmd_count == 1);
+    CHECK(fake_last_submit_cmd_ctx_id == 77);
+    CHECK(fake_last_submit_cmd_ndw == 3);
+    CHECK(fake_last_submit_cmd_words[0] == 0x01020304);
+    CHECK(fake_last_submit_cmd_words[1] == 0x11121314);
+    CHECK(fake_last_submit_cmd_words[2] == 0x21222324);
+
+    fake_submit_cmd_result = -1;
+    command_stream[0] = 0xaabbccdd;
+    submit_payload.hdr.ctx_id = 78;
+    submit_payload.cmd.submit_3d.hdr.ctx_id = 78;
+    submit_payload.cmd.submit_3d.size = sizeof(uint32_t);
+    submit_payload.submit_data_size = sizeof(uint32_t);
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_submit_cmd_count == 2);
+    CHECK(fake_last_submit_cmd_ctx_id == 78);
+    CHECK(fake_last_submit_cmd_ndw == 1);
+    CHECK(fake_last_submit_cmd_words[0] == 0xaabbccdd);
+
+    fake_submit_cmd_result = 0;
+    submit_payload.cmd.submit_3d.num_in_fences = 1;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_submit_cmd_count == 2);
+
+    submit_payload.cmd.submit_3d.num_in_fences = 0;
+    submit_payload.cmd.submit_3d.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_submit_cmd_count == 2);
+}
+
 static void test_callback_completes_newest_matching_fence_and_clears_older(void)
 {
     reset_test_state(19);
@@ -1379,6 +1476,7 @@ int main(void)
     test_ctrl_request_executes_resource_backing_lifecycle();
     test_ctrl_request_attach_backing_failure_leaves_renderer_detached();
     test_reset_detaches_attached_resource_iov();
+    test_ctrl_request_executes_submit_3d_completion();
     test_callback_completes_newest_matching_fence_and_clears_older();
     test_reset_drops_pending_fences_and_ignores_stale_callbacks();
     return 0;

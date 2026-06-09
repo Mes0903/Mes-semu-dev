@@ -510,8 +510,8 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     require_u32("renderer token id remains zero", queued.token.id, 0);
     require_u32("payload size", queued.payload_size,
                 sizeof(struct vgpu_renderer_ctrl_payload));
-    require_ptr("payload release hook", (const void *) queued.release_payload,
-                (const void *) free);
+    require_false("payload release hook installed",
+                  queued.release_payload == NULL);
 
     struct vgpu_renderer_ctrl_payload *payload = queued.payload;
     require_u32("snapshot command type", payload->hdr.type,
@@ -1664,6 +1664,167 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
 }
 #endif
 
+
+#if SEMU_HAS(VIRGL)
+static void test_virgl_submit_3d_snapshots_command_buffer_and_defers(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_cmd_submit *submit =
+        (struct virtio_gpu_cmd_submit *) ((uint8_t *) ram + 0x40);
+    uint32_t *inline_word = (uint32_t *) ((uint8_t *) submit + sizeof(*submit));
+    uint32_t *split_words = (uint32_t *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x1c0);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x7a;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 70);
+
+    submit->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    submit->hdr.ctx_id = 88;
+    submit->size = 3 * sizeof(uint32_t);
+    *inline_word = 0x11111111;
+    split_words[0] = 0x22222222;
+    split_words[1] = 0x33333333;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*submit) + sizeof(uint32_t);
+    desc[1].addr = 0x140;
+    desc[1].len = 2 * sizeof(uint32_t);
+    desc[2].addr = 0x1c0;
+    desc[2].len = sizeof(*response);
+    desc[2].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("submit 3d is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    *inline_word = 0xaaaaaaaa;
+    split_words[0] = 0xbbbbbbbb;
+    split_words[1] = 0xcccccccc;
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("submit 3d queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("submit 3d command type", queued.command_type,
+                VIRTIO_GPU_CMD_SUBMIT_3D);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    require_u32("submit 3d ctx snapshot", payload->cmd.submit_3d.hdr.ctx_id,
+                88);
+    require_u32("submit 3d size snapshot", payload->cmd.submit_3d.size,
+                3 * sizeof(uint32_t));
+    require_u64("submit 3d data size", payload->submit_data_size,
+                3 * sizeof(uint32_t));
+    require_false("submit 3d data is host-owned",
+                  payload->submit_data == inline_word);
+    uint32_t *snapshot_words = payload->submit_data;
+    require_u32("submit 3d word0 snapshot", snapshot_words[0], 0x11111111);
+    require_u32("submit 3d word1 snapshot", snapshot_words[1], 0x22222222);
+    require_u32("submit 3d word2 snapshot", snapshot_words[2], 0x33333333);
+    require_u32("submit 3d response capacity", payload->response_capacity,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("submit 3d desc head", payload->ctrl_completion.desc_head, 70);
+    queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_submit_3d_rejects_invalid_or_late_payload(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_cmd_submit *submit =
+        (struct virtio_gpu_cmd_submit *) ((uint8_t *) ram + 0x40);
+    uint32_t *inline_word = (uint32_t *) ((uint8_t *) submit + sizeof(*submit));
+    uint32_t *late_word = (uint32_t *) ((uint8_t *) ram + 0x160);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x120);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x7b;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 80);
+
+    submit->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    submit->hdr.ctx_id = 89;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*submit);
+    desc[1].addr = 0x120;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    submit->size = 0;
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("zero submit 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("zero submit 3d response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    struct vgpu_renderer_request queued = {0};
+    require_int("zero submit 3d queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    submit->size = 3;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("unaligned submit 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("unaligned submit 3d response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("unaligned submit 3d queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    desc[0].len = sizeof(*submit) + sizeof(*inline_word);
+    *inline_word = 0x55555555;
+    submit->size = sizeof(uint32_t);
+    submit->num_in_fences = 1;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("in-fence submit 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("in-fence submit 3d response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("in-fence submit 3d queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    submit->num_in_fences = 0;
+    submit->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("fenced submit 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("fenced submit 3d response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("fenced submit 3d queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    submit->hdr.flags = 0;
+    desc[0].len = sizeof(*submit);
+    submit->size = sizeof(uint32_t);
+    *late_word = 0x44444444;
+    desc[2].addr = 0x160;
+    desc[2].len = sizeof(*late_word);
+    desc[2].flags = 0;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("late submit 3d payload response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("late submit 3d payload response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("late submit 3d payload queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+#endif
+
 static void test_vgpu_debug_counters_init_and_reset_to_zero(void)
 {
     uint32_t ram[64] = {0};
@@ -2190,6 +2351,8 @@ int main(void)
     test_virgl_resource_attach_backing_snapshots_iov_and_defers();
     test_virgl_resource_attach_rejects_malformed_backing_list();
     test_virgl_context_handlers_submit_ctrl_skeletons();
+    test_virgl_submit_3d_snapshots_command_buffer_and_defers();
+    test_virgl_submit_3d_rejects_invalid_or_late_payload();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_completion_drops_stale_common_generation();
     test_renderer_ctrl_completion_without_metadata_fails();

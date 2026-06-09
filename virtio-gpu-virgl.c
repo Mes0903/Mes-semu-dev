@@ -679,6 +679,28 @@ static void vgpu_virgl_execute_ctrl_request(
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
+    case VIRTIO_GPU_CMD_SUBMIT_3D: {
+        const struct virtio_gpu_cmd_submit *cmd = &payload->cmd.submit_3d;
+
+        if (!payload->submit_data || payload->submit_data_size != cmd->size ||
+            cmd->size == 0 || cmd->size % sizeof(uint32_t) != 0 ||
+            cmd->size / sizeof(uint32_t) > (uint32_t) INT_MAX ||
+            cmd->num_in_fences != 0) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+
+        int ret =
+            virgl_renderer_submit_cmd(payload->submit_data, cmd->hdr.ctx_id,
+                                      (int) (cmd->size / sizeof(uint32_t)));
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
     default:
         response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
         break;
