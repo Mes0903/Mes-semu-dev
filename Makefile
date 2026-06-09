@@ -345,6 +345,18 @@ test-executor-config:
 	/tmp/test-executor-config
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-actor-ready $(HOST_TEST_LDLIBS)
 	/tmp/test-executor-config-actor-ready
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=1 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-input $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-input
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=1 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-rng $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-rng
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=1 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-blk $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-blk
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=1 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-fs $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-fs
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=1 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-net $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-net
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=1 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-executor-config.c executor-config.c -o /tmp/test-executor-config-virtio-snd $(HOST_TEST_LDLIBS)
+	/tmp/test-executor-config-virtio-snd
 
 .PHONY: test-hart-executor
 test-hart-executor:
