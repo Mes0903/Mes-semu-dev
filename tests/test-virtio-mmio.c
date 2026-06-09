@@ -369,6 +369,11 @@ static void require_u64(const char *name, uint64_t got, uint64_t want)
     exit(1);
 }
 
+static bool source_asserted(emu_state_t *emu, enum semu_irq_source source)
+{
+    return (emu->plic.active & semu_irq_source_plic_bit(source)) != 0;
+}
+
 static void init_one_hart_vm(vm_t *vm, hart_t *hart, hart_t **harts)
 {
     memset(hart, 0, sizeof(*hart));
@@ -482,6 +487,19 @@ struct reset_thread_args {
     int ret;
 };
 
+struct irq_race_gate {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    unsigned ready;
+    bool go;
+};
+
+struct irq_race_args {
+    struct virtio_device_common *common;
+    struct irq_race_gate *gate;
+    int ret;
+};
+
 static void *notify_thread_main(void *opaque)
 {
     struct notify_thread_args *args = opaque;
@@ -495,6 +513,59 @@ static void *reset_thread_main(void *opaque)
     struct reset_thread_args *args = opaque;
 
     args->ret = virtio_device_common_reset(args->common);
+    return NULL;
+}
+
+static void irq_race_gate_init(struct irq_race_gate *gate)
+{
+    memset(gate, 0, sizeof(*gate));
+    require_int("irq race mutex init", pthread_mutex_init(&gate->lock, NULL),
+                0);
+    require_int("irq race cond init", pthread_cond_init(&gate->cond, NULL), 0);
+}
+
+static void irq_race_gate_destroy(struct irq_race_gate *gate)
+{
+    pthread_cond_destroy(&gate->cond);
+    pthread_mutex_destroy(&gate->lock);
+}
+
+static void irq_race_gate_wait(struct irq_race_gate *gate)
+{
+    pthread_mutex_lock(&gate->lock);
+    gate->ready++;
+    pthread_cond_broadcast(&gate->cond);
+    while (!gate->go)
+        pthread_cond_wait(&gate->cond, &gate->lock);
+    pthread_mutex_unlock(&gate->lock);
+}
+
+static void irq_race_gate_release_when_ready(struct irq_race_gate *gate)
+{
+    pthread_mutex_lock(&gate->lock);
+    while (gate->ready != 2)
+        pthread_cond_wait(&gate->cond, &gate->lock);
+    gate->go = true;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->lock);
+}
+
+static void *irq_race_mmio_ack_used(void *opaque)
+{
+    struct irq_race_args *args = opaque;
+
+    irq_race_gate_wait(args->gate);
+    args->ret = virtio_mmio_write(args->common, REG(InterruptACK), 4,
+                                  VIRTIO_INT__USED_RING);
+    return NULL;
+}
+
+static void *irq_race_trigger_conf(void *opaque)
+{
+    struct irq_race_args *args = opaque;
+
+    irq_race_gate_wait(args->gate);
+    virtio_irq_trigger(&args->common->irq, VIRTIO_INT__CONF_CHANGE);
     return NULL;
 }
 
@@ -1093,6 +1164,72 @@ static void test_interrupt_status_and_ack(void)
     destroy_test_emu(&emu);
 }
 
+static void test_interrupt_ack_racing_with_actor_completion_keeps_line_asserted(
+    void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    const uint16_t queue_max_sizes[] = {8};
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+
+    for (unsigned i = 0; i < 200; i++) {
+        struct irq_race_gate gate;
+        struct irq_race_args ack_args = {
+            .common = &common,
+            .gate = &gate,
+            .ret = -EAGAIN,
+        };
+        struct irq_race_args trigger_args = {
+            .common = &common,
+            .gate = &gate,
+            .ret = -EAGAIN,
+        };
+        pthread_t ack_thread;
+        pthread_t trigger_thread;
+
+        write_reg(&common, REG(InterruptACK),
+                  VIRTIO_INT__USED_RING | VIRTIO_INT__CONF_CHANGE);
+        virtio_irq_trigger(&common.irq, VIRTIO_INT__USED_RING);
+        require_u32("racing initial status",
+                    read_reg(&common, REG(InterruptStatus)),
+                    VIRTIO_INT__USED_RING);
+        require_true("racing initial line asserted",
+                     source_asserted(&emu, SEMU_IRQ_SOURCE_VGPU));
+
+        irq_race_gate_init(&gate);
+        require_int("ack thread create",
+                    pthread_create(&ack_thread, NULL, irq_race_mmio_ack_used,
+                                   &ack_args),
+                    0);
+        require_int("trigger thread create",
+                    pthread_create(&trigger_thread, NULL,
+                                   irq_race_trigger_conf, &trigger_args),
+                    0);
+        irq_race_gate_release_when_ready(&gate);
+        require_int("ack thread join", pthread_join(ack_thread, NULL), 0);
+        require_int("trigger thread join", pthread_join(trigger_thread, NULL),
+                    0);
+        irq_race_gate_destroy(&gate);
+
+        require_int("racing mmio ack result", ack_args.ret, 0);
+        require_u32("racing final status",
+                    read_reg(&common, REG(InterruptStatus)),
+                    VIRTIO_INT__CONF_CHANGE);
+        require_true("racing final line asserted",
+                     source_asserted(&emu, SEMU_IRQ_SOURCE_VGPU));
+    }
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
 static void test_reset_clears_transport_without_decrementing_config_generation(
     void)
 {
@@ -1414,6 +1551,7 @@ int main(void)
     test_driver_ok_activation_edge();
     test_activation_failure_marks_needs_reset();
     test_interrupt_status_and_ack();
+    test_interrupt_ack_racing_with_actor_completion_keeps_line_asserted();
     test_reset_clears_transport_without_decrementing_config_generation();
     test_reset_prepare_waits_without_common_locks();
     test_reset_gate_covers_blocked_backend_reset();
