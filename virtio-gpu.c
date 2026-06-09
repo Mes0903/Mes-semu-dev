@@ -22,7 +22,6 @@
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
 
-#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
 /* DMT usage macro */
 #define EDID_BLOCK_SIZE 128U

@@ -22,12 +22,14 @@
 #define VIRTIO_GPU_F_CONTEXT_INIT (UINT64_C(1) << 4)
 #define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
 
+#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
+
 /* Common virtq already bounds a descriptor chain by queue size. Keep the
  * backend descriptor view large enough for the full GPU queue so Linux
  * scatter-gather control buffers are not rejected solely because they exceed
  * the old request + data + response shape.
  */
-#define VIRTIO_GPU_MAX_DESC 1024
+#define VIRTIO_GPU_MAX_DESC VIRTIO_GPU_QUEUE_NUM_MAX
 #define VIRTIO_GPU_CONTROLQ 0
 #define VIRTIO_GPU_CURSORQ 1
 
