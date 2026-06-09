@@ -422,7 +422,7 @@ test-vgpu-renderer:
 
 .PHONY: test-vgpu-virgl-backend
 test-vgpu-virgl-backend:
-	$(CC) $(HOST_TEST_CFLAGS) -Itests/fakes -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-virgl-backend.c virtio-gpu-virgl.c vgpu-renderer.c -o /tmp/test-vgpu-virgl-backend $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -Itests/fakes -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-virgl-backend.c virtio-gpu-virgl.c vgpu-renderer.c vgpu-display.c -o /tmp/test-vgpu-virgl-backend $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-virgl-backend
 
 VGPU_COPY_BENCH_SCALE ?= 1

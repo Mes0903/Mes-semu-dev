@@ -1,5 +1,7 @@
 #include "virtio-gpu-virgl.h"
 
+#include "vgpu-display.h"
+
 #include <limits.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -156,11 +158,22 @@ static void vgpu_virgl_clear_renderer_resource_scanouts(uint32_t resource_id)
     }
 }
 
+static bool vgpu_virgl_rect_fits_resource(
+    const struct virtio_gpu_rect *rect,
+    const struct virgl_renderer_resource_info *info)
+{
+    return rect && info && rect->width != 0 && rect->height != 0 &&
+           info->width != 0 && info->height != 0 && rect->x < info->width &&
+           rect->y < info->height && rect->width <= info->width - rect->x &&
+           rect->height <= info->height - rect->y;
+}
+
 static int vgpu_virgl_record_renderer_scanout(
-    const struct vgpu_renderer_ctrl_payload *payload)
+    struct vgpu_renderer_ctrl_payload *payload)
 {
     const struct virtio_gpu_set_scanout *cmd = &payload->cmd.set_scanout;
     const struct virtio_gpu_scanout_info *scanout = &payload->scanout;
+    struct virgl_renderer_resource_info info = {0};
 
     if (cmd->scanout_id >= VIRTIO_GPU_MAX_SCANOUTS || !scanout->enabled)
         return VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
@@ -169,6 +182,24 @@ static int vgpu_virgl_record_renderer_scanout(
     if (cmd->r.width == 0 || cmd->r.height == 0 ||
         cmd->r.width > scanout->width || cmd->r.height > scanout->height)
         return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+    if (virgl_renderer_resource_get_info((int) cmd->resource_id, &info) != 0 ||
+        info.tex_id == 0)
+        return VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (!vgpu_virgl_rect_fits_resource(&cmd->r, &info))
+        return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+    payload->has_gl_scanout_payload = true;
+    payload->gl_scanout_payload = (struct vgpu_display_gl_payload) {
+        .texture_id = info.tex_id,
+        .width = info.width,
+        .height = info.height,
+        .src_x = cmd->r.x,
+        .src_y = cmd->r.y,
+        .src_width = cmd->r.width,
+        .src_height = cmd->r.height,
+        .y_0_top = false,
+    };
 
     vgpu_virgl_renderer_scanouts[cmd->scanout_id] =
         (struct vgpu_virgl_renderer_scanout) {
@@ -558,6 +589,8 @@ static void vgpu_virgl_set_ctrl_side_effect(
                 .scanout_id = payload->cmd.set_scanout.scanout_id,
                 .scanout_generation = payload->scanout_generation,
                 .resource_generation = payload->resource_generation,
+                .has_gl_payload = payload->has_gl_scanout_payload,
+                .gl_payload = payload->gl_scanout_payload,
                 .scanout = payload->scanout,
             };
         completion->virgl_resource.scanouts[0].scanout.primary_resource_id =

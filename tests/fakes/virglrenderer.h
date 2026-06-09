@@ -25,6 +25,20 @@ struct virgl_renderer_resource_create_args {
     uint32_t flags;
 };
 
+
+struct virgl_renderer_resource_info {
+    uint32_t handle;
+    uint32_t virgl_format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t flags;
+    uint32_t tex_id;
+    uint32_t stride;
+    int drm_fourcc;
+    int fd;
+};
+
 struct virgl_renderer_resource_create_blob_args {
     uint32_t res_handle;
     uint32_t ctx_id;
@@ -93,6 +107,8 @@ int virgl_renderer_resource_create(
     uint32_t num_iovs);
 int virgl_renderer_resource_create_blob(
     const struct virgl_renderer_resource_create_blob_args *args);
+int virgl_renderer_resource_get_info(int res_handle,
+                                     struct virgl_renderer_resource_info *info);
 int virgl_renderer_resource_attach_iov(int res_handle,
                                        struct iovec *iov,
                                        int num_iovs);

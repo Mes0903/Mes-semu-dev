@@ -52,6 +52,10 @@ static int fake_resource_create_blob_count;
 static struct virgl_renderer_resource_create_blob_args
     fake_last_resource_create_blob_args;
 static int fake_resource_create_blob_result;
+static int fake_resource_get_info_count;
+static int fake_last_resource_get_info_handle;
+static struct virgl_renderer_resource_info fake_resource_get_info;
+static int fake_resource_get_info_result;
 static int fake_resource_attach_iov_count;
 static int fake_last_resource_attach_iov_handle;
 static struct iovec *fake_last_resource_attach_iov;
@@ -213,6 +217,19 @@ int virgl_renderer_resource_create_blob(
     if (args)
         fake_last_resource_create_blob_args = *args;
     return fake_resource_create_blob_result;
+}
+
+int virgl_renderer_resource_get_info(int res_handle,
+                                     struct virgl_renderer_resource_info *info)
+{
+    fake_resource_get_info_count++;
+    fake_last_resource_get_info_handle = res_handle;
+    if (fake_resource_get_info_result == 0 && info) {
+        *info = fake_resource_get_info;
+        if (info->handle == 0)
+            info->handle = (uint32_t) res_handle;
+    }
+    return fake_resource_get_info_result;
 }
 
 int virgl_renderer_resource_attach_iov(int res_handle,
@@ -395,6 +412,14 @@ static void reset_test_state(uint64_t generation)
     fake_last_resource_create_blob_args =
         (struct virgl_renderer_resource_create_blob_args) {0};
     fake_resource_create_blob_result = 0;
+    fake_resource_get_info_count = 0;
+    fake_last_resource_get_info_handle = 0;
+    fake_resource_get_info = (struct virgl_renderer_resource_info) {
+        .width = 320,
+        .height = 240,
+        .tex_id = 0x4567,
+    };
+    fake_resource_get_info_result = 0;
     fake_resource_attach_iov_count = 0;
     fake_last_resource_attach_iov_handle = 0;
     fake_last_resource_attach_iov = NULL;
@@ -1066,7 +1091,7 @@ static void test_ctrl_request_resource_create_3d_failure_rolls_back_frontend(
     CHECK(fake_resource_unref_count == 0);
 }
 
-static void test_ctrl_request_records_set_scanout_skeleton_completion(void)
+static void test_ctrl_request_records_set_scanout_gl_payload_completion(void)
 {
     reset_test_state(41);
 
@@ -1142,6 +1167,18 @@ static void test_ctrl_request_records_set_scanout_skeleton_completion(void)
     CHECK(completion.virgl_resource.scanouts[0].scanout.src_y == 8);
     CHECK(completion.virgl_resource.scanouts[0].scanout.src_w == 160);
     CHECK(completion.virgl_resource.scanouts[0].scanout.src_h == 120);
+    CHECK(completion.virgl_resource.scanouts[0].has_gl_payload);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.texture_id ==
+          0x4567);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.width == 320);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.height == 240);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.src_x == 4);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.src_y == 8);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.src_width == 160);
+    CHECK(completion.virgl_resource.scanouts[0].gl_payload.src_height == 120);
+    CHECK(!completion.virgl_resource.scanouts[0].gl_payload.y_0_top);
+    CHECK(fake_resource_get_info_count == 1);
+    CHECK(fake_last_resource_get_info_handle == 91);
     CHECK(fake_window_create_count == 0);
     CHECK(fake_window_make_current_count == 0);
     CHECK(!vgpu_renderer_pop_completion(&completion));
@@ -1913,7 +1950,7 @@ int main(void)
     test_ctrl_request_executes_resource_create_3d_completion();
     test_ctrl_request_executes_resource_create_blob_completion();
     test_ctrl_request_resource_create_3d_failure_rolls_back_frontend();
-    test_ctrl_request_records_set_scanout_skeleton_completion();
+    test_ctrl_request_records_set_scanout_gl_payload_completion();
     test_ctrl_request_executes_resource_unref_completion();
     test_ctrl_request_resource_unref_missing_resource_rolls_back();
     test_ctrl_request_executes_resource_backing_lifecycle();

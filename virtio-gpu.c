@@ -855,22 +855,150 @@ static void virtio_gpu_virgl_clear_scanouts_for_resource_generation(
     pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
 }
 
-static void virtio_gpu_virgl_commit_scanout_if_current(
-    virtio_gpu_state_t *vgpu,
+static bool virtio_gpu_virgl_gl_payload_valid(
+    const struct vgpu_display_gl_payload *gl)
+{
+    return gl && gl->texture_id != 0 && gl->width != 0 && gl->height != 0 &&
+           gl->src_width != 0 && gl->src_height != 0 && gl->src_x < gl->width &&
+           gl->src_y < gl->height && gl->src_width <= gl->width - gl->src_x &&
+           gl->src_height <= gl->height - gl->src_y;
+}
+
+static void virtio_gpu_virgl_release_scanout_display_payload(
+    struct vgpu_virgl_scanout_side_effect *effect)
+{
+    if (!effect || !effect->display_payload)
+        return;
+
+    vgpu_display_release_cmd(&(struct vgpu_display_cmd) {
+        .type = VGPU_DISPLAY_CMD_PRIMARY_SET,
+        .u.primary_set = {.payload = effect->display_payload},
+    });
+    effect->display_payload = NULL;
+}
+
+static bool virtio_gpu_virgl_prepare_scanout_gl_payload(
     const struct vgpu_virgl_scanout_side_effect *effect)
 {
-    if (!effect || !vgpu || !vgpu->priv ||
-        effect->scanout_id >= PRIV(vgpu)->num_scanouts ||
+    if (!effect || effect->scanout_id >= VIRTIO_GPU_MAX_SCANOUTS)
+        return false;
+
+    if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
+        return false;
+
+    bool current = virtio_gpu_virgl_scanout_generations[effect->scanout_id] ==
+                   effect->scanout_generation;
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+    if (!current)
+        return true;
+
+    if (!effect->has_gl_payload ||
+        !virtio_gpu_virgl_gl_payload_valid(&effect->gl_payload))
+        return false;
+
+    return vgpu_display_can_publish();
+}
+
+static bool virtio_gpu_virgl_prepare_scanout_display_payload(
+    struct vgpu_virgl_scanout_side_effect *effect)
+{
+    if (!virtio_gpu_virgl_prepare_scanout_gl_payload(effect))
+        return false;
+    if (effect->display_payload ||
         effect->scanout_id >= VIRTIO_GPU_MAX_SCANOUTS)
+        return true;
+
+    if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
+        return false;
+
+    bool current = virtio_gpu_virgl_scanout_generations[effect->scanout_id] ==
+                   effect->scanout_generation;
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+    if (!current)
+        return true;
+
+    struct vgpu_display_payload *payload = calloc(1, sizeof(*payload));
+    if (!payload)
+        return false;
+
+    payload->type = VGPU_DISPLAY_PAYLOAD_GL;
+    payload->gl = effect->gl_payload;
+    effect->display_payload = payload;
+    return true;
+}
+
+static void virtio_gpu_virgl_cancel_pending_scanout_if_current(
+    const struct vgpu_virgl_scanout_side_effect *effect)
+{
+    if (!effect || effect->scanout_id >= VIRTIO_GPU_MAX_SCANOUTS)
         return;
 
     if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
         return;
 
+    if (virtio_gpu_virgl_scanout_generations[effect->scanout_id] ==
+        effect->scanout_generation)
+        virtio_gpu_virgl_advance_scanout_generation_locked(effect->scanout_id);
+
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+}
+
+static bool virtio_gpu_virgl_commit_scanout_if_current(
+    virtio_gpu_state_t *vgpu,
+    struct vgpu_virgl_scanout_side_effect *effect)
+{
+    if (!effect || !vgpu || !vgpu->priv ||
+        effect->scanout_id >= PRIV(vgpu)->num_scanouts ||
+        effect->scanout_id >= VIRTIO_GPU_MAX_SCANOUTS)
+        return true;
+
+    if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
+        return false;
+
     if (virtio_gpu_virgl_scanout_generations[effect->scanout_id] !=
         effect->scanout_generation) {
         pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
-        return;
+        return true;
+    }
+
+    struct vgpu_display_payload *payload = effect->display_payload;
+    if (!payload && effect->has_gl_payload) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        if (!virtio_gpu_virgl_prepare_scanout_display_payload(effect)) {
+            virtio_gpu_virgl_cancel_pending_scanout_if_current(effect);
+            return false;
+        }
+        payload = effect->display_payload;
+        if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0) {
+            virtio_gpu_virgl_release_scanout_display_payload(effect);
+            return false;
+        }
+        if (virtio_gpu_virgl_scanout_generations[effect->scanout_id] !=
+            effect->scanout_generation) {
+            pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+            virtio_gpu_virgl_release_scanout_display_payload(effect);
+            return true;
+        }
+    }
+
+    if (!payload) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        virtio_gpu_virgl_cancel_pending_scanout_if_current(effect);
+        return false;
+    }
+
+    enum vgpu_display_publish_result publish_result =
+        vgpu_display_publish_primary_set_next_generation(effect->scanout_id,
+                                                         payload);
+    effect->display_payload = NULL;
+    if (publish_result != VGPU_DISPLAY_PUBLISH_OK) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        vgpu_display_release_cmd(&(struct vgpu_display_cmd) {
+            .type = VGPU_DISPLAY_CMD_PRIMARY_SET,
+            .u.primary_set = {.payload = payload},
+        });
+        virtio_gpu_virgl_cancel_pending_scanout_if_current(effect);
+        return false;
     }
 
     PRIV(vgpu)->scanouts[effect->scanout_id] = effect->scanout;
@@ -879,6 +1007,7 @@ static void virtio_gpu_virgl_commit_scanout_if_current(
     virtio_gpu_virgl_scanout_resource_generations[effect->scanout_id] =
         effect->resource_generation;
     pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+    return true;
 }
 
 
@@ -913,9 +1042,44 @@ static int virtio_gpu_submit_renderer_reset(uint64_t generation)
     return vgpu_renderer_submit(&request) ? 0 : -EIO;
 }
 
+static void virtio_gpu_virgl_release_prepared_scanout_payloads(
+    struct vgpu_renderer_completion *completion)
+{
+    if (!completion)
+        return;
+
+    for (uint32_t i = 0; i < completion->virgl_resource.scanout_count &&
+                         i < VIRTIO_GPU_MAX_SCANOUTS;
+         i++)
+        virtio_gpu_virgl_release_scanout_display_payload(
+            &completion->virgl_resource.scanouts[i]);
+}
+
+static void virtio_gpu_virgl_prepare_renderer_side_effect(
+    struct vgpu_renderer_completion *completion)
+{
+    if (!completion || completion->virgl_resource.type !=
+                           VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT)
+        return;
+
+    for (uint32_t i = 0; i < completion->virgl_resource.scanout_count &&
+                         i < VIRTIO_GPU_MAX_SCANOUTS;
+         i++) {
+        if (virtio_gpu_virgl_prepare_scanout_display_payload(
+                &completion->virgl_resource.scanouts[i]))
+            continue;
+
+        virtio_gpu_virgl_release_prepared_scanout_payloads(completion);
+        completion->response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        completion->virgl_resource.type =
+            VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT_ROLLBACK;
+        break;
+    }
+}
+
 void virtio_gpu_virgl_apply_renderer_side_effect(
     virtio_gpu_state_t *vgpu UNUSED,
-    const struct vgpu_renderer_completion *completion)
+    struct vgpu_renderer_completion *completion)
 {
     if (!completion)
         return;
@@ -950,11 +1114,22 @@ void virtio_gpu_virgl_apply_renderer_side_effect(
     case VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT:
         for (uint32_t i = 0; i < completion->virgl_resource.scanout_count &&
                              i < VIRTIO_GPU_MAX_SCANOUTS;
-             i++)
-            virtio_gpu_virgl_commit_scanout_if_current(
-                vgpu, &completion->virgl_resource.scanouts[i]);
+             i++) {
+            if (!virtio_gpu_virgl_commit_scanout_if_current(
+                    vgpu, &completion->virgl_resource.scanouts[i])) {
+                completion->response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+                completion->virgl_resource.type =
+                    VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT_ROLLBACK;
+                break;
+            }
+        }
         break;
     case VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT_ROLLBACK:
+        for (uint32_t i = 0; i < completion->virgl_resource.scanout_count &&
+                             i < VIRTIO_GPU_MAX_SCANOUTS;
+             i++)
+            virtio_gpu_virgl_cancel_pending_scanout_if_current(
+                &completion->virgl_resource.scanouts[i]);
         break;
     case VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE:
     default:
@@ -2572,12 +2747,24 @@ static void virtio_gpu_release_renderer_completion(
     completion->response = NULL;
 }
 
+static void virtio_gpu_prepare_renderer_side_effect(
+    struct vgpu_renderer_completion *completion)
+{
+    virtio_gpu_virgl_prepare_renderer_side_effect(completion);
+}
+
 static void virtio_gpu_apply_renderer_side_effect(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion)
+    struct vgpu_renderer_completion *completion)
 {
     if (g_virtio_gpu_backend.apply_renderer_side_effect)
         g_virtio_gpu_backend.apply_renderer_side_effect(vgpu, completion);
+}
+
+static void virtio_gpu_release_prepared_renderer_side_effect(
+    struct vgpu_renderer_completion *completion)
+{
+    virtio_gpu_virgl_release_prepared_scanout_payloads(completion);
 }
 
 static bool virtio_gpu_write_renderer_completion_response(
@@ -2615,7 +2802,7 @@ static bool virtio_gpu_write_renderer_completion_response(
 
 static int virtio_gpu_complete_renderer_ctrl(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion)
+    struct vgpu_renderer_completion *completion)
 {
     struct virtio_gpu_deferred_ctrl_completion ctrl;
     struct virtq *queue;
@@ -2654,21 +2841,27 @@ static int virtio_gpu_complete_renderer_ctrl(
         return -ECANCELED;
     }
 
+    virtio_gpu_prepare_renderer_side_effect(completion);
+
     if (!virtio_gpu_write_renderer_completion_response(vgpu, completion,
                                                        &len)) {
+        virtio_gpu_release_prepared_renderer_side_effect(completion);
         virtio_gpu_end_actor_completion(vgpu);
         pthread_mutex_unlock(&vgpu->common.transport_lock);
         virtio_gpu_set_fail(vgpu);
         return -EFAULT;
     }
 
-    virtio_gpu_apply_renderer_side_effect(vgpu, completion);
-
     ctrl.len = len;
     ret = virtq_add_used(vgpu->common.dma, queue, ctrl.desc_head, ctrl.len);
-    if (ret == 0 && ctrl.trigger_irq &&
-        !virtq_interrupt_suppressed(vgpu->common.dma, queue))
-        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+    if (ret == 0) {
+        virtio_gpu_apply_renderer_side_effect(vgpu, completion);
+        if (ctrl.trigger_irq &&
+            !virtq_interrupt_suppressed(vgpu->common.dma, queue))
+            virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+    } else {
+        virtio_gpu_release_prepared_renderer_side_effect(completion);
+    }
 
     virtio_gpu_end_actor_completion(vgpu);
     pthread_mutex_unlock(&vgpu->common.transport_lock);

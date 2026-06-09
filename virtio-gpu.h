@@ -358,7 +358,7 @@ typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
 typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 typedef void (*virtio_gpu_renderer_side_effect_func)(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion);
+    struct vgpu_renderer_completion *completion);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func reset;
@@ -517,7 +517,7 @@ void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id);
 void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id);
 void virtio_gpu_virgl_apply_renderer_side_effect(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion);
+    struct vgpu_renderer_completion *completion);
 #endif
 void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
                                       struct virtq_desc *vq_desc,

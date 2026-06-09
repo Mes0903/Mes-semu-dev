@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/uio.h>
 
+#include "vgpu-display.h"
 #include "virtio-gpu.h"
 
 #define VGPU_RENDERER_QUEUE_CAPACITY VIRTIO_GPU_QUEUE_NUM_MAX
@@ -43,6 +44,9 @@ struct vgpu_virgl_scanout_side_effect {
     uint32_t scanout_id;
     uint64_t scanout_generation;
     uint64_t resource_generation;
+    bool has_gl_payload;
+    struct vgpu_display_gl_payload gl_payload;
+    struct vgpu_display_payload *display_payload;
     struct virtio_gpu_scanout_info scanout;
 };
 
@@ -73,6 +77,8 @@ struct vgpu_renderer_ctrl_payload {
     size_t submit_data_size;
     uint64_t resource_generation;
     uint64_t scanout_generation;
+    bool has_gl_scanout_payload;
+    struct vgpu_display_gl_payload gl_scanout_payload;
     struct virtio_gpu_scanout_info scanout;
     size_t response_capacity;
     uint32_t response_type;
