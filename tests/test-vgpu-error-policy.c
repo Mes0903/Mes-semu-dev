@@ -9,6 +9,9 @@
 
 #include "device.h"
 #include "virtio-gpu.h"
+#if SEMU_HAS(VIRGL)
+#include "vgpu-renderer.h"
+#endif
 #include "virtio.h"
 
 void semu_wake_interruptible_harts(emu_state_t *emu UNUSED) {}
@@ -128,6 +131,16 @@ static void require_u16(const char *name, uint16_t got, uint16_t want)
     exit(1);
 }
 
+#if SEMU_HAS(VIRGL)
+static uint32_t renderer_release_response_count;
+
+static void renderer_release_response(void *response)
+{
+    renderer_release_response_count++;
+    free(response);
+}
+#endif
+
 static void require_false(const char *name, bool got)
 {
     if (!got)
@@ -209,6 +222,16 @@ static uint32_t load_u32(const uint32_t *ram, uint32_t addr)
     memcpy(&value, (const uint8_t *) ram + addr, sizeof(value));
     return value;
 }
+
+#if SEMU_HAS(VIRGL)
+static uint64_t load_u64(const uint32_t *ram, uint32_t addr)
+{
+    uint64_t value;
+
+    memcpy(&value, (const uint8_t *) ram + addr, sizeof(value));
+    return value;
+}
+#endif
 
 static void configure_test_queue(emu_state_t *emu,
                                  virtio_gpu_state_t *vgpu,
@@ -471,6 +494,177 @@ static void test_deferred_ctrl_completion_revalidates_generations(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+#if SEMU_HAS(VIRGL)
+static void test_renderer_completion_drain_writes_response_and_used_ring(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    const uint64_t renderer_generation = 0x55;
+    struct virtio_gpu_ctrl_hdr *response = calloc(1, sizeof(*response));
+
+    if (!response) {
+        fprintf(stderr, "failed to allocate renderer response\n");
+        exit(1);
+    }
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+
+    response->type = VIRTIO_GPU_RESP_OK_NODATA;
+    response->flags = VIRTIO_GPU_FLAG_FENCE;
+    response->fence_id = UINT64_C(0x1234567887654321);
+
+    renderer_release_response_count = 0;
+    vgpu_renderer_reset_queues(renderer_generation);
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+        .response = response,
+        .response_size = sizeof(*response),
+        .release_response = renderer_release_response,
+        .has_ctrl_completion = true,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 5,
+                .actor_generation = virtio_actor_generation(&vgpu.actor),
+                .common_generation = vgpu.common.generation,
+                .trigger_irq = true,
+            },
+        .has_response_desc = true,
+        .response_desc =
+            {
+                .addr = 0x80,
+                .len = sizeof(*response),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+
+    require_int("queue renderer completion",
+                vgpu_renderer_complete(&completion), true);
+    virtio_gpu_drain_renderer_completions(&vgpu);
+
+    require_u32("renderer response type", load_u32(ram, 0x80),
+                VIRTIO_GPU_RESP_OK_NODATA);
+    require_u32("renderer response flags", load_u32(ram, 0x84),
+                VIRTIO_GPU_FLAG_FENCE);
+    require_u64("renderer response fence", load_u64(ram, 0x88),
+                UINT64_C(0x1234567887654321));
+    require_u16("used idx after renderer completion", load_u16(ram, 0x302), 1);
+    require_u32("renderer used elem id", load_u32(ram, 0x304), 5);
+    require_u32("renderer used elem len", load_u32(ram, 0x308),
+                sizeof(*response));
+    require_u32(
+        "renderer used-ring irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING,
+        VIRTIO_INT__USED_RING);
+    require_u32("renderer response released", renderer_release_response_count,
+                1);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_renderer_completion_drops_stale_common_generation(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    const uint64_t renderer_generation = 0x57;
+    struct virtio_gpu_ctrl_hdr *response = calloc(1, sizeof(*response));
+
+    if (!response) {
+        fprintf(stderr, "failed to allocate stale renderer response\n");
+        exit(1);
+    }
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+
+    response->type = VIRTIO_GPU_RESP_OK_NODATA;
+
+    renderer_release_response_count = 0;
+    vgpu_renderer_reset_queues(renderer_generation);
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+        .response = response,
+        .response_size = sizeof(*response),
+        .release_response = renderer_release_response,
+        .has_ctrl_completion = true,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 6,
+                .actor_generation = virtio_actor_generation(&vgpu.actor),
+                .common_generation = vgpu.common.generation - 1,
+                .trigger_irq = true,
+            },
+        .has_response_desc = true,
+        .response_desc =
+            {
+                .addr = 0x80,
+                .len = sizeof(*response),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+
+    require_int("queue stale renderer completion",
+                vgpu_renderer_complete(&completion), true);
+    virtio_gpu_drain_renderer_completions(&vgpu);
+
+    require_u32("stale renderer response not written", load_u32(ram, 0x80), 0);
+    require_u16("used idx unchanged by stale renderer completion",
+                load_u16(ram, 0x302), 0);
+    require_u32(
+        "stale renderer completion does not trigger used irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
+    require_u32("stale renderer response released",
+                renderer_release_response_count, 1);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_renderer_ctrl_completion_without_metadata_fails(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    const uint64_t renderer_generation = 0x56;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    vgpu_renderer_reset_queues(renderer_generation);
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+    };
+
+    require_int("queue renderer ctrl without metadata",
+                vgpu_renderer_complete(&completion), true);
+    virtio_gpu_drain_renderer_completions(&vgpu);
+
+    require_u32(
+        "renderer ctrl without metadata sets reset-needed",
+        atomic_load(&vgpu.common.status) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+        VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+#endif
+
 static void test_vgpu_destroy_releases_common_without_actor(void)
 {
     static const uint16_t queue_max_sizes[] = {8, 8};
@@ -532,6 +726,11 @@ int main(void)
     test_vgpu_invalid_actor_notify_counts_einval();
     test_vgpu_virgl_gate_keeps_unsupported_features_hidden();
     test_deferred_ctrl_completion_revalidates_generations();
+#if SEMU_HAS(VIRGL)
+    test_renderer_completion_drain_writes_response_and_used_ring();
+    test_renderer_completion_drops_stale_common_generation();
+    test_renderer_ctrl_completion_without_metadata_fails();
+#endif
     test_vgpu_destroy_releases_common_without_actor();
     test_vgpu_destroy_stops_started_actor_and_is_idempotent();
     return 0;

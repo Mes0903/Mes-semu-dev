@@ -860,6 +860,12 @@ static void io_poll_peripherals(emu_state_t *emu)
     EMU_DEVICE_CALL(emu->vfs_lock, pending = virtio_fs_irq_pending(&emu->vfs));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VFS, pending);
 #endif
+#if SEMU_HAS(VIRTIOGPU)
+    EMU_DEVICE_CALL(emu->vgpu_lock,
+                    virtio_gpu_drain_renderer_completions(&emu->vgpu);
+                    pending = virtio_gpu_irq_pending(&emu->vgpu));
+    emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VGPU, pending);
+#endif
 #if SEMU_HAS(VIRTIOINPUT)
     /* The empty path is common during CI and boot workloads, so only
      * drain the host-side queue after the window thread has published

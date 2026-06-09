@@ -364,6 +364,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu);
 void virtio_gpu_destroy(virtio_gpu_state_t *vgpu);
 struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
     virtio_gpu_state_t *vgpu);
+void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu);
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
                                      uint32_t width,
                                      uint32_t height);

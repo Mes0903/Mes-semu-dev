@@ -328,13 +328,19 @@ struct virtio_gpu_deferred_ctrl_completion {
     bool trigger_irq;
 };
 
+struct vgpu_renderer_completion;
+
 typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
                                     struct virtq_desc *vq_desc,
                                     uint32_t *plen);
 typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
+typedef void (*virtio_gpu_renderer_side_effect_func)(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func reset;
+    virtio_gpu_renderer_side_effect_func apply_renderer_side_effect;
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
     virtio_gpu_cmd_func resource_create_2d;
@@ -400,6 +406,7 @@ void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
 int virtio_gpu_complete_deferred_ctrl(
     virtio_gpu_state_t *vgpu,
     const struct virtio_gpu_deferred_ctrl_completion *completion);
+void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu);
 struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
     virtio_gpu_state_t *vgpu);
 

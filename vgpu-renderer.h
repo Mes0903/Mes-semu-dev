@@ -65,6 +65,11 @@ struct vgpu_renderer_completion {
     void *response;
     size_t response_size;
     void (*release_response)(void *response);
+    bool has_ctrl_completion;
+    struct virtio_gpu_deferred_ctrl_completion ctrl_completion;
+    bool has_response_desc;
+    struct virtio_gpu_ctrl_hdr request_hdr;
+    struct virtq_desc response_desc;
     struct {
         enum vgpu_virgl_resource_side_effect_type type;
         uint32_t resource_id;
