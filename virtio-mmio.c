@@ -216,10 +216,10 @@ static void virtio_mmio_prepare_activation_request_locked(
     request->pending = true;
 }
 
-/* Transitional lock-order exception: activation/reset callbacks still use
- * backend_lock before transport_lock to serialize backend callbacks around
- * generation revalidation. See docs/lock-ordering.md before changing or
- * wrapping this path.
+/* Transitional lock-order exception: activation still uses backend_lock
+ * before transport_lock while it revalidates generation/status and runs the
+ * activation callback. Reset callbacks run outside common locks. See
+ * docs/lock-ordering.md before changing or wrapping this path.
  */
 static int virtio_mmio_complete_activation(
     struct virtio_device_common *common,

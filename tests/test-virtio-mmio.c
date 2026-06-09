@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "device.h"
 #include "irq-source.h"
@@ -30,6 +31,35 @@ struct callback_waitpoint {
     bool entered;
     bool release;
 };
+
+#define CALLBACK_WAITPOINT_TIMEOUT_SEC 5
+
+static struct timespec callback_waitpoint_deadline(void)
+{
+    struct timespec deadline;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        perror("clock_gettime");
+        exit(1);
+    }
+    deadline.tv_sec += CALLBACK_WAITPOINT_TIMEOUT_SEC;
+    return deadline;
+}
+
+static void callback_waitpoint_fail_locked(
+    struct callback_waitpoint *waitpoint,
+    const char *name,
+    int ret)
+{
+    pthread_mutex_unlock(&waitpoint->lock);
+    if (ret == ETIMEDOUT)
+        fprintf(stderr, "%s: timed out waiting for callback waitpoint\n",
+                name);
+    else
+        fprintf(stderr, "%s: pthread_cond_timedwait failed: %d\n", name,
+                ret);
+    exit(1);
+}
 
 static void callback_waitpoint_init(struct callback_waitpoint *waitpoint)
 {
@@ -55,22 +85,38 @@ static void callback_waitpoint_destroy(struct callback_waitpoint *waitpoint)
 }
 
 static void callback_waitpoint_enter_and_wait(
-    struct callback_waitpoint *waitpoint)
+    struct callback_waitpoint *waitpoint,
+    const char *name)
 {
+    struct timespec deadline = callback_waitpoint_deadline();
+
     pthread_mutex_lock(&waitpoint->lock);
     waitpoint->entered = true;
     pthread_cond_broadcast(&waitpoint->cond);
-    while (!waitpoint->release)
-        pthread_cond_wait(&waitpoint->cond, &waitpoint->lock);
+    while (!waitpoint->release) {
+        int ret = pthread_cond_timedwait(&waitpoint->cond,
+                                         &waitpoint->lock, &deadline);
+
+        if (ret != 0)
+            callback_waitpoint_fail_locked(waitpoint, name, ret);
+    }
     pthread_mutex_unlock(&waitpoint->lock);
 }
 
 static void callback_waitpoint_wait_entered(
-    struct callback_waitpoint *waitpoint)
+    struct callback_waitpoint *waitpoint,
+    const char *name)
 {
+    struct timespec deadline = callback_waitpoint_deadline();
+
     pthread_mutex_lock(&waitpoint->lock);
-    while (!waitpoint->entered)
-        pthread_cond_wait(&waitpoint->cond, &waitpoint->lock);
+    while (!waitpoint->entered) {
+        int ret = pthread_cond_timedwait(&waitpoint->cond,
+                                         &waitpoint->lock, &deadline);
+
+        if (ret != 0)
+            callback_waitpoint_fail_locked(waitpoint, name, ret);
+    }
     pthread_mutex_unlock(&waitpoint->lock);
 }
 
@@ -175,7 +221,8 @@ static int backend_prepare_reset(void *opaque,
     if (lock_ret == 0)
         pthread_mutex_unlock(&common->transport_lock);
     if (state->prepare_reset_waitpoint)
-        callback_waitpoint_enter_and_wait(state->prepare_reset_waitpoint);
+        callback_waitpoint_enter_and_wait(state->prepare_reset_waitpoint,
+                                          "prepare_reset release");
     return 0;
 }
 
@@ -200,7 +247,8 @@ static int backend_reset(void *opaque,
     if (lock_ret == 0)
         pthread_mutex_unlock(&state->activate_common->transport_lock);
     if (state->reset_waitpoint)
-        callback_waitpoint_enter_and_wait(state->reset_waitpoint);
+        callback_waitpoint_enter_and_wait(state->reset_waitpoint,
+                                          "reset release");
     return 0;
 }
 
@@ -1144,7 +1192,7 @@ static void test_reset_prepare_waits_without_common_locks(void)
 
     require_int("start reset thread",
                 pthread_create(&thread, NULL, reset_thread_main, &args), 0);
-    callback_waitpoint_wait_entered(&prepare_waitpoint);
+    callback_waitpoint_wait_entered(&prepare_waitpoint, "prepare_reset entered");
 
     lock_ret = pthread_mutex_trylock(&common.backend_lock);
     require_int("backend lock available while prepare waits", lock_ret, 0);
@@ -1200,7 +1248,7 @@ static void test_reset_gate_covers_blocked_backend_reset(void)
 
     require_int("start reset thread",
                 pthread_create(&thread, NULL, reset_thread_main, &args), 0);
-    callback_waitpoint_wait_entered(&reset_waitpoint);
+    callback_waitpoint_wait_entered(&reset_waitpoint, "reset entered");
     reset_generation = common.generation;
 
     require_false("backend reset does not hold backend lock",
