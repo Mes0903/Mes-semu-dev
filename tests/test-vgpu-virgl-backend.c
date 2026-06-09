@@ -61,6 +61,28 @@ static struct iovec *fake_last_detached_iov;
 static int fake_last_resource_detach_iov_count;
 static int fake_resource_unref_count;
 static uint32_t fake_last_resource_unref_handle;
+static int fake_transfer_write_iov_count;
+static uint32_t fake_last_transfer_write_handle;
+static uint32_t fake_last_transfer_write_ctx_id;
+static int fake_last_transfer_write_level;
+static uint32_t fake_last_transfer_write_stride;
+static uint32_t fake_last_transfer_write_layer_stride;
+static struct virgl_box fake_last_transfer_write_box;
+static uint64_t fake_last_transfer_write_offset;
+static struct iovec *fake_last_transfer_write_iov;
+static unsigned int fake_last_transfer_write_iov_count;
+static int fake_transfer_write_iov_result;
+static int fake_transfer_read_iov_count;
+static uint32_t fake_last_transfer_read_handle;
+static uint32_t fake_last_transfer_read_ctx_id;
+static uint32_t fake_last_transfer_read_level;
+static uint32_t fake_last_transfer_read_stride;
+static uint32_t fake_last_transfer_read_layer_stride;
+static struct virgl_box fake_last_transfer_read_box;
+static uint64_t fake_last_transfer_read_offset;
+static struct iovec *fake_last_transfer_read_iov;
+static int fake_last_transfer_read_iov_count;
+static int fake_transfer_read_iov_result;
 static int fake_submit_cmd_count;
 static int fake_last_submit_cmd_ctx_id;
 static int fake_last_submit_cmd_ndw;
@@ -217,6 +239,52 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
     fake_last_resource_unref_handle = res_handle;
 }
 
+int virgl_renderer_transfer_write_iov(uint32_t handle,
+                                      uint32_t ctx_id,
+                                      int level,
+                                      uint32_t stride,
+                                      uint32_t layer_stride,
+                                      struct virgl_box *box,
+                                      uint64_t offset,
+                                      struct iovec *iov,
+                                      unsigned int iovec_cnt)
+{
+    fake_transfer_write_iov_count++;
+    fake_last_transfer_write_handle = handle;
+    fake_last_transfer_write_ctx_id = ctx_id;
+    fake_last_transfer_write_level = level;
+    fake_last_transfer_write_stride = stride;
+    fake_last_transfer_write_layer_stride = layer_stride;
+    fake_last_transfer_write_box = box ? *box : (struct virgl_box) {0};
+    fake_last_transfer_write_offset = offset;
+    fake_last_transfer_write_iov = iov;
+    fake_last_transfer_write_iov_count = iovec_cnt;
+    return fake_transfer_write_iov_result;
+}
+
+int virgl_renderer_transfer_read_iov(uint32_t handle,
+                                     uint32_t ctx_id,
+                                     uint32_t level,
+                                     uint32_t stride,
+                                     uint32_t layer_stride,
+                                     struct virgl_box *box,
+                                     uint64_t offset,
+                                     struct iovec *iov,
+                                     int iovec_cnt)
+{
+    fake_transfer_read_iov_count++;
+    fake_last_transfer_read_handle = handle;
+    fake_last_transfer_read_ctx_id = ctx_id;
+    fake_last_transfer_read_level = level;
+    fake_last_transfer_read_stride = stride;
+    fake_last_transfer_read_layer_stride = layer_stride;
+    fake_last_transfer_read_box = box ? *box : (struct virgl_box) {0};
+    fake_last_transfer_read_offset = offset;
+    fake_last_transfer_read_iov = iov;
+    fake_last_transfer_read_iov_count = iovec_cnt;
+    return fake_transfer_read_iov_result;
+}
+
 int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw)
 {
     fake_submit_cmd_count++;
@@ -324,6 +392,28 @@ static void reset_test_state(uint64_t generation)
     fake_last_resource_detach_iov_count = 0;
     fake_resource_unref_count = 0;
     fake_last_resource_unref_handle = 0;
+    fake_transfer_write_iov_count = 0;
+    fake_last_transfer_write_handle = 0;
+    fake_last_transfer_write_ctx_id = 0;
+    fake_last_transfer_write_level = 0;
+    fake_last_transfer_write_stride = 0;
+    fake_last_transfer_write_layer_stride = 0;
+    fake_last_transfer_write_box = (struct virgl_box) {0};
+    fake_last_transfer_write_offset = 0;
+    fake_last_transfer_write_iov = NULL;
+    fake_last_transfer_write_iov_count = 0;
+    fake_transfer_write_iov_result = 0;
+    fake_transfer_read_iov_count = 0;
+    fake_last_transfer_read_handle = 0;
+    fake_last_transfer_read_ctx_id = 0;
+    fake_last_transfer_read_level = 0;
+    fake_last_transfer_read_stride = 0;
+    fake_last_transfer_read_layer_stride = 0;
+    fake_last_transfer_read_box = (struct virgl_box) {0};
+    fake_last_transfer_read_offset = 0;
+    fake_last_transfer_read_iov = NULL;
+    fake_last_transfer_read_iov_count = 0;
+    fake_transfer_read_iov_result = 0;
     fake_submit_cmd_count = 0;
     fake_last_submit_cmd_ctx_id = 0;
     fake_last_submit_cmd_ndw = 0;
@@ -1331,6 +1421,169 @@ static void test_reset_detaches_attached_resource_iov(void)
 }
 
 
+static void test_ctrl_request_executes_transfer_3d_completion(void)
+{
+    reset_test_state(42);
+
+    struct vgpu_renderer_ctrl_payload create_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+        .cmd.resource_create_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+                .resource_id = 95,
+                .target = 2,
+                .format = 3,
+                .bind = 4,
+                .width = 64,
+                .height = 64,
+                .depth = 1,
+                .array_size = 1,
+                .nr_samples = 1,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 42},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+        .payload = &create_payload,
+        .payload_size = sizeof(create_payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    uint8_t backing[16] = {0};
+    struct iovec *iov = malloc(sizeof(*iov));
+    CHECK(iov != NULL);
+    *iov = (struct iovec) {.iov_base = backing, .iov_len = sizeof(backing)};
+    struct vgpu_renderer_ctrl_payload attach_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING},
+        .cmd.resource_attach_backing =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING},
+                .resource_id = 95,
+                .nr_entries = 1,
+            },
+        .iov = iov,
+        .iov_count = 1,
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    request.payload = &attach_payload;
+    request.payload_size = sizeof(attach_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    struct vgpu_renderer_ctrl_payload transfer_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, .ctx_id = 33},
+        .cmd.transfer_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+                        .ctx_id = 33},
+                .box = {.x = 1, .y = 2, .z = 3, .w = 4, .h = 5, .d = 6},
+                .offset = UINT64_C(0x123456789),
+                .resource_id = 95,
+                .level = 2,
+                .stride = 64,
+                .layer_stride = 128,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    request.payload = &transfer_payload;
+    request.payload_size = sizeof(transfer_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE);
+    CHECK(fake_transfer_write_iov_count == 1);
+    CHECK(fake_last_transfer_write_handle == 95);
+    CHECK(fake_last_transfer_write_ctx_id == 33);
+    CHECK(fake_last_transfer_write_level == 2);
+    CHECK(fake_last_transfer_write_stride == 64);
+    CHECK(fake_last_transfer_write_layer_stride == 128);
+    CHECK(fake_last_transfer_write_box.x == 1);
+    CHECK(fake_last_transfer_write_box.y == 2);
+    CHECK(fake_last_transfer_write_box.z == 3);
+    CHECK(fake_last_transfer_write_box.w == 4);
+    CHECK(fake_last_transfer_write_box.h == 5);
+    CHECK(fake_last_transfer_write_box.d == 6);
+    CHECK(fake_last_transfer_write_offset == UINT64_C(0x123456789));
+    CHECK(fake_last_transfer_write_iov == NULL);
+    CHECK(fake_last_transfer_write_iov_count == 0);
+
+    fake_transfer_read_iov_result = -1;
+    transfer_payload.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    transfer_payload.hdr.ctx_id = 34;
+    transfer_payload.cmd.transfer_3d.hdr.type =
+        VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    transfer_payload.cmd.transfer_3d.hdr.ctx_id = 34;
+    transfer_payload.cmd.transfer_3d.level = 3;
+    request.command_type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE);
+    CHECK(fake_transfer_read_iov_count == 1);
+    CHECK(fake_last_transfer_read_handle == 95);
+    CHECK(fake_last_transfer_read_ctx_id == 34);
+    CHECK(fake_last_transfer_read_level == 3);
+    CHECK(fake_last_transfer_read_stride == 64);
+    CHECK(fake_last_transfer_read_layer_stride == 128);
+    CHECK(fake_last_transfer_read_box.x == 1);
+    CHECK(fake_last_transfer_read_box.y == 2);
+    CHECK(fake_last_transfer_read_box.z == 3);
+    CHECK(fake_last_transfer_read_box.w == 4);
+    CHECK(fake_last_transfer_read_box.h == 5);
+    CHECK(fake_last_transfer_read_box.d == 6);
+    CHECK(fake_last_transfer_read_offset == UINT64_C(0x123456789));
+    CHECK(fake_last_transfer_read_iov == NULL);
+    CHECK(fake_last_transfer_read_iov_count == 0);
+
+    fake_transfer_read_iov_result = 0;
+    transfer_payload.cmd.transfer_3d.resource_id = 12345;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    CHECK(fake_transfer_read_iov_count == 1);
+
+    create_payload.cmd.resource_create_3d.resource_id = 96;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    request.payload = &create_payload;
+    request.payload_size = sizeof(create_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    transfer_payload.cmd.transfer_3d.resource_id = 96;
+    request.command_type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    request.payload = &transfer_payload;
+    request.payload_size = sizeof(transfer_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_transfer_read_iov_count == 1);
+
+    transfer_payload.cmd.transfer_3d.resource_id = 95;
+    transfer_payload.cmd.transfer_3d.level = UINT32_MAX;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_transfer_read_iov_count == 1);
+
+    vgpu_virgl_reset_renderer();
+}
+
 static void test_ctrl_request_executes_submit_3d_completion(void)
 {
     reset_test_state(41);
@@ -1476,6 +1729,7 @@ int main(void)
     test_ctrl_request_executes_resource_backing_lifecycle();
     test_ctrl_request_attach_backing_failure_leaves_renderer_detached();
     test_reset_detaches_attached_resource_iov();
+    test_ctrl_request_executes_transfer_3d_completion();
     test_ctrl_request_executes_submit_3d_completion();
     test_callback_completes_newest_matching_fence_and_clears_older();
     test_reset_drops_pending_fences_and_ignores_stale_callbacks();

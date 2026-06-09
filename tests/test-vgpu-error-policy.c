@@ -1485,6 +1485,324 @@ static void test_virgl_resource_attach_backing_snapshots_iov_and_defers(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_virgl_transfer_3d_requires_attached_resource_and_defers(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc attach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc transfer_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc detach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc unref_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_transfer_host_3d *transfer =
+        (struct virtio_gpu_transfer_host_3d *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_res_attach_backing *attach =
+        (struct virtio_gpu_res_attach_backing *) ((uint8_t *) ram + 0x180);
+    struct virtio_gpu_mem_entry *entries =
+        (struct virtio_gpu_mem_entry *) ((uint8_t *) ram + 0x200);
+    struct virtio_gpu_res_detach_backing *detach =
+        (struct virtio_gpu_res_detach_backing *) ((uint8_t *) ram + 0x280);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x2c0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x300);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x7c;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 90);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 66;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 64;
+    create->height = 64;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x300;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before transfer is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before transfer queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    uint64_t resource_generation = create_payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    transfer->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    transfer->hdr.ctx_id = 12;
+    transfer->box = (struct virtio_gpu_box) {
+        .x = 1,
+        .y = 2,
+        .z = 3,
+        .w = 4,
+        .h = 5,
+        .d = 6,
+    };
+    transfer->offset = UINT64_C(0x123456789);
+    transfer->resource_id = 66;
+    transfer->level = 1;
+    transfer->stride = 256;
+    transfer->layer_stride = 512;
+    transfer_desc[0].addr = 0x100;
+    transfer_desc[0].len = sizeof(*transfer);
+    transfer_desc[1].addr = 0x300;
+    transfer_desc[1].len = sizeof(*response);
+    transfer_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.transfer_to_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer before backing response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d transfer before backing response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    struct vgpu_renderer_request empty = {0};
+    require_int("3d transfer before backing queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    attach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach->resource_id = 66;
+    attach->nr_entries = 1;
+    entries[0].addr = 0x340;
+    entries[0].length = 16;
+    attach_desc[0].addr = 0x180;
+    attach_desc[0].len = sizeof(*attach);
+    attach_desc[1].addr = 0x200;
+    attach_desc[1].len = sizeof(*entries);
+    attach_desc[2].addr = 0x300;
+    attach_desc[2].len = sizeof(*response);
+    attach_desc[2].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("3d attach before transfer is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d attach before transfer queued",
+                vgpu_renderer_pop_request(&queued), true);
+
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_to_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer during attach pending response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d transfer during attach pending response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("3d transfer during attach pending queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion attach_success = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_ATTACH_BACKING,
+                .resource_id = 66,
+                .resource_generation = resource_generation,
+                .backing_transition_success = true,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &attach_success);
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 91;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_to_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer to host is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d transfer to host queued",
+                vgpu_renderer_pop_request(&queued), true);
+    require_u32("3d transfer command type", queued.command_type,
+                VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D);
+    struct vgpu_renderer_ctrl_payload *transfer_payload = queued.payload;
+    void (*transfer_release_payload)(void *) = queued.release_payload;
+    require_u32("3d transfer snapshots resource id",
+                transfer_payload->cmd.transfer_3d.resource_id, 66);
+    require_u32("3d transfer snapshots ctx id",
+                transfer_payload->cmd.transfer_3d.hdr.ctx_id, 12);
+    require_u32("3d transfer snapshots box x",
+                transfer_payload->cmd.transfer_3d.box.x, 1);
+    require_u32("3d transfer snapshots box d",
+                transfer_payload->cmd.transfer_3d.box.d, 6);
+    require_u64("3d transfer snapshots offset",
+                transfer_payload->cmd.transfer_3d.offset,
+                UINT64_C(0x123456789));
+    require_u32("3d transfer snapshots stride",
+                transfer_payload->cmd.transfer_3d.stride, 256);
+    require_u32("3d transfer snapshots layer stride",
+                transfer_payload->cmd.transfer_3d.layer_stride, 512);
+    require_u64("3d transfer carries resource generation",
+                transfer_payload->resource_generation, resource_generation);
+    require_u32("3d transfer desc head",
+                transfer_payload->ctrl_completion.desc_head, 91);
+    require_u32("3d transfer response capacity",
+                transfer_payload->response_capacity,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+
+    transfer->resource_id = 999;
+    transfer->box.x = 99;
+    require_u32("3d transfer payload is host-owned resource id",
+                transfer_payload->cmd.transfer_3d.resource_id, 66);
+    require_u32("3d transfer payload is host-owned box",
+                transfer_payload->cmd.transfer_3d.box.x, 1);
+    transfer_release_payload(transfer_payload);
+
+    transfer->hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    transfer->resource_id = 66;
+    transfer->box.x = 7;
+    transfer->box.d = 8;
+    transfer->offset = UINT64_C(0x987654321);
+    transfer->stride = 1024;
+    transfer->layer_stride = 2048;
+    vgpu.ctrl_dispatch.desc_head = 92;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer from host is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d transfer from host queued",
+                vgpu_renderer_pop_request(&queued), true);
+    require_u32("3d transfer from host command type", queued.command_type,
+                VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D);
+    transfer_payload = queued.payload;
+    transfer_release_payload = queued.release_payload;
+    require_u32("3d transfer from host snapshots resource id",
+                transfer_payload->cmd.transfer_3d.resource_id, 66);
+    require_u32("3d transfer from host snapshots hdr type",
+                transfer_payload->cmd.transfer_3d.hdr.type,
+                VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D);
+    require_u32("3d transfer from host snapshots box x",
+                transfer_payload->cmd.transfer_3d.box.x, 7);
+    require_u32("3d transfer from host snapshots box d",
+                transfer_payload->cmd.transfer_3d.box.d, 8);
+    require_u64("3d transfer from host snapshots offset",
+                transfer_payload->cmd.transfer_3d.offset,
+                UINT64_C(0x987654321));
+    require_u32("3d transfer from host snapshots stride",
+                transfer_payload->cmd.transfer_3d.stride, 1024);
+    require_u32("3d transfer from host snapshots layer stride",
+                transfer_payload->cmd.transfer_3d.layer_stride, 2048);
+    require_u64("3d transfer from host carries resource generation",
+                transfer_payload->resource_generation, resource_generation);
+    require_u32("3d transfer from host desc head",
+                transfer_payload->ctrl_completion.desc_head, 92);
+    transfer->resource_id = 998;
+    transfer->box.x = 98;
+    require_u32("3d transfer from host payload is host-owned resource id",
+                transfer_payload->cmd.transfer_3d.resource_id, 66);
+    require_u32("3d transfer from host payload is host-owned box",
+                transfer_payload->cmd.transfer_3d.box.x, 7);
+    transfer_release_payload(transfer_payload);
+
+    transfer->resource_id = 777;
+    transfer->level = 1;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("missing 3d transfer response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("missing 3d transfer response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("missing 3d transfer queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    transfer->resource_id = 66;
+    transfer->level = UINT32_MAX;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("invalid-level 3d transfer response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("invalid-level 3d transfer response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("invalid-level 3d transfer queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    detach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    detach->resource_id = 66;
+    detach_desc[0].addr = 0x280;
+    detach_desc[0].len = sizeof(*detach);
+    detach_desc[1].addr = 0x300;
+    detach_desc[1].len = sizeof(*response);
+    detach_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("3d detach before transfer is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d detach before transfer queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    transfer->level = 1;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer during detach pending response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d transfer during detach pending response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("3d transfer during detach pending queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion detach_success = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_DETACH_BACKING,
+                .resource_id = 66,
+                .resource_generation = resource_generation,
+                .backing_transition_success = true,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &detach_success);
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer after detach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d transfer after detach response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("3d transfer after detach queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 66;
+    unref_desc[0].addr = 0x2c0;
+    unref_desc[0].len = sizeof(*unref);
+    unref_desc[1].addr = 0x300;
+    unref_desc[1].len = sizeof(*response);
+    unref_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    require_u32("3d unref before transfer is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d unref before transfer queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.transfer_from_host_3d(&vgpu, transfer_desc, &len);
+    require_u32("3d transfer during unref pending response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d transfer during unref pending response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("3d transfer during unref pending queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_resource_attach_rejects_malformed_backing_list(void)
 {
     uint32_t ram[512] = {0};
@@ -2349,6 +2667,7 @@ int main(void)
     test_virgl_resource_unref_sync_submit_failure_restores_namespace();
     test_virgl_resource_unref_stale_rollback_after_2d_reuse();
     test_virgl_resource_attach_backing_snapshots_iov_and_defers();
+    test_virgl_transfer_3d_requires_attached_resource_and_defers();
     test_virgl_resource_attach_rejects_malformed_backing_list();
     test_virgl_context_handlers_submit_ctrl_skeletons();
     test_virgl_submit_3d_snapshots_command_buffer_and_defers();

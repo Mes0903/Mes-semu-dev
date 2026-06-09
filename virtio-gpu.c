@@ -691,6 +691,32 @@ static void virtio_gpu_virgl_finish_detach_backing(uint32_t resource_id,
     pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
 }
 
+static int virtio_gpu_virgl_begin_transfer_3d(uint32_t resource_id,
+                                              uint64_t *generation)
+{
+    struct virtio_gpu_virgl_resource_state *res;
+    int ret = pthread_mutex_lock(&virtio_gpu_virgl_resources_lock);
+
+    if (ret != 0)
+        return -ret;
+
+    res = virtio_gpu_virgl_find_live_resource_locked(resource_id);
+    if (!res) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        return -ENOENT;
+    }
+    if (!res->backing_attached || res->backing_attach_pending ||
+        res->backing_detach_pending) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        return -EALREADY;
+    }
+
+    if (generation)
+        *generation = res->generation;
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+    return 0;
+}
+
 static void virtio_gpu_virgl_clear_resources(void)
 {
     if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
@@ -783,6 +809,10 @@ static void virtio_gpu_copy_renderer_ctrl_cmd(
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
         memcpy(&payload->cmd.resource_create_3d, request, request_size);
+        break;
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
+    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
+        memcpy(&payload->cmd.transfer_3d, request, request_size);
         break;
     case VIRTIO_GPU_CMD_SUBMIT_3D:
         memcpy(&payload->cmd.submit_3d, request, request_size);
@@ -1458,6 +1488,83 @@ void virtio_gpu_virgl_resource_detach_backing_handler(
     if (*plen != VIRTIO_GPU_RESPONSE_DEFERRED)
         virtio_gpu_virgl_finish_detach_backing(snapshot.resource_id,
                                                resource_generation, false);
+}
+
+static void virtio_gpu_virgl_transfer_host_3d_handler(
+    virtio_gpu_state_t *vgpu,
+    struct virtq_desc *vq_desc,
+    uint32_t *plen,
+    uint32_t command_type)
+{
+    const struct virtio_gpu_transfer_host_3d *request = virtio_gpu_get_request(
+        vgpu, vq_desc, sizeof(struct virtio_gpu_transfer_host_3d));
+    const struct virtq_desc *response_desc;
+    uint64_t resource_generation = 0;
+    int ret;
+
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_transfer_host_3d snapshot = *request;
+    response_desc = virtio_gpu_get_response_desc(
+        vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
+    if (!response_desc) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    if (snapshot.level > (uint32_t) INT_MAX) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    ret = virtio_gpu_virgl_begin_transfer_3d(snapshot.resource_id,
+                                             &resource_generation);
+    if (ret == -ENOENT) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret != 0) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    snapshot.hdr.type = command_type;
+    virtio_gpu_submit_renderer_ctrl(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_ctrl_hdr), command_type,
+        VIRTIO_GPU_RESP_OK_NODATA, resource_generation, plen);
+}
+
+void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen)
+{
+    virtio_gpu_virgl_transfer_host_3d_handler(
+        vgpu, vq_desc, plen, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D);
+}
+
+void virtio_gpu_virgl_transfer_from_host_3d_handler(virtio_gpu_state_t *vgpu,
+                                                    struct virtq_desc *vq_desc,
+                                                    uint32_t *plen)
+{
+    virtio_gpu_virgl_transfer_host_3d_handler(
+        vgpu, vq_desc, plen, VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D);
 }
 
 void virtio_gpu_virgl_submit_3d_handler(virtio_gpu_state_t *vgpu,

@@ -33,6 +33,15 @@ struct virgl_renderer_gl_ctx_param {
     int compat_ctx;
 };
 
+struct virgl_box {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+    uint32_t w;
+    uint32_t h;
+    uint32_t d;
+};
+
 struct virgl_renderer_callbacks {
     int version;
     void (*write_fence)(void *cookie, uint32_t fence);
@@ -78,5 +87,23 @@ void virgl_renderer_resource_detach_iov(int res_handle,
                                         struct iovec **iov,
                                         int *num_iovs);
 void virgl_renderer_resource_unref(uint32_t res_handle);
+int virgl_renderer_transfer_read_iov(uint32_t handle,
+                                     uint32_t ctx_id,
+                                     uint32_t level,
+                                     uint32_t stride,
+                                     uint32_t layer_stride,
+                                     struct virgl_box *box,
+                                     uint64_t offset,
+                                     struct iovec *iov,
+                                     int iovec_cnt);
+int virgl_renderer_transfer_write_iov(uint32_t handle,
+                                      uint32_t ctx_id,
+                                      int level,
+                                      uint32_t stride,
+                                      uint32_t layer_stride,
+                                      struct virgl_box *box,
+                                      uint64_t offset,
+                                      struct iovec *iov,
+                                      unsigned int iovec_cnt);
 int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw);
 void virgl_renderer_reset(void);

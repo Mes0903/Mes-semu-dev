@@ -61,6 +61,7 @@ struct vgpu_renderer_ctrl_payload {
         struct virtio_gpu_res_attach_backing resource_attach_backing;
         struct virtio_gpu_res_detach_backing resource_detach_backing;
         struct virtio_gpu_resource_create_3d resource_create_3d;
+        struct virtio_gpu_transfer_host_3d transfer_3d;
         struct virtio_gpu_cmd_submit submit_3d;
     } cmd;
     struct iovec *iov;
