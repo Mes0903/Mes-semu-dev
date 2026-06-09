@@ -220,46 +220,59 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                        uint16_t queue_index,
                                        uint64_t generation)
 {
-    bool lifecycle_locked = false;
-    bool lifecycle_accepting;
-    bool still_current;
-    int ret;
+    for (;;) {
+        bool lifecycle_locked = false;
+        bool lifecycle_accepting;
+        bool still_current;
+        int ret;
 
-    pthread_mutex_lock(&common->backend_lock);
-    ret = virtio_mmio_lock_notify_lifecycle_gate(common, &lifecycle_locked);
-    if (ret < 0) {
+        ret = virtio_mmio_lock_notify_lifecycle_gate(common,
+                                                     &lifecycle_locked);
+        if (ret < 0)
+            return ret;
+
+        pthread_mutex_lock(&common->transport_lock);
+        still_current = common->generation == generation &&
+                        queue_index < common->num_queues &&
+                        common->queues[queue_index].ready;
+        lifecycle_accepting = virtio_mmio_notify_lifecycle_accepting(
+            common, lifecycle_locked);
+        pthread_mutex_unlock(&common->transport_lock);
+
+        if (!still_current) {
+            virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
+            return -ECANCELED;
+        }
+
+        if (!lifecycle_accepting) {
+            virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
+            return 0;
+        }
+
+        ret = pthread_mutex_trylock(&common->backend_lock);
+        if (ret == EBUSY) {
+            virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
+            ret = pthread_mutex_lock(&common->backend_lock);
+            if (ret != 0)
+                return -ret;
+            pthread_mutex_unlock(&common->backend_lock);
+            continue;
+        }
+        if (ret != 0) {
+            virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
+            return -ret;
+        }
+
+        /* Hold lifecycle through the notify scheduling decision so stop-new-
+         * device-work cannot interleave. Common notify_queue callbacks must
+         * stay short/non-blocking; migrating legacy blocking devices remains
+         * a later actor work item.
+         */
+        ret = ops->notify_queue(opaque, queue_index, generation);
         pthread_mutex_unlock(&common->backend_lock);
+        virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
         return ret;
     }
-
-    pthread_mutex_lock(&common->transport_lock);
-    still_current = common->generation == generation &&
-                    queue_index < common->num_queues &&
-                    common->queues[queue_index].ready;
-    lifecycle_accepting = virtio_mmio_notify_lifecycle_accepting(
-        common, lifecycle_locked);
-    pthread_mutex_unlock(&common->transport_lock);
-
-    if (!still_current) {
-        virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
-        pthread_mutex_unlock(&common->backend_lock);
-        return -ECANCELED;
-    }
-
-    if (!lifecycle_accepting) {
-        virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
-        pthread_mutex_unlock(&common->backend_lock);
-        return 0;
-    }
-
-    /* The decision to enqueue backend work is serialized with lifecycle
-     * accepting state; release before running potentially blocking backend
-     * work.
-     */
-    virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
-    ret = ops->notify_queue(opaque, queue_index, generation);
-    pthread_mutex_unlock(&common->backend_lock);
-    return ret;
 }
 
 static int virtio_mmio_set_status_locked(
