@@ -371,6 +371,25 @@ static void test_runtime_enters_running_before_threaded_executor_start(void)
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
+static void test_window_loop_return_closes_device_work_before_join(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    require_int("lifecycle running",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    require_bool("window return starts accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), true);
+
+    semu_runtime_window_loop_returned(&emu);
+
+    require_int("window return lifecycle stopping",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPING);
+    require_bool("window return closes device work",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 int main(void)
 {
     test_default_selector_maps_hart_count_to_executor_mode();
@@ -383,5 +402,6 @@ int main(void)
     test_debug_unsupported_config_fails_lifecycle();
     test_debug_init_failure_fails_lifecycle();
     test_runtime_enters_running_before_threaded_executor_start();
+    test_window_loop_return_closes_device_work_before_join();
     return 0;
 }

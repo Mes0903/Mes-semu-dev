@@ -302,6 +302,11 @@ static void semu_runtime_enter_stopped(emu_state_t *emu)
         (void) semu_vm_lifecycle_enter_stopped(&emu->lifecycle);
 }
 
+static void UNUSED semu_runtime_window_loop_returned(emu_state_t *emu)
+{
+    semu_runtime_enter_stopping(emu);
+}
+
 static void semu_runtime_enter_failed(emu_state_t *emu)
 {
     enum semu_vm_lifecycle_state state;
@@ -3291,11 +3296,11 @@ int main(int argc, char **argv)
 
         /* Main thread runs window event loop. Returns either because the user
          * closed the window ('SDL_QUIT') or because the emulator called
-         * 'window_shutdown()'. 'emu_tick_peripherals()' picks up the window
-         * backend's closed state and sets 'emu->stopped', so no direct write to
-         * 'emu.stopped' is needed here.
+         * 'window_shutdown()'. Publish STOPPING before joining the emulator
+         * thread so new device work is rejected during shutdown wait/teardown.
          */
         g_window.window_main_loop();
+        semu_runtime_window_loop_returned(&emu);
 
         /* Wait for emulator thread to finish. */
         pthread_join(emu_thread, NULL);
