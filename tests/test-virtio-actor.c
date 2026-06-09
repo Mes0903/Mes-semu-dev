@@ -585,6 +585,10 @@ static void test_fail_marks_failed_and_wakes_waiters(void)
     require_state("failed state", virtio_actor_get_state(&actor),
                   VIRTIO_ACTOR_FAILED);
     require_true("failed flag", actor.failed);
+    require_int("notify after failed", virtio_actor_notify_queue(&actor, 0),
+                -EIO);
+    require_u32("failed notify leaves no pending",
+                virtio_actor_pending_mask(&actor), 0);
     require_int("wait until failed",
                 virtio_actor_wait_until(&actor, VIRTIO_ACTOR_FAILED), 0);
 
