@@ -36,6 +36,36 @@ static uint32_t debug_last_context_ctx_id;
 static uint32_t debug_last_context_ring_idx;
 static uint64_t debug_last_context_fence;
 
+struct vgpu_virgl_renderer_resource {
+    uint32_t resource_id;
+    struct vgpu_virgl_renderer_resource *next;
+};
+
+static struct vgpu_virgl_renderer_resource *vgpu_virgl_renderer_resources;
+
+static void vgpu_virgl_clear_renderer_resources(void)
+{
+    while (vgpu_virgl_renderer_resources) {
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_renderer_resources;
+        vgpu_virgl_renderer_resources = res->next;
+        free(res);
+    }
+}
+
+static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id)
+{
+    struct vgpu_virgl_renderer_resource *res = calloc(1, sizeof(*res));
+
+    if (!res)
+        return false;
+
+    res->resource_id = resource_id;
+    res->next = vgpu_virgl_renderer_resources;
+    vgpu_virgl_renderer_resources = res;
+    return true;
+}
+
 static bool vgpu_virgl_fence_stream_matches(
     const struct vgpu_virgl_pending_fence *pending,
     bool context_fence,
@@ -314,6 +344,7 @@ void vgpu_virgl_reset_renderer(void)
     pthread_mutex_unlock(&vgpu_virgl_lock);
 
     virgl_renderer_reset();
+    vgpu_virgl_clear_renderer_resources();
 }
 
 static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
@@ -340,6 +371,30 @@ static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
     return 0;
 }
 
+static void vgpu_virgl_set_ctrl_side_effect(
+    struct vgpu_renderer_completion *completion,
+    const struct vgpu_renderer_ctrl_payload *payload,
+    uint32_t response_type)
+{
+    if (!completion || !payload)
+        return;
+
+    switch (payload->hdr.type) {
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
+        if (response_type != VIRTIO_GPU_RESP_OK_NODATA) {
+            completion->virgl_resource.type =
+                VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK;
+            completion->virgl_resource.resource_id =
+                payload->cmd.resource_create_3d.resource_id;
+            completion->virgl_resource.resource_generation =
+                payload->resource_generation;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void vgpu_virgl_complete_ctrl_request(
     const struct vgpu_renderer_request *request,
     const struct vgpu_renderer_ctrl_payload *payload,
@@ -361,6 +416,7 @@ static void vgpu_virgl_complete_ctrl_request(
         .response_desc = payload->response_desc,
     };
 
+    vgpu_virgl_set_ctrl_side_effect(&completion, payload, response_type);
     (void) vgpu_renderer_complete(&completion);
 }
 
@@ -449,6 +505,36 @@ static void vgpu_virgl_execute_ctrl_request(
         virgl_renderer_context_destroy(payload->cmd.ctx_destroy.hdr.ctx_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
+        const struct virtio_gpu_resource_create_3d *cmd =
+            &payload->cmd.resource_create_3d;
+        struct virgl_renderer_resource_create_args args = {
+            .handle = cmd->resource_id,
+            .target = cmd->target,
+            .format = cmd->format,
+            .bind = cmd->bind,
+            .width = cmd->width,
+            .height = cmd->height,
+            .depth = cmd->depth,
+            .array_size = cmd->array_size,
+            .last_level = cmd->last_level,
+            .nr_samples = cmd->nr_samples,
+            .flags = cmd->flags,
+        };
+        int ret = virgl_renderer_resource_create(&args, NULL, 0);
+
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id)) {
+            virgl_renderer_resource_unref(cmd->resource_id);
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            break;
+        }
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
     default:
         response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
         break;

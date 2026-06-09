@@ -468,6 +468,249 @@ static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_virgl_resource_create_3d_handler_tracks_pending_resource(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc desc_2d[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *request =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_create_2d *request_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x180);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response_2d =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x1e0);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x73;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    vgpu.common.generation = renderer_generation;
+    vgpu.actor_drain_generation = virtio_actor_generation(&vgpu.actor);
+    vgpu.ctrl_dispatch = (struct virtio_gpu_ctrl_dispatch_context) {
+        .active = true,
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = 10,
+        .actor_generation = vgpu.actor_drain_generation,
+        .common_generation = vgpu.common.generation,
+        .trigger_irq = true,
+    };
+    vgpu_renderer_reset_queues(renderer_generation);
+
+    request->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    request->resource_id = 55;
+    request->target = 2;
+    request->format = 3;
+    request->bind = 4;
+    request->width = 640;
+    request->height = 480;
+    request->depth = 1;
+    request->array_size = 1;
+    request->last_level = 0;
+    request->nr_samples = 1;
+    request->flags = 0x5a;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*request);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    request->resource_id = 99;
+    request->width = 1;
+    request->height = 1;
+
+    require_u32("resource create is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("resource create queued", vgpu_renderer_pop_request(&queued),
+                true);
+    require_u32("resource create command type", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_CREATE_3D);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t first_generation = payload->resource_generation;
+    require_u32("snapshot resource id",
+                payload->cmd.resource_create_3d.resource_id, 55);
+    require_u32("snapshot width", payload->cmd.resource_create_3d.width, 640);
+    require_u32("snapshot height", payload->cmd.resource_create_3d.height, 480);
+    require_false("resource generation assigned", first_generation == 0);
+
+    len = 0;
+    request->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    request->resource_id = 55;
+    request->width = 320;
+    request->height = 240;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("duplicate resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("duplicate resource response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    struct vgpu_renderer_request empty = {0};
+    require_int("duplicate resource queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    request_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    request_2d->resource_id = 55;
+    request_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    request_2d->width = 8;
+    request_2d->height = 8;
+    desc_2d[0].addr = 0x180;
+    desc_2d[0].len = sizeof(*request_2d);
+    desc_2d[1].addr = 0x1e0;
+    desc_2d[1].len = sizeof(*response_2d);
+    desc_2d[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, desc_2d, &len);
+    require_u32("2d duplicate of pending 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d duplicate of pending 3d response", response_2d->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+
+    struct vgpu_renderer_completion stale_rollback = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 55,
+                .resource_generation = first_generation + 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_rollback);
+
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("stale rollback keeps resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("stale rollback keeps resource response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("stale rollback queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion rollback = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 55,
+                .resource_generation = first_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &rollback);
+    queued.release_payload(payload);
+
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("resource recreate after rollback is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("resource recreate queued", vgpu_renderer_pop_request(&queued),
+                true);
+    struct vgpu_renderer_ctrl_payload *payload2 = queued.payload;
+    uint64_t second_generation = payload2->resource_generation;
+    require_false("resource generation advances",
+                  second_generation == first_generation);
+
+    stale_rollback.virgl_resource.resource_generation = first_generation;
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_rollback);
+
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("old rollback keeps newer resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("old rollback keeps newer resource response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("old rollback queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    rollback.virgl_resource.resource_generation = second_generation;
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &rollback);
+    queued.release_payload(payload2);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_resource_create_3d_rejects_live_2d_resource_id(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_res_create_2d *request_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_resource_create_3d *request_3d =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x74;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+
+    request_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    request_2d->resource_id = 77;
+    request_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    request_2d->width = 16;
+    request_2d->height = 16;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*request_2d);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, desc, &len);
+    require_u32("2d resource create response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d resource create response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    vgpu.common.generation = renderer_generation;
+    vgpu.actor_drain_generation = virtio_actor_generation(&vgpu.actor);
+    vgpu.ctrl_dispatch = (struct virtio_gpu_ctrl_dispatch_context) {
+        .active = true,
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = 11,
+        .actor_generation = vgpu.actor_drain_generation,
+        .common_generation = vgpu.common.generation,
+        .trigger_irq = true,
+    };
+    vgpu_renderer_reset_queues(renderer_generation);
+
+    memset(request_3d, 0, sizeof(*request_3d));
+    request_3d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    request_3d->resource_id = 77;
+    request_3d->target = 2;
+    request_3d->format = 3;
+    request_3d->bind = 4;
+    request_3d->width = 16;
+    request_3d->height = 16;
+    request_3d->depth = 1;
+    request_3d->array_size = 1;
+    request_3d->nr_samples = 1;
+    response->type = 0;
+    len = 0;
+    desc[0].len = sizeof(*request_3d);
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("3d duplicate of live 2d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d duplicate of live 2d response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d duplicate queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
 {
     uint32_t ram[512] = {0};
@@ -1026,6 +1269,8 @@ int main(void)
 #if SEMU_HAS(VIRGL)
     test_hidden_virgl_command_returns_undefined_without_renderer_work();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
+    test_virgl_resource_create_3d_handler_tracks_pending_resource();
+    test_virgl_resource_create_3d_rejects_live_2d_resource_id();
     test_virgl_context_handlers_submit_ctrl_skeletons();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_completion_drops_stale_common_generation();

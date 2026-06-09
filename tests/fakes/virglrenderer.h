@@ -9,6 +9,22 @@
 
 typedef void *virgl_renderer_gl_context;
 
+struct iovec;
+
+struct virgl_renderer_resource_create_args {
+    uint32_t handle;
+    uint32_t target;
+    uint32_t format;
+    uint32_t bind;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+};
+
 struct virgl_renderer_gl_ctx_param {
     int version;
     bool shared;
@@ -51,4 +67,9 @@ int virgl_renderer_context_create(uint32_t handle,
                                   uint32_t nlen,
                                   const char *name);
 void virgl_renderer_context_destroy(uint32_t handle);
+int virgl_renderer_resource_create(
+    struct virgl_renderer_resource_create_args *args,
+    struct iovec *iov,
+    uint32_t num_iovs);
+void virgl_renderer_resource_unref(uint32_t res_handle);
 void virgl_renderer_reset(void);

@@ -440,6 +440,8 @@ static inline uint64_t virtio_gpu_debug_counter_load(
 }
 
 void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu);
+bool virtio_gpu_sw_resource_2d_exists(virtio_gpu_state_t *vgpu,
+                                      uint32_t resource_id);
 bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu);
 bool virtio_gpu_begin_actor_completion(virtio_gpu_state_t *vgpu);
 int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu);
@@ -463,6 +465,13 @@ void virtio_gpu_virgl_ctx_create_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
                                           struct virtq_desc *vq_desc,
                                           uint32_t *plen);
+void virtio_gpu_virgl_resource_create_3d_handler(virtio_gpu_state_t *vgpu,
+                                                 struct virtq_desc *vq_desc,
+                                                 uint32_t *plen);
+bool virtio_gpu_virgl_resource_id_exists(uint32_t resource_id);
+void virtio_gpu_virgl_apply_renderer_side_effect(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion);
 #endif
 void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
                                       struct virtq_desc *vq_desc,

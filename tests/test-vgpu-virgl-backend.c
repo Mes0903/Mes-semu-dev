@@ -42,6 +42,14 @@ static uint32_t fake_last_context_create_nlen;
 static char fake_last_context_create_name[64];
 static int fake_context_destroy_count;
 static uint32_t fake_last_context_destroy_handle;
+static int fake_resource_create_count;
+static struct virgl_renderer_resource_create_args
+    fake_last_resource_create_args;
+static struct iovec *fake_last_resource_create_iov;
+static uint32_t fake_last_resource_create_num_iovs;
+static int fake_resource_create_result;
+static int fake_resource_unref_count;
+static uint32_t fake_last_resource_unref_handle;
 static int wake_renderer_count;
 static int wake_frontend_count;
 static int fake_cookie_marker;
@@ -143,6 +151,25 @@ void virgl_renderer_context_destroy(uint32_t handle)
     fake_last_context_destroy_handle = handle;
 }
 
+int virgl_renderer_resource_create(
+    struct virgl_renderer_resource_create_args *args,
+    struct iovec *iov,
+    uint32_t num_iovs)
+{
+    fake_resource_create_count++;
+    if (args)
+        fake_last_resource_create_args = *args;
+    fake_last_resource_create_iov = iov;
+    fake_last_resource_create_num_iovs = num_iovs;
+    return fake_resource_create_result;
+}
+
+void virgl_renderer_resource_unref(uint32_t res_handle)
+{
+    fake_resource_unref_count++;
+    fake_last_resource_unref_handle = res_handle;
+}
+
 void virgl_renderer_reset(void)
 {
     fake_reset_count++;
@@ -212,6 +239,14 @@ static void reset_test_state(uint64_t generation)
            sizeof(fake_last_context_create_name));
     fake_context_destroy_count = 0;
     fake_last_context_destroy_handle = 0;
+    fake_resource_create_count = 0;
+    fake_last_resource_create_args =
+        (struct virgl_renderer_resource_create_args) {0};
+    fake_last_resource_create_iov = NULL;
+    fake_last_resource_create_num_iovs = 0;
+    fake_resource_create_result = 0;
+    fake_resource_unref_count = 0;
+    fake_last_resource_unref_handle = 0;
     wake_renderer_count = 0;
     wake_frontend_count = 0;
     fake_window_create_count = 0;
@@ -635,6 +670,124 @@ static void test_ctrl_request_executes_context_create_destroy(void)
     CHECK(fake_last_context_destroy_handle == 77);
 }
 
+static void test_ctrl_request_executes_resource_create_3d_completion(void)
+{
+    reset_test_state(34);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+        .cmd.resource_create_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+                .resource_id = 88,
+                .target = 2,
+                .format = 3,
+                .bind = 4,
+                .width = 640,
+                .height = 480,
+                .depth = 1,
+                .array_size = 1,
+                .last_level = 0,
+                .nr_samples = 1,
+                .flags = 0x5a,
+            },
+        .resource_generation = 0x1234,
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 15,
+                .actor_generation = 25,
+                .common_generation = 34,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0xc0,
+                .len = sizeof(struct virtio_gpu_ctrl_hdr),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 34},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE);
+    CHECK(fake_resource_create_count == 1);
+    CHECK(fake_last_resource_create_args.handle == 88);
+    CHECK(fake_last_resource_create_args.target == 2);
+    CHECK(fake_last_resource_create_args.format == 3);
+    CHECK(fake_last_resource_create_args.bind == 4);
+    CHECK(fake_last_resource_create_args.width == 640);
+    CHECK(fake_last_resource_create_args.height == 480);
+    CHECK(fake_last_resource_create_args.flags == 0x5a);
+    CHECK(fake_last_resource_create_iov == NULL);
+    CHECK(fake_last_resource_create_num_iovs == 0);
+}
+
+static void test_ctrl_request_resource_create_3d_failure_rolls_back_frontend(
+    void)
+{
+    reset_test_state(35);
+    fake_resource_create_result = -1;
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+        .cmd.resource_create_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+                .resource_id = 89,
+            },
+        .resource_generation = 0x5678,
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 16,
+                .actor_generation = 26,
+                .common_generation = 35,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0xd0,
+                .len = sizeof(struct virtio_gpu_ctrl_hdr),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 35},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK);
+    CHECK(completion.virgl_resource.resource_id == 89);
+    CHECK(completion.virgl_resource.resource_generation == 0x5678);
+    CHECK(fake_resource_create_count == 1);
+    CHECK(fake_resource_unref_count == 0);
+}
+
 static void test_callback_completes_newest_matching_fence_and_clears_older(void)
 {
     reset_test_state(19);
@@ -705,6 +858,8 @@ int main(void)
     test_ctrl_request_executes_get_capset_info_completion();
     test_ctrl_request_executes_get_capset_completion();
     test_ctrl_request_executes_context_create_destroy();
+    test_ctrl_request_executes_resource_create_3d_completion();
+    test_ctrl_request_resource_create_3d_failure_rolls_back_frontend();
     test_callback_completes_newest_matching_fence_and_clears_older();
     test_reset_drops_pending_fences_and_ignores_stale_callbacks();
     return 0;

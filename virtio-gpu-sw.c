@@ -223,6 +223,12 @@ static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(
     return NULL;
 }
 
+bool virtio_gpu_sw_resource_2d_exists(virtio_gpu_state_t *vgpu,
+                                      uint32_t resource_id)
+{
+    return vgpu && vgpu_sw_get_resource_2d(vgpu, resource_id) != NULL;
+}
+
 static struct virtio_gpu_scanout_info *vgpu_sw_get_scanout(
     virtio_gpu_state_t *vgpu,
     uint32_t scanout_id)
@@ -766,7 +772,11 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
      * confuse later 'TRANSFER' / 'FLUSH' / 'UNREF' requests that target the
      * same id. Spec explicitly allows the device to fail this.
      */
-    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)) {
+    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)
+#if SEMU_HAS(VIRGL)
+        || virtio_gpu_virgl_resource_id_exists(request->resource_id)
+#endif
+    ) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX "%s(): resource id %u already in use\n",
                 __func__, request->resource_id);
@@ -1820,7 +1830,12 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
 #endif
     .ctx_attach_resource = VIRTIO_GPU_CMD_UNDEF,
     .ctx_detach_resource = VIRTIO_GPU_CMD_UNDEF,
+#if SEMU_HAS(VIRGL)
+    .resource_create_3d = virtio_gpu_virgl_resource_create_3d_handler,
+    .apply_renderer_side_effect = virtio_gpu_virgl_apply_renderer_side_effect,
+#else
     .resource_create_3d = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .transfer_to_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .transfer_from_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .submit_3d = VIRTIO_GPU_CMD_UNDEF,
