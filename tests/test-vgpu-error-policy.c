@@ -150,7 +150,6 @@ static void renderer_release_response(void *response)
     free(response);
 }
 
-
 #endif
 
 static void require_false(const char *name, bool got)
@@ -161,7 +160,6 @@ static void require_false(const char *name, bool got)
     fprintf(stderr, "%s: got true, want false\n", name);
     exit(1);
 }
-
 
 static void require_u64(const char *name, uint64_t got, uint64_t want)
 {
@@ -284,7 +282,92 @@ static void configure_test_queue(emu_state_t *emu,
         0);
 }
 
+static void test_vgpu_resource_unref_releases_2d_resource_synchronously(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_res_create_2d *create =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0xc0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    uint32_t len = 0;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create->resource_id = 41;
+    create->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create->width = 8;
+    create->height = 8;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, desc, &len);
+    require_u32("2d create response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d create response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    memset(response, 0, sizeof(*response));
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 41;
+    desc[0].addr = 0xc0;
+    desc[0].len = sizeof(*unref);
+    len = 0;
+
+    g_virtio_gpu_backend.resource_unref(&vgpu, desc, &len);
+    require_u32("2d unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d unref response", response->type, VIRTIO_GPU_RESP_OK_NODATA);
+
 #if SEMU_HAS(VIRGL)
+    struct vgpu_renderer_request queued = {0};
+    require_int("2d unref queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+#endif
+
+    memset(response, 0, sizeof(*response));
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create);
+    len = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, desc, &len);
+    require_u32("2d recreate after unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d recreate after unref response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+#if SEMU_HAS(VIRGL)
+
+static void activate_test_renderer_dispatch(virtio_gpu_state_t *vgpu,
+                                            uint64_t renderer_generation,
+                                            uint32_t desc_head)
+{
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu->actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu->actor), 0);
+    vgpu->common.generation = renderer_generation;
+    vgpu->actor_drain_generation = virtio_actor_generation(&vgpu->actor);
+    vgpu->ctrl_dispatch = (struct virtio_gpu_ctrl_dispatch_context) {
+        .active = true,
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = desc_head,
+        .actor_generation = vgpu->actor_drain_generation,
+        .common_generation = vgpu->common.generation,
+        .trigger_irq = true,
+    };
+    vgpu_renderer_reset_queues(renderer_generation);
+}
+
 static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
 {
     uint32_t ram[512] = {0};
@@ -711,6 +794,408 @@ static void test_virgl_resource_create_3d_rejects_live_2d_resource_id(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_virgl_resource_unref_handler_defers_and_frees_namespace(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc unref_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *create_response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *unref_response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x1a0);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x75;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 20);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 61;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 64;
+    create->height = 64;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x100;
+    create_desc[1].len = sizeof(*create_response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before unref is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create request queued", vgpu_renderer_pop_request(&queued),
+                true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    uint64_t first_generation = create_payload->resource_generation;
+    require_false("3d create generation assigned", first_generation == 0);
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 21;
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    unref->hdr.fence_id = UINT64_C(0xabcdef);
+    unref->resource_id = 61;
+    unref_desc[0].addr = 0x140;
+    unref_desc[0].len = sizeof(*unref);
+    unref_desc[1].addr = 0x1a0;
+    unref_desc[1].len = sizeof(*unref_response);
+    unref_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    unref->resource_id = 999;
+    unref->hdr.fence_id = UINT64_C(0x123456);
+
+    require_u32("3d unref is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d unref request queued", vgpu_renderer_pop_request(&queued),
+                true);
+    require_u32("3d unref command type", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_UNREF);
+    struct vgpu_renderer_ctrl_payload *unref_payload = queued.payload;
+    require_u32("3d unref snapshots resource id",
+                unref_payload->cmd.resource_unref.resource_id, 61);
+    require_u64("3d unref carries original generation",
+                unref_payload->resource_generation, first_generation);
+    require_u64("3d unref snapshots fence", unref_payload->hdr.fence_id,
+                UINT64_C(0xabcdef));
+    require_u32("3d unref response desc addr",
+                unref_payload->response_desc.addr, 0x1a0);
+    queued.release_payload(queued.payload);
+
+    unref->resource_id = 61;
+    unref->hdr.fence_id = UINT64_C(0x555555);
+    unref_response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    require_u32("duplicate pending 3d unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("duplicate pending 3d unref response", unref_response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_u32("duplicate pending 3d unref response flags",
+                unref_response->flags, VIRTIO_GPU_FLAG_FENCE);
+    require_u64("duplicate pending 3d unref response fence",
+                unref_response->fence_id, UINT64_C(0x555555));
+    struct vgpu_renderer_request empty = {0};
+    require_int("duplicate pending 3d unref queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    vgpu.ctrl_dispatch.desc_head = 22;
+    create->resource_id = 61;
+    create->width = 32;
+    create->height = 32;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d recreate after deferred unref is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d recreate request queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *recreate_payload = queued.payload;
+    uint64_t second_generation = recreate_payload->resource_generation;
+    require_false("3d recreate generation advances",
+                  second_generation == first_generation);
+
+    struct vgpu_renderer_completion stale_rollback = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF_ROLLBACK,
+                .resource_id = 61,
+                .resource_generation = first_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_rollback);
+
+    len = 0;
+    create_response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("stale unref rollback keeps newer resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("stale unref rollback keeps newer resource response",
+                create_response->type, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("stale unref rollback queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion stale_commit = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF,
+                .resource_id = 61,
+                .resource_generation = first_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_commit);
+
+    len = 0;
+    create_response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("stale unref commit keeps newer resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("stale unref commit keeps newer resource response",
+                create_response->type, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("stale unref commit queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 61,
+                .resource_generation = second_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
+    queued.release_payload(recreate_payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_resource_unref_sync_submit_failure_restores_namespace(
+    void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc unref_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+    uint64_t resource_generation;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 30);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 62;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 64;
+    create->height = 64;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x100;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before sync-fail unref is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before sync-fail queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    resource_generation = create_payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    for (uint32_t i = 0; i < VGPU_RENDERER_QUEUE_CAPACITY; i++) {
+        struct vgpu_renderer_request filler = {
+            .type = VGPU_RENDERER_REQ_POLL,
+            .token = {.generation = renderer_generation},
+        };
+        require_int("fill renderer queue", vgpu_renderer_submit(&filler), true);
+    }
+
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 62;
+    unref_desc[0].addr = 0x140;
+    unref_desc[0].len = sizeof(*unref);
+    unref_desc[1].addr = 0x100;
+    unref_desc[1].len = sizeof(*response);
+    unref_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    require_u32("3d unref submit failure response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d unref submit failure response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+
+    vgpu_renderer_reset_queues(renderer_generation);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("sync-failed unref preserves resource response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("sync-failed unref preserves resource", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 62,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_resource_unref_stale_rollback_after_2d_reuse(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create_3d =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_create_2d *create_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x1c0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x77;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 40);
+
+    create_3d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create_3d->resource_id = 63;
+    create_3d->target = 2;
+    create_3d->format = 3;
+    create_3d->bind = 4;
+    create_3d->width = 64;
+    create_3d->height = 64;
+    create_3d->depth = 1;
+    create_3d->array_size = 1;
+    create_3d->nr_samples = 1;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create_3d);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("3d create before 2d reuse is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before 2d reuse queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t resource_generation = payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 41;
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 63;
+    desc[0].addr = 0x1c0;
+    desc[0].len = sizeof(*unref);
+    len = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, desc, &len);
+    require_u32("3d unref before 2d reuse is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d unref before 2d reuse queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    create_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create_2d->resource_id = 63;
+    create_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create_2d->width = 8;
+    create_2d->height = 8;
+    desc[0].addr = 0x140;
+    desc[0].len = sizeof(*create_2d);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, desc, &len);
+    require_u32("2d reuse after deferred 3d unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d reuse after deferred 3d unref response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    struct vgpu_renderer_completion stale_commit = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF,
+                .resource_id = 63,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_commit);
+
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create_3d);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("stale unref commit keeps 2d reuse response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("stale unref commit keeps 2d reuse response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    struct vgpu_renderer_request empty = {0};
+    require_int("stale unref commit after 2d reuse queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion stale_rollback = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF_ROLLBACK,
+                .resource_id = 63,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_rollback);
+
+    desc[0].addr = 0x1c0;
+    desc[0].len = sizeof(*unref);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, desc, &len);
+    require_u32("2d unref after stale 3d side effects response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d unref after stale 3d side effects response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    vgpu.ctrl_dispatch.desc_head = 42;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create_3d);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, desc, &len);
+    require_u32("3d create after 2d reuse cleanup is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d create after 2d reuse cleanup queued",
+                vgpu_renderer_pop_request(&queued), true);
+    payload = queued.payload;
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 63,
+                .resource_generation = payload->resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
+    queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
 {
     uint32_t ram[512] = {0};
@@ -894,7 +1379,6 @@ static void test_undefined_command_returns_device_error(void)
         "device not reset-needed",
         atomic_load(&vgpu.common.status) & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
 }
-
 
 static void test_vgpu_actor_failure_marks_device_reset_needed(void)
 {
@@ -1261,6 +1745,7 @@ int main(void)
     test_vgpu_debug_counters_init_and_reset_to_zero();
     test_vgpu_display_counters_snapshot_reads_existing_counters();
     test_undefined_command_returns_device_error();
+    test_vgpu_resource_unref_releases_2d_resource_synchronously();
     test_vgpu_actor_failure_marks_device_reset_needed();
     test_vgpu_failed_actor_notify_counts_eio();
     test_vgpu_invalid_actor_notify_counts_einval();
@@ -1271,6 +1756,9 @@ int main(void)
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
     test_virgl_resource_create_3d_rejects_live_2d_resource_id();
+    test_virgl_resource_unref_handler_defers_and_frees_namespace();
+    test_virgl_resource_unref_sync_submit_failure_restores_namespace();
+    test_virgl_resource_unref_stale_rollback_after_2d_reuse();
     test_virgl_context_handlers_submit_ctrl_skeletons();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_completion_drops_stale_common_generation();

@@ -66,6 +66,25 @@ static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id)
     return true;
 }
 
+static bool vgpu_virgl_remove_renderer_resource(uint32_t resource_id)
+{
+    struct vgpu_virgl_renderer_resource **cursor =
+        &vgpu_virgl_renderer_resources;
+
+    while (*cursor) {
+        struct vgpu_virgl_renderer_resource *res = *cursor;
+
+        if (res->resource_id == resource_id) {
+            *cursor = res->next;
+            free(res);
+            return true;
+        }
+        cursor = &res->next;
+    }
+
+    return false;
+}
+
 static bool vgpu_virgl_fence_stream_matches(
     const struct vgpu_virgl_pending_fence *pending,
     bool context_fence,
@@ -390,6 +409,16 @@ static void vgpu_virgl_set_ctrl_side_effect(
                 payload->resource_generation;
         }
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+        completion->virgl_resource.type =
+            response_type == VIRTIO_GPU_RESP_OK_NODATA
+                ? VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF
+                : VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF_ROLLBACK;
+        completion->virgl_resource.resource_id =
+            payload->cmd.resource_unref.resource_id;
+        completion->virgl_resource.resource_generation =
+            payload->resource_generation;
+        break;
     default:
         break;
     }
@@ -532,6 +561,18 @@ static void vgpu_virgl_execute_ctrl_request(
             response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
             break;
         }
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
+        const struct virtio_gpu_res_unref *cmd = &payload->cmd.resource_unref;
+
+        if (!vgpu_virgl_remove_renderer_resource(cmd->resource_id)) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+
+        virgl_renderer_resource_unref(cmd->resource_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }

@@ -56,6 +56,7 @@ struct vgpu_renderer_ctrl_payload {
         struct virtio_gpu_get_capset get_capset;
         struct virtio_gpu_ctx_create ctx_create;
         struct virtio_gpu_ctx_destroy ctx_destroy;
+        struct virtio_gpu_res_unref resource_unref;
         struct virtio_gpu_resource_create_3d resource_create_3d;
     } cmd;
     uint64_t resource_generation;

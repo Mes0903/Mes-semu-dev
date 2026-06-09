@@ -903,6 +903,9 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     res_2d->image_size = image_size;
     SW(vgpu)->hostmem += image_size;
     list_push(&res_2d->list, &SW(vgpu)->res_2d_list);
+#if SEMU_HAS(VIRGL)
+    virtio_gpu_virgl_discard_resource_unref(request->resource_id);
+#endif
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -929,6 +932,13 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
+
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+        virtio_gpu_virgl_resource_unref_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
 
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, request->resource_id);
