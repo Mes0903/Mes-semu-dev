@@ -635,6 +635,33 @@ static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
     require_int("hidden command queues no renderer work",
                 vgpu_renderer_pop_request(&queued), false);
 
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
+    memset(blob, 0, sizeof(*blob));
+    memset(response, 0, sizeof(*response));
+    desc0.len = sizeof(*blob);
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = 77;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->size = 4096;
+    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
+    store_u16(ram, 0x202, 2);
+
+    require_int(
+        "notify hidden blob create",
+        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
+                                      vgpu.common.generation),
+        0);
+    wait_for_used_idx(ram, 0x302, 2);
+
+    require_u32("hidden blob response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_u32("hidden blob used id", load_u32(ram, 0x30c), 0);
+    require_u32("hidden blob used len", load_u32(ram, 0x310),
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_int("hidden blob queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
@@ -801,6 +828,206 @@ static void test_virgl_resource_create_3d_handler_tracks_pending_resource(void)
     rollback.virgl_resource.resource_generation = second_generation;
     g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &rollback);
     queued.release_payload(payload2);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+
+static void test_virgl_resource_create_blob_handler_tracks_pending_resource(
+    void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc blob_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc create_2d_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_mem_entry *entries =
+        (struct virtio_gpu_mem_entry *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_res_create_2d *create_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x180);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x240);
+    struct virtio_gpu_ctrl_hdr *response_2d =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x280);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x74;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 35);
+
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->hdr.ctx_id = 9;
+    blob->resource_id = 58;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST;
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->nr_entries = 2;
+    blob->blob_id = UINT64_C(0x1122334455667788);
+    blob->size = 48;
+    entries[0].addr = 0x300;
+    entries[0].length = 16;
+    entries[1].addr = 0x340;
+    entries[1].length = 32;
+    blob_desc[0].addr = 0x40;
+    blob_desc[0].len = sizeof(*blob);
+    blob_desc[1].addr = 0x100;
+    blob_desc[1].len = 2 * sizeof(*entries);
+    blob_desc[2].addr = 0x240;
+    blob_desc[2].len = sizeof(*response);
+    blob_desc[2].flags = VIRTIO_DESC_F_WRITE;
+
+    struct vgpu_renderer_request empty = {0};
+
+    blob->blob_mem = 0;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob invalid mem response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("blob invalid mem response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("blob invalid mem queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST;
+    blob->blob_flags = UINT32_C(0x80000000);
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob invalid flags response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("blob invalid flags response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("blob invalid flags queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->nr_entries = UINT32_MAX;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob too many entries response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("blob too many entries response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("blob too many entries queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    blob->nr_entries = 2;
+    blob_desc[1].len = sizeof(*entries);
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob short backing list response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("blob short backing list response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("blob short backing list queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    blob_desc[1].len = 2 * sizeof(*entries);
+    entries[1].addr = UINT64_C(0x100000000);
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob invalid backing address response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("blob invalid backing address response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("blob invalid backing address queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    entries[1].addr = 0x340;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("blob create is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("blob create queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("blob create command type", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t first_generation = payload->resource_generation;
+    require_false("blob resource generation assigned", first_generation == 0);
+    require_u32("blob snapshot resource id",
+                payload->cmd.resource_create_blob.resource_id, 58);
+    require_u32("blob snapshot ctx id",
+                payload->cmd.resource_create_blob.hdr.ctx_id, 9);
+    require_u32("blob snapshot mem", payload->cmd.resource_create_blob.blob_mem,
+                VIRTIO_GPU_BLOB_MEM_GUEST);
+    require_u32("blob snapshot flags",
+                payload->cmd.resource_create_blob.blob_flags,
+                VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
+    require_u32("blob snapshot nr entries",
+                payload->cmd.resource_create_blob.nr_entries, 2);
+    require_u64("blob snapshot id", payload->cmd.resource_create_blob.blob_id,
+                UINT64_C(0x1122334455667788));
+    require_u64("blob snapshot size", payload->cmd.resource_create_blob.size,
+                48);
+    require_u32("blob iov count", payload->iov_count, 2);
+    require_ptr("blob iov0 base", payload->iov[0].iov_base,
+                (uint8_t *) ram + 0x300);
+    require_u64("blob iov0 len", payload->iov[0].iov_len, 16);
+    require_ptr("blob iov1 base", payload->iov[1].iov_base,
+                (uint8_t *) ram + 0x340);
+    require_u64("blob iov1 len", payload->iov[1].iov_len, 32);
+
+    blob->resource_id = 999;
+    blob->hdr.ctx_id = 99;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->nr_entries = 0;
+    entries[0].addr = 0x380;
+    require_u32("blob payload is host-owned resource id",
+                payload->cmd.resource_create_blob.resource_id, 58);
+    require_u32("blob payload is host-owned ctx id",
+                payload->cmd.resource_create_blob.hdr.ctx_id, 9);
+    require_u32("blob payload is host-owned mem",
+                payload->cmd.resource_create_blob.blob_mem,
+                VIRTIO_GPU_BLOB_MEM_GUEST);
+    queued.release_payload(queued.payload);
+
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = 58;
+    blob->hdr.ctx_id = 9;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST;
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->nr_entries = 2;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_blob(&vgpu, blob_desc, &len);
+    require_u32("duplicate pending blob response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("duplicate pending blob response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    require_int("duplicate pending blob queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    create_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create_2d->resource_id = 58;
+    create_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create_2d->width = 8;
+    create_2d->height = 8;
+    create_2d_desc[0].addr = 0x180;
+    create_2d_desc[0].len = sizeof(*create_2d);
+    create_2d_desc[1].addr = 0x280;
+    create_2d_desc[1].len = sizeof(*response_2d);
+    create_2d_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, create_2d_desc, &len);
+    require_u32("2d duplicate of pending blob response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d duplicate of pending blob response", response_2d->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 58,
+                .resource_generation = first_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
@@ -2662,6 +2889,7 @@ int main(void)
     test_hidden_virgl_command_returns_undefined_without_renderer_work();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
+    test_virgl_resource_create_blob_handler_tracks_pending_resource();
     test_virgl_resource_create_3d_rejects_live_2d_resource_id();
     test_virgl_resource_unref_handler_defers_and_frees_namespace();
     test_virgl_resource_unref_sync_submit_failure_restores_namespace();

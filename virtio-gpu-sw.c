@@ -1818,12 +1818,11 @@ static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
 }
 
 /* The software backend supports only CPU-backed 2D scanout resources today.
- * Optional virtio-gpu features for capsets, resource UUIDs, blob resources,
- * virgl/3D contexts, and blob mappings intentionally stay routed to
- * 'VIRTIO_GPU_CMD_UNDEF' so unsupported guest paths fail explicitly.
- *
- * TODO: Implement these handlers after the feature bits, backend resource
- * model, and display payload path grow matching virgl/blob support.
+ * Default-off VirGL builds may route hidden capset/context/3D/blob substrate
+ * commands through the renderer path for host coverage, but guest-visible
+ * feature advertisement remains disabled until the backend resource model,
+ * reset/shutdown policy, and display payload path grow complete support.
+ * Unsupported commands remain routed to VIRTIO_GPU_CMD_UNDEF.
  */
 const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .reset = vgpu_sw_reset,
@@ -1844,7 +1843,11 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
 #endif
     .get_edid = virtio_gpu_get_edid_handler,
     .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
+#if SEMU_HAS(VIRGL)
+    .resource_create_blob = virtio_gpu_virgl_resource_create_blob_handler,
+#else
     .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
 #if SEMU_HAS(VIRGL)
     .ctx_create = virtio_gpu_virgl_ctx_create_handler,

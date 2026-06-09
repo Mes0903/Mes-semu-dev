@@ -48,6 +48,10 @@ static struct virgl_renderer_resource_create_args
 static struct iovec *fake_last_resource_create_iov;
 static uint32_t fake_last_resource_create_num_iovs;
 static int fake_resource_create_result;
+static int fake_resource_create_blob_count;
+static struct virgl_renderer_resource_create_blob_args
+    fake_last_resource_create_blob_args;
+static int fake_resource_create_blob_result;
 static int fake_resource_attach_iov_count;
 static int fake_last_resource_attach_iov_handle;
 static struct iovec *fake_last_resource_attach_iov;
@@ -200,6 +204,15 @@ int virgl_renderer_resource_create(
     fake_last_resource_create_iov = iov;
     fake_last_resource_create_num_iovs = num_iovs;
     return fake_resource_create_result;
+}
+
+int virgl_renderer_resource_create_blob(
+    const struct virgl_renderer_resource_create_blob_args *args)
+{
+    fake_resource_create_blob_count++;
+    if (args)
+        fake_last_resource_create_blob_args = *args;
+    return fake_resource_create_blob_result;
 }
 
 int virgl_renderer_resource_attach_iov(int res_handle,
@@ -378,6 +391,10 @@ static void reset_test_state(uint64_t generation)
     fake_last_resource_create_iov = NULL;
     fake_last_resource_create_num_iovs = 0;
     fake_resource_create_result = 0;
+    fake_resource_create_blob_count = 0;
+    fake_last_resource_create_blob_args =
+        (struct virgl_renderer_resource_create_blob_args) {0};
+    fake_resource_create_blob_result = 0;
     fake_resource_attach_iov_count = 0;
     fake_last_resource_attach_iov_handle = 0;
     fake_last_resource_attach_iov = NULL;
@@ -906,6 +923,95 @@ static void test_ctrl_request_executes_resource_create_3d_completion(void)
     CHECK(fake_last_resource_create_args.flags == 0x5a);
     CHECK(fake_last_resource_create_iov == NULL);
     CHECK(fake_last_resource_create_num_iovs == 0);
+}
+
+
+static void test_ctrl_request_executes_resource_create_blob_completion(void)
+{
+    struct iovec iov[2] = {
+        {.iov_base = (void *) (uintptr_t) 0x1000, .iov_len = 16},
+        {.iov_base = (void *) (uintptr_t) 0x2000, .iov_len = 32},
+    };
+
+    reset_test_state(135);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, .ctx_id = 44},
+        .cmd.resource_create_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+                        .ctx_id = 44},
+                .resource_id = 188,
+                .blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST,
+                .blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                .nr_entries = 2,
+                .blob_id = UINT64_C(0x0102030405060708),
+                .size = 48,
+            },
+        .iov = iov,
+        .iov_count = 2,
+        .resource_generation = 0x123456,
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 115,
+                .actor_generation = 125,
+                .common_generation = 135,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0xc8,
+                .len = sizeof(struct virtio_gpu_ctrl_hdr),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 135},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_NONE);
+    CHECK(fake_resource_create_blob_count == 1);
+    CHECK(fake_last_resource_create_blob_args.res_handle == 188);
+    CHECK(fake_last_resource_create_blob_args.ctx_id == 44);
+    CHECK(fake_last_resource_create_blob_args.blob_mem ==
+          VIRTIO_GPU_BLOB_MEM_GUEST);
+    CHECK(fake_last_resource_create_blob_args.blob_flags ==
+          VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
+    CHECK(fake_last_resource_create_blob_args.blob_id ==
+          UINT64_C(0x0102030405060708));
+    CHECK(fake_last_resource_create_blob_args.size == 48);
+    CHECK(fake_last_resource_create_blob_args.iovecs == iov);
+    CHECK(fake_last_resource_create_blob_args.num_iovs == 2);
+    CHECK(fake_resource_create_count == 0);
+
+    fake_resource_create_blob_result = -1;
+    payload.cmd.resource_create_blob.resource_id = 189;
+    payload.resource_generation = 0x789abc;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(completion.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK);
+    CHECK(completion.virgl_resource.resource_id == 189);
+    CHECK(completion.virgl_resource.resource_generation == 0x789abc);
+    CHECK(fake_resource_create_blob_count == 2);
+    CHECK(fake_resource_unref_count == 0);
 }
 
 static void test_ctrl_request_resource_create_3d_failure_rolls_back_frontend(
@@ -1723,6 +1829,7 @@ int main(void)
     test_ctrl_request_executes_get_capset_completion();
     test_ctrl_request_executes_context_create_destroy();
     test_ctrl_request_executes_resource_create_3d_completion();
+    test_ctrl_request_executes_resource_create_blob_completion();
     test_ctrl_request_resource_create_3d_failure_rolls_back_frontend();
     test_ctrl_request_executes_resource_unref_completion();
     test_ctrl_request_resource_unref_missing_resource_rolls_back();

@@ -25,6 +25,17 @@ struct virgl_renderer_resource_create_args {
     uint32_t flags;
 };
 
+struct virgl_renderer_resource_create_blob_args {
+    uint32_t res_handle;
+    uint32_t ctx_id;
+    uint32_t blob_mem;
+    uint32_t blob_flags;
+    uint64_t blob_id;
+    uint64_t size;
+    const struct iovec *iovecs;
+    uint32_t num_iovs;
+};
+
 struct virgl_renderer_gl_ctx_param {
     int version;
     bool shared;
@@ -80,6 +91,8 @@ int virgl_renderer_resource_create(
     struct virgl_renderer_resource_create_args *args,
     struct iovec *iov,
     uint32_t num_iovs);
+int virgl_renderer_resource_create_blob(
+    const struct virgl_renderer_resource_create_blob_args *args);
 int virgl_renderer_resource_attach_iov(int res_handle,
                                        struct iovec *iov,
                                        int num_iovs);

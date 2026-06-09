@@ -451,6 +451,16 @@ static void vgpu_virgl_set_ctrl_side_effect(
         return;
 
     switch (payload->hdr.type) {
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+        if (response_type != VIRTIO_GPU_RESP_OK_NODATA) {
+            completion->virgl_resource.type =
+                VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK;
+            completion->virgl_resource.resource_id =
+                payload->cmd.resource_create_blob.resource_id;
+            completion->virgl_resource.resource_generation =
+                payload->resource_generation;
+        }
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
         if (response_type != VIRTIO_GPU_RESP_OK_NODATA) {
             completion->virgl_resource.type =
@@ -606,6 +616,33 @@ static void vgpu_virgl_execute_ctrl_request(
         virgl_renderer_context_destroy(payload->cmd.ctx_destroy.hdr.ctx_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
+        const struct virtio_gpu_resource_create_blob *cmd =
+            &payload->cmd.resource_create_blob;
+        struct virgl_renderer_resource_create_blob_args args = {
+            .res_handle = cmd->resource_id,
+            .ctx_id = cmd->hdr.ctx_id,
+            .blob_mem = cmd->blob_mem,
+            .blob_flags = cmd->blob_flags,
+            .blob_id = cmd->blob_id,
+            .size = cmd->size,
+            .iovecs = payload->iov,
+            .num_iovs = payload->iov_count,
+        };
+        int ret = virgl_renderer_resource_create_blob(&args);
+
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id)) {
+            virgl_renderer_resource_unref(cmd->resource_id);
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            break;
+        }
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
         const struct virtio_gpu_resource_create_3d *cmd =
             &payload->cmd.resource_create_3d;

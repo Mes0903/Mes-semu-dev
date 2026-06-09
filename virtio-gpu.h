@@ -226,6 +226,24 @@ PACKED(struct virtio_gpu_resource_create_3d {
     uint32_t padding;
 });
 
+PACKED(struct virtio_gpu_resource_create_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t blob_mem;
+    uint32_t blob_flags;
+    uint32_t nr_entries;
+    uint64_t blob_id;
+    uint64_t size;
+});
+
+#define VIRTIO_GPU_BLOB_MEM_GUEST 0x0001
+#define VIRTIO_GPU_BLOB_MEM_HOST3D 0x0002
+#define VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST 0x0003
+
+#define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 0x0001
+#define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE 0x0002
+#define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+
 PACKED(struct virtio_gpu_ctx_resource {
     struct virtio_gpu_ctrl_hdr hdr;
     uint32_t resource_id;
@@ -468,6 +486,9 @@ void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_resource_create_3d_handler(virtio_gpu_state_t *vgpu,
                                                  struct virtq_desc *vq_desc,
                                                  uint32_t *plen);
+void virtio_gpu_virgl_resource_create_blob_handler(virtio_gpu_state_t *vgpu,
+                                                   struct virtq_desc *vq_desc,
+                                                   uint32_t *plen);
 void virtio_gpu_virgl_resource_unref_handler(virtio_gpu_state_t *vgpu,
                                              struct virtq_desc *vq_desc,
                                              uint32_t *plen);
