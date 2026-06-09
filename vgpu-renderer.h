@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/uio.h>
 
 #include "virtio-gpu.h"
 
@@ -57,8 +58,12 @@ struct vgpu_renderer_ctrl_payload {
         struct virtio_gpu_ctx_create ctx_create;
         struct virtio_gpu_ctx_destroy ctx_destroy;
         struct virtio_gpu_res_unref resource_unref;
+        struct virtio_gpu_res_attach_backing resource_attach_backing;
+        struct virtio_gpu_res_detach_backing resource_detach_backing;
         struct virtio_gpu_resource_create_3d resource_create_3d;
     } cmd;
+    struct iovec *iov;
+    uint32_t iov_count;
     uint64_t resource_generation;
     size_t response_capacity;
     uint32_t response_type;

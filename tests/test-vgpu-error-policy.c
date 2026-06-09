@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <time.h>
 
 #include "device.h"
@@ -345,6 +346,92 @@ static void test_vgpu_resource_unref_releases_2d_resource_synchronously(void)
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
+
+static void test_vgpu_resource_attach_detach_keeps_2d_path_synchronous(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc attach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc detach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_res_create_2d *create =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_attach_backing *attach =
+        (struct virtio_gpu_res_attach_backing *) ((uint8_t *) ram + 0xc0);
+    struct virtio_gpu_res_detach_backing *detach =
+        (struct virtio_gpu_res_detach_backing *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_mem_entry *entry =
+        (struct virtio_gpu_mem_entry *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    uint32_t len = 0;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create->resource_id = 42;
+    create->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create->width = 4;
+    create->height = 4;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, create_desc, &len);
+    require_u32("2d create before attach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d create before attach response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    attach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach->resource_id = 42;
+    attach->nr_entries = 1;
+    entry->addr = 0x1c0;
+    entry->length = 16;
+    attach_desc[0].addr = 0xc0;
+    attach_desc[0].len = sizeof(*attach);
+    attach_desc[1].addr = 0x140;
+    attach_desc[1].len = sizeof(*entry);
+    attach_desc[2].addr = 0x180;
+    attach_desc[2].len = sizeof(*response);
+    attach_desc[2].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("2d attach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d attach response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    detach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    detach->resource_id = 42;
+    detach_desc[0].addr = 0x100;
+    detach_desc[0].len = sizeof(*detach);
+    detach_desc[1].addr = 0x180;
+    detach_desc[1].len = sizeof(*response);
+    detach_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("2d detach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d detach response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+#if SEMU_HAS(VIRGL)
+    struct vgpu_renderer_request queued = {0};
+    require_int("2d attach/detach queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+#endif
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 
 #if SEMU_HAS(VIRGL)
 
@@ -1196,6 +1283,310 @@ static void test_virgl_resource_unref_stale_rollback_after_2d_reuse(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+
+static void test_virgl_resource_attach_backing_snapshots_iov_and_defers(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc attach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc detach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_attach_backing *attach =
+        (struct virtio_gpu_res_attach_backing *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_res_detach_backing *detach =
+        (struct virtio_gpu_res_detach_backing *) ((uint8_t *) ram + 0x160);
+    struct virtio_gpu_mem_entry *entries =
+        (struct virtio_gpu_mem_entry *) ((uint8_t *) ram + 0x1c0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x240);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x78;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 50);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 64;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 64;
+    create->height = 64;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x240;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before attach is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before attach queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    uint64_t resource_generation = create_payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    attach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    attach->hdr.fence_id = UINT64_C(0x123456789abcdef0);
+    attach->resource_id = 64;
+    attach->nr_entries = 2;
+    entries[0].addr = 0x300;
+    entries[0].length = 16;
+    entries[1].addr = 0x340;
+    entries[1].length = 32;
+    attach_desc[0].addr = 0x100;
+    attach_desc[0].len = sizeof(*attach);
+    attach_desc[1].addr = 0x1c0;
+    attach_desc[1].len = 2 * sizeof(*entries);
+    attach_desc[2].addr = 0x240;
+    attach_desc[2].len = sizeof(*response);
+    attach_desc[2].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("3d attach is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    attach->resource_id = 999;
+    entries[0].addr = 0x380;
+    entries[0].length = 4;
+
+    require_int("3d attach queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("3d attach command type", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+    struct vgpu_renderer_ctrl_payload *attach_payload = queued.payload;
+    void (*attach_release_payload)(void *) = queued.release_payload;
+    require_u32("3d attach snapshots resource id",
+                attach_payload->cmd.resource_attach_backing.resource_id, 64);
+    require_u32("3d attach snapshots entry count",
+                attach_payload->cmd.resource_attach_backing.nr_entries, 2);
+    require_u64("3d attach carries resource generation",
+                attach_payload->resource_generation, resource_generation);
+    require_u64("3d attach snapshots fence", attach_payload->hdr.fence_id,
+                UINT64_C(0x123456789abcdef0));
+    require_u32("3d attach iov count", attach_payload->iov_count, 2);
+    require_ptr("3d attach iov0 base", attach_payload->iov[0].iov_base,
+                (uint8_t *) ram + 0x300);
+    require_u64("3d attach iov0 len", attach_payload->iov[0].iov_len, 16);
+    require_ptr("3d attach iov1 base", attach_payload->iov[1].iov_base,
+                (uint8_t *) ram + 0x340);
+    require_u64("3d attach iov1 len", attach_payload->iov[1].iov_len, 32);
+
+    attach->resource_id = 64;
+    attach->hdr.fence_id = UINT64_C(0x1111);
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("duplicate pending 3d attach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("duplicate pending 3d attach response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    struct vgpu_renderer_request empty = {0};
+    require_int("duplicate pending 3d attach queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    detach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    detach->resource_id = 64;
+    detach_desc[0].addr = 0x160;
+    detach_desc[0].len = sizeof(*detach);
+    detach_desc[1].addr = 0x240;
+    detach_desc[1].len = sizeof(*response);
+    detach_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("3d detach before attach completion response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d detach before attach completion response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("3d detach before attach completion queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion attach_success = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_ATTACH_BACKING,
+                .resource_id = 64,
+                .resource_generation = resource_generation,
+                .backing_transition_success = true,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &attach_success);
+
+    vgpu.ctrl_dispatch.desc_head = 51;
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("3d detach is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d detach queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("3d detach command type", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
+    struct vgpu_renderer_ctrl_payload *detach_payload = queued.payload;
+    void (*detach_release_payload)(void *) = queued.release_payload;
+    require_u32("3d detach snapshots resource id",
+                detach_payload->cmd.resource_detach_backing.resource_id, 64);
+    require_u64("3d detach carries resource generation",
+                detach_payload->resource_generation, resource_generation);
+
+    struct vgpu_renderer_completion stale_detach = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_DETACH_BACKING,
+                .resource_id = 64,
+                .resource_generation = resource_generation + 1,
+                .backing_transition_success = true,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_detach);
+
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("stale 3d detach side effect keeps pending response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("stale 3d detach side effect keeps pending response",
+                response->type, VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_int("stale 3d detach side effect queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    stale_detach.virgl_resource.resource_generation = resource_generation;
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale_detach);
+
+    len = 0;
+    response->type = 0;
+    g_virtio_gpu_backend.resource_detach_backing(&vgpu, detach_desc, &len);
+    require_u32("3d detach after detach completion response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("3d detach after detach completion response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+
+    attach_release_payload(attach_payload);
+    detach_release_payload(detach_payload);
+
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 64,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_resource_attach_rejects_malformed_backing_list(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc attach_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_attach_backing *attach =
+        (struct virtio_gpu_res_attach_backing *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x79;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 60);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 65;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 64;
+    create->height = 64;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before malformed attach is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before malformed attach queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t resource_generation = payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    attach->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach->resource_id = 65;
+    attach->nr_entries = 1;
+    attach_desc[0].addr = 0x100;
+    attach_desc[0].len = sizeof(*attach);
+    attach_desc[1].addr = 0x140;
+    attach_desc[1].len = sizeof(struct virtio_gpu_mem_entry) - 1;
+    attach_desc[2].addr = 0x180;
+    attach_desc[2].len = sizeof(*response);
+    attach_desc[2].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("malformed 3d attach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("malformed 3d attach response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    struct vgpu_renderer_request empty = {0};
+    require_int("malformed 3d attach queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct virtio_gpu_mem_entry *late_entry =
+        (struct virtio_gpu_mem_entry *) ((uint8_t *) ram + 0x1c0);
+    late_entry->addr = 0x200;
+    late_entry->length = 16;
+    attach_desc[1].len = 0;
+    attach_desc[2].addr = 0x180;
+    attach_desc[2].len = sizeof(*response);
+    attach_desc[2].flags = VIRTIO_DESC_F_WRITE;
+    attach_desc[3].addr = 0x1c0;
+    attach_desc[3].len = sizeof(*late_entry);
+    attach_desc[3].flags = 0;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.resource_attach_backing(&vgpu, attach_desc, &len);
+    require_u32("late-readable 3d attach response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("late-readable 3d attach response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("late-readable 3d attach queues no renderer work",
+                vgpu_renderer_pop_request(&empty), false);
+
+    struct vgpu_renderer_completion cleanup = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_CREATE_3D_ROLLBACK,
+                .resource_id = 65,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &cleanup);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
 {
     uint32_t ram[512] = {0};
@@ -1298,6 +1689,39 @@ static void test_vgpu_debug_counters_init_and_reset_to_zero(void)
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
+
+#if SEMU_HAS(VIRGL)
+static void test_vgpu_common_reset_queues_renderer_reset_request(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    uint64_t old_generation;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    old_generation = vgpu.common.generation;
+    vgpu_renderer_reset_queues(old_generation);
+
+    require_int("common reset", virtio_device_common_reset(&vgpu.common), 0);
+    require_false("common generation advanced",
+                  vgpu.common.generation == old_generation);
+
+    struct vgpu_renderer_request request = {0};
+    require_int("renderer reset request queued",
+                vgpu_renderer_pop_request(&request), true);
+    require_u32("renderer reset request type", request.type,
+                VGPU_RENDERER_REQ_RESET);
+    require_u64("renderer reset request generation", request.token.generation,
+                vgpu.common.generation);
+    require_ptr("renderer reset request payload", request.payload, NULL);
+    require_ptr("renderer reset release hook",
+                (const void *) request.release_payload, NULL);
+    require_int("only one renderer reset request",
+                vgpu_renderer_pop_request(&request), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+#endif
 
 static void test_vgpu_display_counters_snapshot_reads_existing_counters(void)
 {
@@ -1743,9 +2167,13 @@ static void test_vgpu_destroy_stops_started_actor_and_is_idempotent(void)
 int main(void)
 {
     test_vgpu_debug_counters_init_and_reset_to_zero();
+#if SEMU_HAS(VIRGL)
+    test_vgpu_common_reset_queues_renderer_reset_request();
+#endif
     test_vgpu_display_counters_snapshot_reads_existing_counters();
     test_undefined_command_returns_device_error();
     test_vgpu_resource_unref_releases_2d_resource_synchronously();
+    test_vgpu_resource_attach_detach_keeps_2d_path_synchronous();
     test_vgpu_actor_failure_marks_device_reset_needed();
     test_vgpu_failed_actor_notify_counts_eio();
     test_vgpu_invalid_actor_notify_counts_einval();
@@ -1759,6 +2187,8 @@ int main(void)
     test_virgl_resource_unref_handler_defers_and_frees_namespace();
     test_virgl_resource_unref_sync_submit_failure_restores_namespace();
     test_virgl_resource_unref_stale_rollback_after_2d_reuse();
+    test_virgl_resource_attach_backing_snapshots_iov_and_defers();
+    test_virgl_resource_attach_rejects_malformed_backing_list();
     test_virgl_context_handlers_submit_ctrl_skeletons();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_completion_drops_stale_common_generation();

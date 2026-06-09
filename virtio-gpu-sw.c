@@ -1164,6 +1164,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
+
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, request->resource_id);
@@ -1398,6 +1399,13 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
         return;
     }
 
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(backing_info->resource_id)) {
+        virtio_gpu_virgl_resource_attach_backing_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
+
     if (vq_desc[1].flags & VIRTIO_DESC_F_WRITE) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -1563,6 +1571,13 @@ static void vgpu_sw_cmd_resource_detach_backing_handler(
         *plen = 0;
         return;
     }
+
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+        virtio_gpu_virgl_resource_detach_backing_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =

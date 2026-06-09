@@ -1,9 +1,11 @@
 #include "virtio-gpu-virgl.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 
 #include <virglrenderer.h>
 
@@ -38,10 +40,13 @@ static uint64_t debug_last_context_fence;
 
 struct vgpu_virgl_renderer_resource {
     uint32_t resource_id;
+    bool backing_attached;
     struct vgpu_virgl_renderer_resource *next;
 };
 
 static struct vgpu_virgl_renderer_resource *vgpu_virgl_renderer_resources;
+
+static void vgpu_virgl_detach_iov(uint32_t resource_id);
 
 static void vgpu_virgl_clear_renderer_resources(void)
 {
@@ -49,6 +54,8 @@ static void vgpu_virgl_clear_renderer_resources(void)
         struct vgpu_virgl_renderer_resource *res =
             vgpu_virgl_renderer_resources;
         vgpu_virgl_renderer_resources = res->next;
+        if (res->backing_attached)
+            vgpu_virgl_detach_iov(res->resource_id);
         free(res);
     }
 }
@@ -64,6 +71,29 @@ static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id)
     res->next = vgpu_virgl_renderer_resources;
     vgpu_virgl_renderer_resources = res;
     return true;
+}
+
+static struct vgpu_virgl_renderer_resource *vgpu_virgl_find_renderer_resource(
+    uint32_t resource_id)
+{
+    for (struct vgpu_virgl_renderer_resource *res =
+             vgpu_virgl_renderer_resources;
+         res; res = res->next) {
+        if (res->resource_id == resource_id)
+            return res;
+    }
+
+    return NULL;
+}
+
+static void vgpu_virgl_detach_iov(uint32_t resource_id)
+{
+    struct iovec *iov = NULL;
+    int num_iovs = 0;
+
+    virgl_renderer_resource_detach_iov(resource_id, &iov, &num_iovs);
+    (void) num_iovs;
+    free(iov);
 }
 
 static bool vgpu_virgl_remove_renderer_resource(uint32_t resource_id)
@@ -362,8 +392,8 @@ void vgpu_virgl_reset_renderer(void)
     debug_last_context_fence = 0;
     pthread_mutex_unlock(&vgpu_virgl_lock);
 
-    virgl_renderer_reset();
     vgpu_virgl_clear_renderer_resources();
+    virgl_renderer_reset();
 }
 
 static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
@@ -419,6 +449,26 @@ static void vgpu_virgl_set_ctrl_side_effect(
         completion->virgl_resource.resource_generation =
             payload->resource_generation;
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+        completion->virgl_resource.type =
+            VGPU_VIRGL_RESOURCE_SIDE_EFFECT_ATTACH_BACKING;
+        completion->virgl_resource.resource_id =
+            payload->cmd.resource_attach_backing.resource_id;
+        completion->virgl_resource.resource_generation =
+            payload->resource_generation;
+        completion->virgl_resource.backing_transition_success =
+            response_type == VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+        completion->virgl_resource.type =
+            VGPU_VIRGL_RESOURCE_SIDE_EFFECT_DETACH_BACKING;
+        completion->virgl_resource.resource_id =
+            payload->cmd.resource_detach_backing.resource_id;
+        completion->virgl_resource.resource_generation =
+            payload->resource_generation;
+        completion->virgl_resource.backing_transition_success =
+            response_type == VIRTIO_GPU_RESP_OK_NODATA;
+        break;
     default:
         break;
     }
@@ -451,7 +501,7 @@ static void vgpu_virgl_complete_ctrl_request(
 
 static void vgpu_virgl_execute_ctrl_request(
     const struct vgpu_renderer_request *request,
-    const struct vgpu_renderer_ctrl_payload *payload)
+    struct vgpu_renderer_ctrl_payload *payload)
 {
     uint32_t response_type = payload->response_type;
     void *response = NULL;
@@ -564,14 +614,67 @@ static void vgpu_virgl_execute_ctrl_request(
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: {
+        const struct virtio_gpu_res_attach_backing *cmd =
+            &payload->cmd.resource_attach_backing;
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_find_renderer_resource(cmd->resource_id);
+
+        if (!res) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+        if (res->backing_attached || payload->iov_count > INT_MAX) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+
+        int ret = virgl_renderer_resource_attach_iov(
+            cmd->resource_id, payload->iov, (int) payload->iov_count);
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+
+        res->backing_attached = true;
+        payload->iov = NULL;
+        payload->iov_count = 0;
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: {
+        const struct virtio_gpu_res_detach_backing *cmd =
+            &payload->cmd.resource_detach_backing;
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_find_renderer_resource(cmd->resource_id);
+
+        if (!res) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+        if (!res->backing_attached) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+
+        vgpu_virgl_detach_iov(cmd->resource_id);
+        res->backing_attached = false;
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
     case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
         const struct virtio_gpu_res_unref *cmd = &payload->cmd.resource_unref;
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_find_renderer_resource(cmd->resource_id);
 
-        if (!vgpu_virgl_remove_renderer_resource(cmd->resource_id)) {
+        if (!res) {
             response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
             break;
         }
 
+        if (res->backing_attached)
+            vgpu_virgl_detach_iov(cmd->resource_id);
+        (void) vgpu_virgl_remove_renderer_resource(cmd->resource_id);
         virgl_renderer_resource_unref(cmd->resource_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
@@ -645,8 +748,7 @@ void vgpu_virgl_execute_renderer_request(
         break;
     case VGPU_RENDERER_REQ_CTRL:
         vgpu_virgl_execute_ctrl_request(
-            request,
-            (const struct vgpu_renderer_ctrl_payload *) request->payload);
+            request, (struct vgpu_renderer_ctrl_payload *) request->payload);
         if (request->release_payload)
             request->release_payload(request->payload);
         break;

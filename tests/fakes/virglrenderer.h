@@ -71,5 +71,11 @@ int virgl_renderer_resource_create(
     struct virgl_renderer_resource_create_args *args,
     struct iovec *iov,
     uint32_t num_iovs);
+int virgl_renderer_resource_attach_iov(int res_handle,
+                                       struct iovec *iov,
+                                       int num_iovs);
+void virgl_renderer_resource_detach_iov(int res_handle,
+                                        struct iovec **iov,
+                                        int *num_iovs);
 void virgl_renderer_resource_unref(uint32_t res_handle);
 void virgl_renderer_reset(void);
