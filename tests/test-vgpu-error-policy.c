@@ -93,8 +93,58 @@ static void test_vgpu_actor_failure_marks_device_reset_needed(void)
                     VIRTIO_STATUS__DEVICE_NEEDS_RESET,
                 VIRTIO_STATUS__DEVICE_NEEDS_RESET);
 
-    virtio_actor_destroy(&vgpu.actor);
-    virtio_device_common_destroy(&vgpu.common);
+    virtio_gpu_destroy(&vgpu);
+    pthread_mutex_destroy(&emu.plic_lock);
+}
+
+static void test_vgpu_destroy_releases_common_without_actor(void)
+{
+    static const uint16_t queue_max_sizes[] = {8, 8};
+    uint32_t ram[64] = {0};
+    emu_state_t emu = {0};
+    virtio_gpu_state_t vgpu = {0};
+    struct virtio_device_common_config config = {
+        .emu = &emu,
+        .dma = &emu.ram_dma,
+        .irq_source = SEMU_IRQ_SOURCE_COUNT,
+        .device_id = 16,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+    };
+
+    emu.ram = ram;
+    ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
+    require_int("common init", virtio_device_common_init(&vgpu.common, &config),
+                0);
+
+    virtio_gpu_destroy(&vgpu);
+    require_false("partial common no longer initialized",
+                  vgpu.common.initialized);
+    virtio_gpu_destroy(&vgpu);
+}
+
+static void test_vgpu_destroy_stops_started_actor_and_is_idempotent(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu = {0};
+    virtio_gpu_state_t vgpu;
+
+    emu.ram = ram;
+    ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
+    require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
+
+    virtio_gpu_init(&vgpu, &emu);
+    require_int("start actor", virtio_actor_start(&vgpu.actor), 0);
+
+    virtio_gpu_destroy(&vgpu);
+    require_false("actor no longer initialized", vgpu.actor_initialized);
+    require_false("common no longer initialized", vgpu.common.initialized);
+    require_false("actor thread no longer live",
+                  vgpu.actor.thread_started && !vgpu.actor.thread_joined);
+
+    virtio_gpu_destroy(&vgpu);
+    virtio_gpu_destroy(NULL);
     pthread_mutex_destroy(&emu.plic_lock);
 }
 
@@ -102,5 +152,7 @@ int main(void)
 {
     test_undefined_command_returns_device_error();
     test_vgpu_actor_failure_marks_device_reset_needed();
+    test_vgpu_destroy_releases_common_without_actor();
+    test_vgpu_destroy_stops_started_actor_and_is_idempotent();
     return 0;
 }
