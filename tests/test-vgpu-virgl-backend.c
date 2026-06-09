@@ -34,6 +34,18 @@ static int fake_reset_count;
 static int wake_renderer_count;
 static int wake_frontend_count;
 static int fake_cookie_marker;
+static int fake_window_create_count;
+static int fake_window_create_scanout_idx;
+static struct virgl_renderer_gl_ctx_param fake_window_create_param;
+static struct virgl_renderer_gl_ctx_param *fake_window_create_param_ptr;
+static virgl_renderer_gl_context fake_window_create_result =
+    (virgl_renderer_gl_context) (uintptr_t) 0x12345678;
+static int fake_window_destroy_count;
+static virgl_renderer_gl_context fake_window_destroy_ctx;
+static int fake_window_make_current_count;
+static int fake_window_make_current_scanout_idx;
+static virgl_renderer_gl_context fake_window_make_current_ctx;
+static int fake_window_make_current_result;
 
 int virgl_renderer_init(void *cookie,
                         int flags,
@@ -77,6 +89,33 @@ void virgl_renderer_reset(void)
     fake_reset_count++;
 }
 
+virgl_renderer_gl_context vgpu_window_virgl_create_context(
+    int scanout_idx,
+    struct virgl_renderer_gl_ctx_param *param)
+{
+    fake_window_create_count++;
+    fake_window_create_scanout_idx = scanout_idx;
+    fake_window_create_param_ptr = param;
+    if (param)
+        fake_window_create_param = *param;
+    return fake_window_create_result;
+}
+
+void vgpu_window_virgl_destroy_context(virgl_renderer_gl_context ctx)
+{
+    fake_window_destroy_count++;
+    fake_window_destroy_ctx = ctx;
+}
+
+int vgpu_window_virgl_make_current(int scanout_idx,
+                                   virgl_renderer_gl_context ctx)
+{
+    fake_window_make_current_count++;
+    fake_window_make_current_scanout_idx = scanout_idx;
+    fake_window_make_current_ctx = ctx;
+    return fake_window_make_current_result;
+}
+
 static void wake_renderer(void)
 {
     wake_renderer_count++;
@@ -105,6 +144,16 @@ static void reset_test_state(uint64_t generation)
     fake_reset_count = 0;
     wake_renderer_count = 0;
     wake_frontend_count = 0;
+    fake_window_create_count = 0;
+    fake_window_create_scanout_idx = -1;
+    fake_window_create_param = (struct virgl_renderer_gl_ctx_param) {0};
+    fake_window_create_param_ptr = NULL;
+    fake_window_destroy_count = 0;
+    fake_window_destroy_ctx = NULL;
+    fake_window_make_current_count = 0;
+    fake_window_make_current_scanout_idx = -1;
+    fake_window_make_current_ctx = NULL;
+    fake_window_make_current_result = 0;
 
     vgpu_renderer_set_wake_renderer(wake_renderer);
     vgpu_renderer_set_wake_frontend(wake_frontend);
@@ -132,6 +181,9 @@ static void init_renderer_for_test(void)
     CHECK(vgpu_virgl_init_renderer(&fake_cookie_marker) == 0);
     CHECK(fake_callbacks.write_fence != NULL);
     CHECK(fake_callbacks.write_context_fence != NULL);
+    CHECK(fake_callbacks.create_gl_context != NULL);
+    CHECK(fake_callbacks.destroy_gl_context != NULL);
+    CHECK(fake_callbacks.make_current != NULL);
 }
 
 static void test_init_renderer_uses_thread_sync_and_callbacks(void)
@@ -146,6 +198,72 @@ static void test_init_renderer_uses_thread_sync_and_callbacks(void)
     CHECK(fake_callbacks.version == VIRGL_RENDERER_CALLBACKS_VERSION);
     CHECK(fake_callbacks.write_fence != NULL);
     CHECK(fake_callbacks.write_context_fence != NULL);
+}
+
+static void test_init_renderer_installs_gl_context_callbacks(void)
+{
+    reset_test_state(3);
+    init_renderer_for_test();
+
+    CHECK(fake_callbacks.create_gl_context != NULL);
+    CHECK(fake_callbacks.destroy_gl_context != NULL);
+    CHECK(fake_callbacks.make_current != NULL);
+}
+
+static void test_create_gl_context_callback_delegates_to_window_hook(void)
+{
+    struct virgl_renderer_gl_ctx_param param = {
+        .version = 1,
+        .shared = true,
+        .major_ver = 4,
+        .minor_ver = 3,
+        .compat_ctx = 1,
+    };
+
+    reset_test_state(5);
+    init_renderer_for_test();
+
+    virgl_renderer_gl_context ctx =
+        fake_callbacks.create_gl_context(fake_init_cookie, 2, &param);
+
+    CHECK(ctx == fake_window_create_result);
+    CHECK(fake_window_create_count == 1);
+    CHECK(fake_window_create_scanout_idx == 2);
+    CHECK(fake_window_create_param_ptr == &param);
+    CHECK(fake_window_create_param.version == param.version);
+    CHECK(fake_window_create_param.shared == param.shared);
+    CHECK(fake_window_create_param.major_ver == param.major_ver);
+    CHECK(fake_window_create_param.minor_ver == param.minor_ver);
+    CHECK(fake_window_create_param.compat_ctx == param.compat_ctx);
+}
+
+static void test_destroy_gl_context_callback_delegates_to_window_hook(void)
+{
+    int marker;
+    virgl_renderer_gl_context ctx = &marker;
+
+    reset_test_state(6);
+    init_renderer_for_test();
+
+    fake_callbacks.destroy_gl_context(fake_init_cookie, ctx);
+
+    CHECK(fake_window_destroy_count == 1);
+    CHECK(fake_window_destroy_ctx == ctx);
+}
+
+static void test_make_current_callback_delegates_to_window_hook(void)
+{
+    int marker;
+    virgl_renderer_gl_context ctx = &marker;
+
+    reset_test_state(8);
+    fake_window_make_current_result = -17;
+    init_renderer_for_test();
+
+    CHECK(fake_callbacks.make_current(fake_init_cookie, 4, ctx) == -17);
+    CHECK(fake_window_make_current_count == 1);
+    CHECK(fake_window_make_current_scanout_idx == 4);
+    CHECK(fake_window_make_current_ctx == ctx);
 }
 
 static void test_ctx0_fence_completion_preserves_guest_id_and_generation(void)
@@ -313,6 +431,10 @@ static void test_reset_drops_pending_fences_and_ignores_stale_callbacks(void)
 int main(void)
 {
     test_init_renderer_uses_thread_sync_and_callbacks();
+    test_init_renderer_installs_gl_context_callbacks();
+    test_create_gl_context_callback_delegates_to_window_hook();
+    test_destroy_gl_context_callback_delegates_to_window_hook();
+    test_make_current_callback_delegates_to_window_hook();
     test_ctx0_fence_completion_preserves_guest_id_and_generation();
     test_context_fence_completion_preserves_stream_metadata();
     test_poll_requests_coalesce_until_executed();

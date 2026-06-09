@@ -261,9 +261,36 @@ static void vgpu_virgl_write_context_fence(void *cookie,
     vgpu_renderer_complete(&completion);
 }
 
+static virgl_renderer_gl_context vgpu_virgl_create_context(
+    void *cookie,
+    int scanout_idx,
+    struct virgl_renderer_gl_ctx_param *param)
+{
+    (void) cookie;
+    return vgpu_window_virgl_create_context(scanout_idx, param);
+}
+
+static void vgpu_virgl_destroy_context(void *cookie,
+                                       virgl_renderer_gl_context ctx)
+{
+    (void) cookie;
+    vgpu_window_virgl_destroy_context(ctx);
+}
+
+static int vgpu_virgl_make_current(void *cookie,
+                                   int scanout_idx,
+                                   virgl_renderer_gl_context ctx)
+{
+    (void) cookie;
+    return vgpu_window_virgl_make_current(scanout_idx, ctx);
+}
+
 static struct virgl_renderer_callbacks vgpu_virgl_callbacks = {
     .version = VIRGL_RENDERER_CALLBACKS_VERSION,
     .write_fence = vgpu_virgl_write_fence,
+    .create_gl_context = vgpu_virgl_create_context,
+    .destroy_gl_context = vgpu_virgl_destroy_context,
+    .make_current = vgpu_virgl_make_current,
     .write_context_fence = vgpu_virgl_write_context_fence,
 };
 

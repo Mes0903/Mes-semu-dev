@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <virglrenderer.h>
+
 #include "vgpu-renderer.h"
 
 struct vgpu_virgl_debug_stats {
@@ -33,3 +35,10 @@ bool vgpu_virgl_submit_fence(uint64_t generation,
 void vgpu_virgl_execute_renderer_request(
     const struct vgpu_renderer_request *request);
 void vgpu_virgl_debug_snapshot(struct vgpu_virgl_debug_stats *stats);
+
+virgl_renderer_gl_context vgpu_window_virgl_create_context(
+    int scanout_idx,
+    struct virgl_renderer_gl_ctx_param *param);
+void vgpu_window_virgl_destroy_context(virgl_renderer_gl_context ctx);
+int vgpu_window_virgl_make_current(int scanout_idx,
+                                   virgl_renderer_gl_context ctx);

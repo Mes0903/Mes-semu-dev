@@ -1,17 +1,33 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define VIRGL_RENDERER_CALLBACKS_VERSION 4
 #define VIRGL_RENDERER_THREAD_SYNC 2
 #define VIRGL_RENDERER_FENCE_FLAG_MERGEABLE (1 << 0)
 
+typedef void *virgl_renderer_gl_context;
+
+struct virgl_renderer_gl_ctx_param {
+    int version;
+    bool shared;
+    int major_ver;
+    int minor_ver;
+    int compat_ctx;
+};
+
 struct virgl_renderer_callbacks {
     int version;
     void (*write_fence)(void *cookie, uint32_t fence);
-    void *create_gl_context;
-    void *destroy_gl_context;
-    void *make_current;
+    virgl_renderer_gl_context (*create_gl_context)(
+        void *cookie,
+        int scanout_idx,
+        struct virgl_renderer_gl_ctx_param *param);
+    void (*destroy_gl_context)(void *cookie, virgl_renderer_gl_context ctx);
+    int (*make_current)(void *cookie,
+                        int scanout_idx,
+                        virgl_renderer_gl_context ctx);
     void (*write_context_fence)(void *cookie,
                                 uint32_t ctx_id,
                                 uint32_t ring_idx,
