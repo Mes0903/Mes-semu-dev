@@ -251,6 +251,7 @@ ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += vgpu-rect.o
     ifeq ($(call has, VIRGL), 1)
         OBJS_EXTRA += vgpu-renderer.o
+        OBJS_EXTRA += virtio-gpu-virgl.o
     endif
 endif
 
@@ -414,6 +415,11 @@ test-vgpu-renderer:
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-renderer-queue.c vgpu-renderer.c -o /tmp/test-vgpu-renderer $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-renderer
 
+.PHONY: test-vgpu-virgl-backend
+test-vgpu-virgl-backend:
+	$(CC) $(HOST_TEST_CFLAGS) -Itests/fakes -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-virgl-backend.c virtio-gpu-virgl.c vgpu-renderer.c -o /tmp/test-vgpu-virgl-backend $(HOST_TEST_LDLIBS)
+	/tmp/test-vgpu-virgl-backend
+
 VGPU_COPY_BENCH_SCALE ?= 1
 .PHONY: bench-vgpu-copy
 bench-vgpu-copy:
@@ -450,7 +456,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-virgl-gate test-vgpu-renderer test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-virgl-gate test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-executor-config test-hart-executor
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
