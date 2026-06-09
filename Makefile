@@ -334,7 +334,7 @@ test-virtio-input-config:
 
 .PHONY: test-vgpu-rect
 test-vgpu-rect:
-	$(CC) $(HOST_TEST_CFLAGS) tests/test-vgpu-rect.c vgpu-rect.c vgpu-display.c -o /tmp/test-vgpu-rect $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-rect.c vgpu-rect.c vgpu-display.c -Wl,--wrap=free -o /tmp/test-vgpu-rect $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-rect
 
 .PHONY: test-vgpu-error-policy

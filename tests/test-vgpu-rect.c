@@ -34,6 +34,37 @@ static void require_u32(const char *name, uint32_t got, uint32_t want)
     exit(1);
 }
 
+static void require_publish_result(const char *name,
+                                   enum vgpu_display_publish_result got,
+                                   enum vgpu_display_publish_result want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %d, want %d\n", name, got, want);
+    exit(1);
+}
+
+static uint32_t vgpu_display_free_calls;
+static bool vgpu_display_count_free;
+
+void __real_free(void *ptr);
+
+void __wrap_free(void *ptr)
+{
+    if (vgpu_display_count_free && ptr)
+        vgpu_display_free_calls++;
+    __real_free(ptr);
+}
+
+static struct vgpu_display_payload *alloc_display_payload(const char *name)
+{
+    struct vgpu_display_payload *payload = calloc(1, sizeof(*payload));
+
+    require_true(name, payload != NULL);
+    return payload;
+}
+
 static void require_rect(const char *name,
                          struct vgpu_dirty_rect got,
                          uint32_t x,
@@ -309,6 +340,46 @@ static void test_lifecycle_publish_result_classification(void)
                       VGPU_DISPLAY_PUBLISH_BACKPRESSURE));
 }
 
+static void test_display_shutdown_after_producer_stopped_drains_payloads(void)
+{
+    struct vgpu_display_payload *primary =
+        alloc_display_payload("primary payload alloc");
+    struct vgpu_display_payload *cursor =
+        alloc_display_payload("cursor payload alloc");
+    struct vgpu_display_cmd cmd;
+
+    require_publish_result(
+        "primary publish before shutdown",
+        vgpu_display_publish_primary_set(0, primary), VGPU_DISPLAY_PUBLISH_OK);
+    require_publish_result(
+        "cursor publish before shutdown",
+        vgpu_display_publish_cursor_set(0, cursor, 1, 2, 3, 4),
+        VGPU_DISPLAY_PUBLISH_OK);
+
+    vgpu_display_free_calls = 0;
+    vgpu_display_count_free = true;
+    vgpu_display_shutdown_after_producer_stopped();
+    vgpu_display_count_free = false;
+
+    require_u32("shutdown releases queued payloads",
+                vgpu_display_free_calls, 2);
+    require_false("shutdown drains display queue", vgpu_display_pop_cmd(&cmd));
+
+    struct vgpu_display_payload *late =
+        alloc_display_payload("late payload alloc");
+    require_publish_result(
+        "primary publish after shutdown unavailable",
+        vgpu_display_publish_primary_set(0, late),
+        VGPU_DISPLAY_PUBLISH_UNAVAILABLE);
+    free(late);
+    require_publish_result("primary clear after shutdown unavailable",
+                           vgpu_display_publish_primary_clear(0),
+                           VGPU_DISPLAY_PUBLISH_UNAVAILABLE);
+    require_publish_result("cursor move after shutdown unavailable",
+                           vgpu_display_publish_cursor_move(0, 5, 6),
+                           VGPU_DISPLAY_PUBLISH_UNAVAILABLE);
+}
+
 int main(void)
 {
     test_full_scanout_maps_to_full_payload_and_dst();
@@ -322,5 +393,6 @@ int main(void)
     test_primary_bind_requires_generation_advance();
     test_primary_clear_requires_published_clear();
     test_lifecycle_publish_result_classification();
+    test_display_shutdown_after_producer_stopped_drains_payloads();
     return 0;
 }
