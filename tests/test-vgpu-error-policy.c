@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -9,15 +10,17 @@
 #include "virtio-gpu.h"
 #include "virtio.h"
 
-void virtio_device_common_set_needs_reset(struct virtio_device_common *common)
+void semu_wake_interruptible_harts(emu_state_t *emu UNUSED)
 {
-    if (!common)
-        return;
-    atomic_fetch_or(&common->status, VIRTIO_STATUS__DEVICE_NEEDS_RESET);
 }
 
-void virtio_irq_trigger(struct virtio_irq *irq UNUSED, uint32_t bits UNUSED)
+static void require_int(const char *name, int got, int want)
 {
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %d, want %d\n", name, got, want);
+    exit(1);
 }
 
 static void require_u32(const char *name, uint32_t got, uint32_t want)
@@ -72,8 +75,32 @@ static void test_undefined_command_returns_device_error(void)
                       VIRTIO_STATUS__DEVICE_NEEDS_RESET);
 }
 
+
+static void test_vgpu_actor_failure_marks_device_reset_needed(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu = {0};
+    virtio_gpu_state_t vgpu;
+
+    emu.ram = ram;
+    ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
+    require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
+
+    virtio_gpu_init(&vgpu, &emu);
+    require_int("actor fail", virtio_actor_fail(&vgpu.actor), 0);
+    require_u32("actor failure sets reset-needed",
+                atomic_load(&vgpu.common.status) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+
+    virtio_actor_destroy(&vgpu.actor);
+    virtio_device_common_destroy(&vgpu.common);
+    pthread_mutex_destroy(&emu.plic_lock);
+}
+
 int main(void)
 {
     test_undefined_command_returns_device_error();
+    test_vgpu_actor_failure_marks_device_reset_needed();
     return 0;
 }

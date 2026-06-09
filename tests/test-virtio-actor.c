@@ -85,7 +85,11 @@ struct test_backend {
     unsigned drain_count[8];
     unsigned lock_held_count;
     unsigned old_generation_after_reset_entries;
+    unsigned failed_callback_count;
+    enum virtio_actor_state failed_callback_state;
+    uint64_t failed_callback_generation;
     uint64_t last_generation;
+    bool failed_callback_lock_held;
     atomic_bool reset_done;
     bool work[8];
     bool inject_work_after_clear[8];
@@ -228,9 +232,22 @@ static bool test_queue_has_work(void *opaque,
     return has_work;
 }
 
+static void test_actor_failed(void *opaque, struct virtio_actor *actor)
+{
+    struct test_backend *backend = opaque;
+
+    pthread_mutex_lock(&backend->lock);
+    backend->failed_callback_count++;
+    backend->failed_callback_lock_held = virtio_actor_lock_is_held(actor);
+    backend->failed_callback_state = virtio_actor_get_state(actor);
+    backend->failed_callback_generation = virtio_actor_generation(actor);
+    pthread_mutex_unlock(&backend->lock);
+}
+
 static const struct virtio_actor_ops test_ops = {
     .drain_queue = test_drain_queue,
     .queue_has_work = test_queue_has_work,
+    .on_failed = test_actor_failed,
 };
 
 static void test_init_destroy_state_and_generation(void)
@@ -585,6 +602,16 @@ static void test_fail_marks_failed_and_wakes_waiters(void)
     require_state("failed state", virtio_actor_get_state(&actor),
                   VIRTIO_ACTOR_FAILED);
     require_true("failed flag", actor.failed);
+    pthread_mutex_lock(&backend.lock);
+    require_int("failed callback count", (int) backend.failed_callback_count,
+                1);
+    require_false("failed callback outside actor lock",
+                  backend.failed_callback_lock_held);
+    require_state("failed callback observed state",
+                  backend.failed_callback_state, VIRTIO_ACTOR_FAILED);
+    require_u64("failed callback observed generation",
+                backend.failed_callback_generation, 1);
+    pthread_mutex_unlock(&backend.lock);
     require_int("notify after failed", virtio_actor_notify_queue(&actor, 0),
                 -EIO);
     require_u32("failed notify leaves no pending",
