@@ -360,7 +360,7 @@ test-virtio-rng-fault:
 
 .PHONY: test-virtio-blk-common
 test-virtio-blk-common:
-	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=1 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-blk-common.c virtio-mmio.c lock-order.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c vm-lifecycle.c -Wl,--gc-sections -o /tmp/test-virtio-blk-common $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=1 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-blk-common.c virtio-actor.c virtio-mmio.c lock-order.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c -Wl,--gc-sections -o /tmp/test-virtio-blk-common $(HOST_TEST_LDLIBS)
 	/tmp/test-virtio-blk-common
 
 .PHONY: test-vgpu-rect

@@ -137,30 +137,26 @@ static void virtio_blk_write_config(void *opaque,
     memcpy((uint8_t *) PRIV(vblk) + offset, &value, size);
 }
 
-static bool virtio_blk_queue_available(virtio_blk_state_t *vblk,
-                                       const struct virtq *queue,
-                                       uint16_t *available)
+static int virtio_blk_queue_available(virtio_blk_state_t *vblk,
+                                      struct virtq *queue,
+                                      uint16_t *available)
 {
     uint16_t avail_idx;
     uint16_t delta;
 
-    if (!queue || !queue->ready || !available)
-        return false;
+    if (!vblk || !queue || !queue->ready || !available)
+        return -EINVAL;
 
     if (!ram_dma_read(vblk->common.dma, queue->driver_addr + 2, &avail_idx,
-                      sizeof(avail_idx))) {
-        virtio_blk_set_fail(vblk);
-        return false;
-    }
+                      sizeof(avail_idx)))
+        return -EFAULT;
 
     delta = (uint16_t) (avail_idx - queue->last_avail);
-    if (delta > queue->queue_size) {
-        virtio_blk_set_fail(vblk);
-        return false;
-    }
+    if (delta > queue->queue_size)
+        return -EINVAL;
 
     *available = delta;
-    return true;
+    return 0;
 }
 
 static guest_size_t virtio_blk_iov_bytes(const struct virtq_iov *iov,
@@ -305,12 +301,132 @@ static int virtio_blk_process_chain(virtio_blk_state_t *vblk,
     return 0;
 }
 
-static void virtio_blk_drain_queue(virtio_blk_state_t *vblk,
-                                   struct virtq *queue)
+static bool virtio_blk_actor_generation_current(virtio_blk_state_t *vblk,
+                                                struct virtio_actor *actor,
+                                                uint64_t generation)
 {
+    (void) vblk;
+    return actor && virtio_actor_generation(actor) == generation;
+}
+
+static bool virtio_blk_queue_ready_for_actor(virtio_blk_state_t *vblk,
+                                             const struct virtq *queue)
+{
+    unsigned status;
+
+    if (!vblk || !queue || !queue->ready)
+        return false;
+
+    status = virtio_blk_status_load(vblk);
+    return !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) &&
+           (status & VIRTIO_STATUS__DRIVER_OK);
+}
+
+static bool virtio_blk_common_generation_current(virtio_blk_state_t *vblk,
+                                                 uint64_t generation)
+{
+    bool current;
+
+    if (!vblk || !vblk->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    current = vblk->common.generation == generation &&
+              !vblk->common.reset_in_progress;
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+    return current;
+}
+
+static bool virtio_blk_capture_common_generation(virtio_blk_state_t *vblk,
+                                                 uint64_t *generation)
+{
+    unsigned status;
+    bool current;
+
+    if (!vblk || !vblk->common.initialized || !generation)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    status = virtio_blk_status_load(vblk);
+    current = !vblk->common.reset_in_progress &&
+              (status & VIRTIO_STATUS__DRIVER_OK) &&
+              !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    if (current)
+        *generation = vblk->common.generation;
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+    return current;
+}
+
+static bool virtio_blk_begin_actor_completion(virtio_blk_state_t *vblk,
+                                              uint64_t actor_generation,
+                                              uint64_t common_generation)
+{
+    bool common_current;
+
+    if (!vblk || !vblk->actor_initialized || !vblk->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    common_current = vblk->common.generation == common_generation &&
+                     !vblk->common.reset_in_progress;
+    if (!common_current) {
+        pthread_mutex_unlock(&vblk->common.transport_lock);
+        return false;
+    }
+
+    if (!virtio_actor_begin_completion(&vblk->actor, actor_generation)) {
+        pthread_mutex_unlock(&vblk->common.transport_lock);
+        return false;
+    }
+    return true;
+}
+
+static void virtio_blk_end_actor_completion(virtio_blk_state_t *vblk)
+{
+    if (!vblk || !vblk->actor_initialized)
+        return;
+
+    virtio_actor_end_completion(&vblk->actor);
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+}
+
+static void virtio_blk_set_fail_for_actor(virtio_blk_state_t *vblk,
+                                          uint64_t actor_generation,
+                                          uint64_t common_generation)
+{
+    if (!virtio_blk_begin_actor_completion(vblk, actor_generation,
+                                           common_generation))
+        return;
+    virtio_blk_set_fail(vblk);
+    virtio_blk_end_actor_completion(vblk);
+}
+
+static int virtio_blk_actor_drain_queue(void *opaque,
+                                        struct virtio_actor *actor,
+                                        uint16_t queue_index,
+                                        uint64_t generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+    struct virtq *queue;
     struct virtq_iov readable[VBLK_QUEUE_NUM_MAX];
     struct virtq_iov writable[VBLK_QUEUE_NUM_MAX];
     bool consumed = false;
+    uint64_t common_generation = 0;
+
+    if (!vblk || queue_index != VBLK_QUEUE) {
+        if (vblk)
+            virtio_blk_set_fail(vblk);
+        return 0;
+    }
+
+    queue = &vblk->common.queues[VBLK_QUEUE];
+
+    if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+        return 0;
+    if (!virtio_blk_queue_ready_for_actor(vblk, queue))
+        return 0;
+    if (!virtio_blk_capture_common_generation(vblk, &common_generation))
+        return 0;
 
     for (;;) {
         struct virtq_chain chain = {
@@ -323,42 +439,139 @@ static void virtio_blk_drain_queue(virtio_blk_state_t *vblk,
         uint32_t used_len = 0;
         int ret;
 
-        if (!virtio_blk_queue_available(vblk, queue, &available))
-            return;
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
+        ret = virtio_blk_queue_available(vblk, queue, &available);
+        if (ret < 0) {
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
+        }
         if (available == 0)
             break;
 
         ret = virtq_pop(vblk->common.dma, queue, &chain);
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_blk_set_fail(vblk);
-            return;
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
         }
         if (ret == 0)
             break;
 
         ret = virtio_blk_process_chain(vblk, &chain, &used_len);
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_blk_set_fail(vblk);
-            return;
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
         }
 
-        if (virtq_add_used(vblk->common.dma, queue, chain.head, used_len) < 0) {
+        if (!virtio_blk_begin_actor_completion(vblk, generation,
+                                               common_generation))
+            return 0;
+        ret = virtq_add_used(vblk->common.dma, queue, chain.head, used_len);
+        if (ret < 0) {
             virtio_blk_set_fail(vblk);
-            return;
+            virtio_blk_end_actor_completion(vblk);
+            return 0;
         }
+        virtio_blk_end_actor_completion(vblk);
         consumed = true;
     }
 
-    if (consumed && !virtq_interrupt_suppressed(vblk->common.dma, queue))
-        virtio_irq_trigger(&vblk->common.irq, VIRTIO_INT__USED_RING);
+    if (consumed && virtio_blk_begin_actor_completion(vblk, generation,
+                                                      common_generation)) {
+        if (!virtq_interrupt_suppressed(vblk->common.dma, queue))
+            virtio_irq_trigger(&vblk->common.irq, VIRTIO_INT__USED_RING);
+        virtio_blk_end_actor_completion(vblk);
+    }
+    return 0;
 }
+
+static bool virtio_blk_actor_queue_has_work(void *opaque,
+                                            struct virtio_actor *actor,
+                                            uint16_t queue_index,
+                                            uint64_t generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+    uint16_t available = 0;
+    uint64_t common_generation = 0;
+    int ret;
+
+    if (!vblk || queue_index != VBLK_QUEUE)
+        return false;
+    if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+        return false;
+    if (!virtio_blk_queue_ready_for_actor(vblk,
+                                          &vblk->common.queues[VBLK_QUEUE]))
+        return false;
+    if (!virtio_blk_capture_common_generation(vblk, &common_generation))
+        return false;
+
+    ret = virtio_blk_queue_available(vblk, &vblk->common.queues[VBLK_QUEUE],
+                                     &available);
+    if (ret < 0) {
+        virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+        return false;
+    }
+    return available != 0;
+}
+
+static void virtio_blk_actor_failed(void *opaque,
+                                    struct virtio_actor *actor UNUSED)
+{
+    virtio_blk_state_t *vblk = opaque;
+
+    if (vblk)
+        virtio_blk_set_fail(vblk);
+}
+
+static const struct virtio_actor_ops virtio_blk_actor_ops = {
+    .drain_queue = virtio_blk_actor_drain_queue,
+    .queue_has_work = virtio_blk_actor_queue_has_work,
+    .on_failed = virtio_blk_actor_failed,
+};
 
 static int virtio_blk_activate(void *opaque,
                                const struct virtio_activation_context *ctx)
 {
-    (void) opaque;
+    virtio_blk_state_t *vblk = opaque;
+    int ret;
+
     (void) ctx;
-    return 0;
+
+    if (!vblk || !vblk->actor_initialized)
+        return -EINVAL;
+
+    ret = virtio_actor_start(&vblk->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vblk->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vblk->actor);
+}
+
+static int virtio_blk_prepare_reset(void *opaque,
+                                    uint64_t old_generation,
+                                    uint64_t new_generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (!vblk || !vblk->actor_initialized)
+        return 0;
+    return virtio_actor_reset(&vblk->actor);
 }
 
 static int virtio_blk_reset(void *opaque,
@@ -376,8 +589,7 @@ static int virtio_blk_notify_queue(void *opaque,
                                    uint64_t generation)
 {
     virtio_blk_state_t *vblk = opaque;
-    struct virtq *queue;
-    unsigned status;
+    int ret;
 
     (void) generation;
 
@@ -387,21 +599,17 @@ static int virtio_blk_notify_queue(void *opaque,
         return -EINVAL;
     }
 
-    status = virtio_blk_status_load(vblk);
-    queue = &vblk->common.queues[VBLK_QUEUE];
-    if (status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+    ret = virtio_actor_notify_queue(&vblk->actor, queue_index);
+    if (ret == 0 || ret == -EAGAIN)
         return 0;
-    if (!(status & VIRTIO_STATUS__DRIVER_OK) || !queue->ready) {
-        virtio_blk_set_fail(vblk);
-        return -EINVAL;
-    }
 
-    virtio_blk_drain_queue(vblk, queue);
-    return 0;
+    virtio_blk_set_fail(vblk);
+    return ret;
 }
 
 static const struct virtio_device_ops virtio_blk_ops = {
     .activate = virtio_blk_activate,
+    .prepare_reset = virtio_blk_prepare_reset,
     .reset = virtio_blk_reset,
     .notify_queue = virtio_blk_notify_queue,
     .read_config = virtio_blk_read_config,
@@ -621,6 +829,14 @@ uint32_t *virtio_blk_init(virtio_blk_state_t *vblk,
         exit(2);
     }
 
+    if (virtio_actor_init(&vblk->actor, &virtio_blk_actor_ops, vblk,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vblk->common);
+        fprintf(stderr, "Failed to initialize virtio-blk actor.\n");
+        exit(2);
+    }
+    vblk->actor_initialized = true;
+
     return disk_mem;
 }
 
@@ -628,6 +844,12 @@ void virtio_blk_destroy(virtio_blk_state_t *vblk)
 {
     if (!vblk)
         return;
+
+    if (vblk->actor_initialized) {
+        virtio_actor_stop(&vblk->actor);
+        virtio_actor_destroy(&vblk->actor);
+        vblk->actor_initialized = false;
+    }
 
     virtio_device_common_destroy(&vblk->common);
     if (vblk->priv && vblk_dev_cnt > 0)

@@ -160,6 +160,8 @@ bool virtio_net_init(virtio_net_state_t *vnet, const char *name);
 
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
     uint32_t *disk;
