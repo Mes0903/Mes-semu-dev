@@ -159,6 +159,74 @@ static void test_completion_fifo_generation_and_wake(void)
     CHECK(!vgpu_renderer_pop_completion(&out));
 }
 
+static void test_completion_preserves_virgl_resource_side_effect_metadata(void)
+{
+    reset_test_counters();
+    vgpu_renderer_reset_queues(9);
+
+    struct vgpu_renderer_completion completion = test_completion(32, 9);
+    completion.type = VGPU_RENDERER_DONE_VIRGL_RESOURCE;
+    completion.virgl_resource.type =
+        VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT;
+    completion.virgl_resource.resource_id = 0x1234;
+    completion.virgl_resource.resource_generation =
+        UINT64_C(0x1122334455667788);
+    completion.virgl_resource.backing_transition_success = true;
+    completion.virgl_resource.scanout_id = 3;
+    completion.virgl_resource.scanout_generation = UINT64_C(0x8877665544332211);
+    completion.virgl_resource.rect = (struct virtio_gpu_rect) {
+        .x = 10, .y = 20, .width = 640, .height = 480};
+    completion.virgl_resource.scanout_count = 1;
+    completion.virgl_resource.scanouts[0].scanout_id = 3;
+    completion.virgl_resource.scanouts[0].scanout_generation =
+        UINT64_C(0xaabbccddeeff0011);
+    completion.virgl_resource.scanouts[0].scanout =
+        (struct virtio_gpu_scanout_info) {
+            .width = 800,
+            .height = 600,
+            .enabled = 1,
+            .primary_resource_id = 0x1234,
+            .cursor_resource_id = 0x5678,
+            .src_x = 4,
+            .src_y = 5,
+            .src_w = 320,
+            .src_h = 240,
+        };
+
+    CHECK(vgpu_renderer_complete(&completion));
+
+    struct vgpu_renderer_completion out;
+    CHECK(vgpu_renderer_pop_completion(&out));
+    CHECK(out.type == VGPU_RENDERER_DONE_VIRGL_RESOURCE);
+    CHECK(out.virgl_resource.type ==
+          VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT);
+    CHECK(out.virgl_resource.resource_id == 0x1234);
+    CHECK(out.virgl_resource.resource_generation ==
+          UINT64_C(0x1122334455667788));
+    CHECK(out.virgl_resource.backing_transition_success);
+    CHECK(out.virgl_resource.scanout_id == 3);
+    CHECK(out.virgl_resource.scanout_generation ==
+          UINT64_C(0x8877665544332211));
+    CHECK(out.virgl_resource.rect.x == 10);
+    CHECK(out.virgl_resource.rect.y == 20);
+    CHECK(out.virgl_resource.rect.width == 640);
+    CHECK(out.virgl_resource.rect.height == 480);
+    CHECK(out.virgl_resource.scanout_count == 1);
+    CHECK(out.virgl_resource.scanouts[0].scanout_id == 3);
+    CHECK(out.virgl_resource.scanouts[0].scanout_generation ==
+          UINT64_C(0xaabbccddeeff0011));
+    CHECK(out.virgl_resource.scanouts[0].scanout.width == 800);
+    CHECK(out.virgl_resource.scanouts[0].scanout.height == 600);
+    CHECK(out.virgl_resource.scanouts[0].scanout.enabled == 1);
+    CHECK(out.virgl_resource.scanouts[0].scanout.primary_resource_id == 0x1234);
+    CHECK(out.virgl_resource.scanouts[0].scanout.cursor_resource_id == 0x5678);
+    CHECK(out.virgl_resource.scanouts[0].scanout.src_x == 4);
+    CHECK(out.virgl_resource.scanouts[0].scanout.src_y == 5);
+    CHECK(out.virgl_resource.scanouts[0].scanout.src_w == 320);
+    CHECK(out.virgl_resource.scanouts[0].scanout.src_h == 240);
+    CHECK(!vgpu_renderer_pop_completion(&out));
+}
+
 static void test_frontend_wake_runs_outside_queue_lock(void)
 {
     reset_test_counters();
@@ -356,6 +424,7 @@ int main(void)
     test_capacity_covers_full_gpu_queue_burst();
     test_request_fifo_and_wake();
     test_completion_fifo_generation_and_wake();
+    test_completion_preserves_virgl_resource_side_effect_metadata();
     test_frontend_wake_runs_outside_queue_lock();
     test_full_request_queue_rejects_newest();
     test_full_completion_queue_releases_newest_response();
