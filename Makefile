@@ -14,6 +14,20 @@ OBJS_EXTRA :=
 
 LDFLAGS :=
 
+SANITIZE ?=
+SANITIZE_VALUE := $(strip $(SANITIZE))
+ifneq ($(SANITIZE_VALUE),)
+ifneq ($(words $(SANITIZE_VALUE)),1)
+$(error Invalid SANITIZE="$(SANITIZE)". Set exactly one of: address thread)
+endif
+ifneq ($(filter address thread,$(SANITIZE_VALUE)),$(SANITIZE_VALUE))
+$(error Unsupported SANITIZE="$(SANITIZE)". Supported values: address thread)
+endif
+SANITIZE_FLAGS := -fsanitize=$(SANITIZE_VALUE) -fno-omit-frame-pointer
+CFLAGS += $(SANITIZE_FLAGS)
+LDFLAGS += $(SANITIZE_FLAGS)
+endif
+
 CFLAGS += -pthread
 LDFLAGS += -pthread
 
@@ -258,6 +272,8 @@ phase6-runtime-contract-test:
 
 HOST_TEST_CFLAGS := -std=c11 -O2 -g -Wall -Wextra -pthread -I. -include common.h $(DT_CFLAGS)
 HOST_TEST_LDLIBS := -lm -pthread
+HOST_TEST_CFLAGS += $(SANITIZE_FLAGS)
+HOST_TEST_LDLIBS += $(SANITIZE_FLAGS)
 
 .PHONY: test-mmio-bus
 test-mmio-bus:
