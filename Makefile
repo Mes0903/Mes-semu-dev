@@ -4,6 +4,7 @@ include mk/check-libs.mk
 CC ?= gcc
 CFLAGS := -O2 -g -Wall -Wextra
 CFLAGS += -include common.h
+PKG_CONFIG ?= pkg-config
 
 # clock frequency
 CLOCK_FREQ ?= 65000000
@@ -222,6 +223,27 @@ endif
 # virtio-gpu
 ENABLE_VIRTIOGPU ?= 1
 $(call set-feature, VIRTIOGPU)
+
+# VirGL/virtio-gpu 3D support is intentionally default-off. Turning this on
+# only compiles gated 3D substrate until a complete renderer backend is wired.
+ENABLE_VIRGL ?= 0
+VIRGL_PKGS := virglrenderer epoxy gl egl
+VIRGL_CFLAGS :=
+VIRGL_LIBS :=
+ifeq ($(call has, VIRGL), 1)
+    ifneq ($(call has, VIRTIOGPU), 1)
+        $(error ENABLE_VIRGL=1 requires ENABLE_VIRTIOGPU=1)
+    endif
+    ifneq (0,$(shell $(PKG_CONFIG) --exists $(VIRGL_PKGS) >/dev/null 2>&1; echo $$?))
+        $(error ENABLE_VIRGL=1 requires pkg-config packages: $(VIRGL_PKGS))
+    endif
+    VIRGL_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(VIRGL_PKGS))
+    VIRGL_LIBS := $(shell $(PKG_CONFIG) --libs $(VIRGL_PKGS))
+    CFLAGS += $(VIRGL_CFLAGS)
+    LDFLAGS += $(VIRGL_LIBS)
+endif
+$(call set-feature, VIRGL)
+
 ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu.o
     OBJS_EXTRA += virtio-gpu-sw.o
@@ -378,6 +400,12 @@ test-vgpu-error-policy:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c vgpu-display.c vgpu-rect.c -Wl,--gc-sections -o /tmp/test-vgpu-error-policy $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-error-policy
 
+.PHONY: test-vgpu-virgl-gate
+test-vgpu-virgl-gate:
+	$(Q)bash tests/test-vgpu-virgl-make-gate.sh
+	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c vgpu-display.c vgpu-rect.c -Wl,--gc-sections -o /tmp/test-vgpu-virgl-gate $(HOST_TEST_LDLIBS)
+	/tmp/test-vgpu-virgl-gate
+
 VGPU_COPY_BENCH_SCALE ?= 1
 .PHONY: bench-vgpu-copy
 bench-vgpu-copy:
@@ -414,7 +442,14 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-virgl-gate test-debug-gate test-executor-config test-hart-executor
+
+.PHONY: print-vgpu-virgl-config
+print-vgpu-virgl-config:
+	@printf 'SEMU_FEATURE_VIRGL=%s\n' '$(call has, VIRGL)'
+	@printf 'VIRGL_PKGS=%s\n' '$(VIRGL_PKGS)'
+	@printf 'VIRGL_CFLAGS=%s\n' '$(VIRGL_CFLAGS)'
+	@printf 'VIRGL_LIBS=%s\n' '$(VIRGL_LIBS)'
 
 OBJS := \
 	riscv.o \

@@ -119,6 +119,15 @@ static void require_u32(const char *name, uint32_t got, uint32_t want)
     exit(1);
 }
 
+static void require_u16(const char *name, uint16_t got, uint16_t want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got 0x%x, want 0x%x\n", name, got, want);
+    exit(1);
+}
+
 static void require_false(const char *name, bool got)
 {
     if (!got)
@@ -183,6 +192,37 @@ static void destroy_vgpu_test_state(emu_state_t *emu, virtio_gpu_state_t *vgpu)
 {
     virtio_gpu_destroy(vgpu);
     pthread_mutex_destroy(&emu->plic_lock);
+}
+
+static uint16_t load_u16(const uint32_t *ram, uint32_t addr)
+{
+    uint16_t value;
+
+    memcpy(&value, (const uint8_t *) ram + addr, sizeof(value));
+    return value;
+}
+
+static uint32_t load_u32(const uint32_t *ram, uint32_t addr)
+{
+    uint32_t value;
+
+    memcpy(&value, (const uint8_t *) ram + addr, sizeof(value));
+    return value;
+}
+
+static void configure_test_queue(emu_state_t *emu,
+                                 virtio_gpu_state_t *vgpu,
+                                 uint16_t queue_index)
+{
+    const guest_paddr_t desc_addr = 0x100;
+    const guest_paddr_t driver_addr = 0x200;
+    const guest_paddr_t device_addr = 0x300;
+
+    require_int(
+        "configure queue",
+        virtq_configure(&vgpu->common.queues[queue_index], &emu->ram_dma, 8,
+                        desc_addr, driver_addr, device_addr, 0),
+        0);
 }
 
 static void test_vgpu_debug_counters_init_and_reset_to_zero(void)
@@ -356,6 +396,81 @@ static void test_vgpu_invalid_actor_notify_counts_einval(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_vgpu_virgl_gate_keeps_unsupported_features_hidden(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    uint32_t num_capsets;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+
+    require_u64("VirGL feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
+    require_u64("context-init feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    virtio_gpu_set_num_capsets(&vgpu, 5);
+    num_capsets = vgpu.common.ops->read_config(
+        vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    require_u32("no capsets without renderer backend", num_capsets, 0);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_deferred_ctrl_completion_revalidates_generations(void)
+{
+    uint32_t ram[256] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtio_gpu_deferred_ctrl_completion completion;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+
+    completion = (struct virtio_gpu_deferred_ctrl_completion) {
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = 3,
+        .len = 0x44,
+        .actor_generation = virtio_actor_generation(&vgpu.actor),
+        .common_generation = vgpu.common.generation,
+        .trigger_irq = true,
+    };
+    require_int("current deferred completion",
+                virtio_gpu_complete_deferred_ctrl(&vgpu, &completion), 0);
+    require_u16("used idx after current completion", load_u16(ram, 0x302), 1);
+    require_u32("used elem id", load_u32(ram, 0x304), 3);
+    require_u32("used elem len", load_u32(ram, 0x308), 0x44);
+    require_u32(
+        "used-ring irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING,
+        VIRTIO_INT__USED_RING);
+
+    completion.common_generation--;
+    completion.desc_head = 4;
+    completion.len = 0x88;
+    require_int("stale common generation completion",
+                virtio_gpu_complete_deferred_ctrl(&vgpu, &completion),
+                -ECANCELED);
+    require_u16("used idx unchanged by stale common completion",
+                load_u16(ram, 0x302), 1);
+
+    completion.common_generation = vgpu.common.generation;
+    completion.actor_generation++;
+    require_int("stale actor generation completion",
+                virtio_gpu_complete_deferred_ctrl(&vgpu, &completion),
+                -ECANCELED);
+    require_u16("used idx unchanged by stale actor completion",
+                load_u16(ram, 0x302), 1);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_vgpu_destroy_releases_common_without_actor(void)
 {
     static const uint16_t queue_max_sizes[] = {8, 8};
@@ -415,6 +530,8 @@ int main(void)
     test_vgpu_actor_failure_marks_device_reset_needed();
     test_vgpu_failed_actor_notify_counts_eio();
     test_vgpu_invalid_actor_notify_counts_einval();
+    test_vgpu_virgl_gate_keeps_unsupported_features_hidden();
+    test_deferred_ctrl_completion_revalidates_generations();
     test_vgpu_destroy_releases_common_without_actor();
     test_vgpu_destroy_stops_started_actor_and_is_idempotent();
     return 0;

@@ -340,6 +340,43 @@ static void test_lifecycle_publish_result_classification(void)
                       VGPU_DISPLAY_PUBLISH_BACKPRESSURE));
 }
 
+static void test_gl_payload_metadata_survives_display_queue(void)
+{
+    struct vgpu_display_payload *payload =
+        alloc_display_payload("gl payload alloc");
+    struct vgpu_display_cmd cmd;
+
+    payload->type = VGPU_DISPLAY_PAYLOAD_GL;
+    payload->gl.texture_id = 42;
+    payload->gl.width = 640;
+    payload->gl.height = 480;
+    payload->gl.src_x = 1;
+    payload->gl.src_y = 2;
+    payload->gl.src_width = 320;
+    payload->gl.src_height = 240;
+    payload->gl.y_0_top = true;
+
+    require_publish_result("gl primary publish",
+                           vgpu_display_publish_primary_set(0, payload),
+                           VGPU_DISPLAY_PUBLISH_OK);
+    require_true("gl primary pop", vgpu_display_pop_cmd(&cmd));
+    require_u32("gl command type", cmd.type, VGPU_DISPLAY_CMD_PRIMARY_SET);
+    require_u32("gl payload type", cmd.u.primary_set.payload->type,
+                VGPU_DISPLAY_PAYLOAD_GL);
+    require_u32("gl texture id", cmd.u.primary_set.payload->gl.texture_id, 42);
+    require_u32("gl width", cmd.u.primary_set.payload->gl.width, 640);
+    require_u32("gl height", cmd.u.primary_set.payload->gl.height, 480);
+    require_u32("gl source x", cmd.u.primary_set.payload->gl.src_x, 1);
+    require_u32("gl source y", cmd.u.primary_set.payload->gl.src_y, 2);
+    require_u32("gl source width", cmd.u.primary_set.payload->gl.src_width,
+                320);
+    require_u32("gl source height", cmd.u.primary_set.payload->gl.src_height,
+                240);
+    require_true("gl y_0_top", cmd.u.primary_set.payload->gl.y_0_top);
+
+    vgpu_display_release_cmd(&cmd);
+}
+
 static void test_display_shutdown_after_producer_stopped_drains_payloads(void)
 {
     struct vgpu_display_payload *primary =
@@ -348,9 +385,9 @@ static void test_display_shutdown_after_producer_stopped_drains_payloads(void)
         alloc_display_payload("cursor payload alloc");
     struct vgpu_display_cmd cmd;
 
-    require_publish_result(
-        "primary publish before shutdown",
-        vgpu_display_publish_primary_set(0, primary), VGPU_DISPLAY_PUBLISH_OK);
+    require_publish_result("primary publish before shutdown",
+                           vgpu_display_publish_primary_set(0, primary),
+                           VGPU_DISPLAY_PUBLISH_OK);
     require_publish_result(
         "cursor publish before shutdown",
         vgpu_display_publish_cursor_set(0, cursor, 1, 2, 3, 4),
@@ -361,16 +398,15 @@ static void test_display_shutdown_after_producer_stopped_drains_payloads(void)
     vgpu_display_shutdown_after_producer_stopped();
     vgpu_display_count_free = false;
 
-    require_u32("shutdown releases queued payloads",
-                vgpu_display_free_calls, 2);
+    require_u32("shutdown releases queued payloads", vgpu_display_free_calls,
+                2);
     require_false("shutdown drains display queue", vgpu_display_pop_cmd(&cmd));
 
     struct vgpu_display_payload *late =
         alloc_display_payload("late payload alloc");
-    require_publish_result(
-        "primary publish after shutdown unavailable",
-        vgpu_display_publish_primary_set(0, late),
-        VGPU_DISPLAY_PUBLISH_UNAVAILABLE);
+    require_publish_result("primary publish after shutdown unavailable",
+                           vgpu_display_publish_primary_set(0, late),
+                           VGPU_DISPLAY_PUBLISH_UNAVAILABLE);
     free(late);
     require_publish_result("primary clear after shutdown unavailable",
                            vgpu_display_publish_primary_clear(0),
@@ -393,6 +429,7 @@ int main(void)
     test_primary_bind_requires_generation_advance();
     test_primary_clear_requires_published_clear();
     test_lifecycle_publish_result_classification();
+    test_gl_payload_metadata_survives_display_queue();
     test_display_shutdown_after_producer_stopped_drains_payloads();
     return 0;
 }

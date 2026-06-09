@@ -17,6 +17,11 @@
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 
+#define VIRTIO_GPU_F_VIRGL (UINT64_C(1) << 0)
+#define VIRTIO_GPU_F_EDID (UINT64_C(1) << 1)
+#define VIRTIO_GPU_F_CONTEXT_INIT (UINT64_C(1) << 4)
+#define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
+
 /* Common virtq already bounds a descriptor chain by queue size. Keep the
  * backend descriptor view large enough for the full GPU queue so Linux
  * scatter-gather control buffers are not rejected solely because they exceed
@@ -42,6 +47,7 @@ struct virtio_gpu_scanout_info {
 typedef struct {
     struct virtio_gpu_scanout_info scanouts[VIRTIO_GPU_MAX_SCANOUTS];
     uint32_t num_scanouts;
+    uint32_t num_capsets;
 } virtio_gpu_data_t;
 
 PACKED(struct virtio_gpu_config {
@@ -310,6 +316,15 @@ enum virtio_gpu_formats {
     VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM = 134
 };
 
+struct virtio_gpu_deferred_ctrl_completion {
+    uint16_t queue_index;
+    uint32_t desc_head;
+    uint32_t len;
+    uint64_t actor_generation;
+    uint64_t common_generation;
+    bool trigger_irq;
+};
+
 typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
                                     struct virtq_desc *vq_desc,
                                     uint32_t *plen);
@@ -378,6 +393,10 @@ uint32_t virtio_gpu_write_ctrl_response(
     uint32_t type);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
+int virtio_gpu_complete_deferred_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_deferred_ctrl_completion *completion);
 struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
     virtio_gpu_state_t *vgpu);
 

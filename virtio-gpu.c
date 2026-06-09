@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -19,11 +20,7 @@
 
 #define VIRTIO_GPU_CMD_TRACE_ENABLED 0
 
-#define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
-
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
-#define VIRTIO_GPU_F_EDID (1 << 1)
-#define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
@@ -75,6 +72,29 @@ static void virtio_gpu_init_display_counters(
     atomic_init(&counters->publish_can_publish_false, 0);
     atomic_init(&counters->dirty_merges, 0);
     atomic_init(&counters->full_resync_escalations, 0);
+}
+
+static bool virtio_gpu_virgl_runtime_ready(void)
+{
+#if SEMU_HAS(VIRGL)
+    /* The build gate exists, but guest-visible VirGL remains disabled until
+     * the renderer backend, GL owner handoff, fences, reset, and capsets are
+     * all wired in this actor/common-transport branch.
+     */
+    return false;
+#else
+    return false;
+#endif
+}
+
+static uint64_t virtio_gpu_device_features(void)
+{
+    uint64_t features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1;
+
+    if (virtio_gpu_virgl_runtime_ready())
+        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT;
+
+    return features;
 }
 
 static void virtio_gpu_init_actor_debug_counters(
@@ -222,6 +242,15 @@ void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu)
         virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets)
+{
+    if (!vgpu || !vgpu->priv)
+        return;
+
+    PRIV(vgpu)->num_capsets =
+        virtio_gpu_virgl_runtime_ready() ? num_capsets : 0;
+}
+
 bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu)
 {
     return vgpu && vgpu->actor_initialized &&
@@ -246,6 +275,69 @@ int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu)
     if (!vgpu || !vgpu->actor_initialized)
         return -EINVAL;
     return virtio_actor_end_completion(&vgpu->actor);
+}
+
+static bool virtio_gpu_begin_actor_generation_completion(
+    virtio_gpu_state_t *vgpu,
+    uint64_t generation)
+{
+    bool accepted = vgpu && vgpu->actor_initialized &&
+                    virtio_actor_begin_completion(&vgpu->actor, generation);
+
+    if (vgpu && !accepted)
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_completion_rejected);
+    return accepted;
+}
+
+int virtio_gpu_complete_deferred_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_deferred_ctrl_completion *completion)
+{
+    struct virtq *queue;
+    int ret;
+
+    if (!vgpu || !completion || !vgpu->actor_initialized)
+        return -EINVAL;
+
+    ret = pthread_mutex_lock(&vgpu->common.transport_lock);
+    if (ret != 0)
+        return -ret;
+
+    if (completion->common_generation != vgpu->common.generation ||
+        vgpu->common.reset_in_progress ||
+        completion->queue_index >= vgpu->common.num_queues) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_stale_generation);
+        return -ECANCELED;
+    }
+
+    queue = &vgpu->common.queues[completion->queue_index];
+    if (!queue->ready ||
+        (virtio_gpu_status_load(vgpu) & VIRTIO_STATUS__DEVICE_NEEDS_RESET)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    if (!virtio_gpu_begin_actor_generation_completion(
+            vgpu, completion->actor_generation)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    ret = virtq_add_used(vgpu->common.dma, queue, completion->desc_head,
+                         completion->len);
+    if (ret == 0 && completion->trigger_irq &&
+        !virtq_interrupt_suppressed(vgpu->common.dma, queue))
+        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+
+    virtio_gpu_end_actor_completion(vgpu);
+    pthread_mutex_unlock(&vgpu->common.transport_lock);
+
+    if (ret < 0)
+        virtio_gpu_set_fail(vgpu);
+    return ret;
 }
 
 void *virtio_gpu_get_request(virtio_gpu_state_t *vgpu,
@@ -1111,7 +1203,8 @@ static uint32_t virtio_gpu_read_config(void *opaque,
         .events_read = 0,
         .events_clear = 0,
         .num_scanouts = PRIV(vgpu)->num_scanouts,
-        .num_capsets = 0,
+        .num_capsets =
+            virtio_gpu_virgl_runtime_ready() ? PRIV(vgpu)->num_capsets : 0,
     };
     uint32_t value = 0;
 
@@ -1386,7 +1479,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         .irq_source = SEMU_IRQ_SOURCE_VGPU,
         .device_id = 16,
         .vendor_id = VIRTIO_VENDOR_ID,
-        .device_features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1,
+        .device_features = virtio_gpu_device_features(),
         .required_features = VIRTIO_GPU_F_VERSION_1,
         .queue_max_sizes = queue_max_sizes,
         .num_queues = ARRAY_SIZE(queue_max_sizes),

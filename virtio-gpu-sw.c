@@ -560,6 +560,7 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
         return NULL;
     }
 
+    payload->type = VGPU_DISPLAY_PAYLOAD_CPU;
     payload->cpu.format = res_2d->format;
     payload->cpu.width = width;
     payload->cpu.height = height;

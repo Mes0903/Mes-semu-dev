@@ -25,15 +25,30 @@ struct vgpu_display_cpu_payload {
     uint8_t *pixels;
 };
 
+/* Immutable GL scanout metadata. The GL object remains owned by the future
+ * window/GL renderer path; this bridge only transports the handle and source
+ * view needed to retain the scanout on the consumer side.
+ */
+struct vgpu_display_gl_payload {
+    uint32_t texture_id;
+    uint32_t width, height;
+    uint32_t src_x, src_y, src_width, src_height;
+    bool y_0_top;
+};
+
+enum vgpu_display_payload_type {
+    VGPU_DISPLAY_PAYLOAD_CPU = 0,
+    VGPU_DISPLAY_PAYLOAD_GL,
+};
+
 /* Owning payload object passed through the display queue. The bridge queues
  * and disposes this object, while GPU and window backends only fill or
  * consume the payload it carries.
  */
 struct vgpu_display_payload {
+    enum vgpu_display_payload_type type;
     struct vgpu_display_cpu_payload cpu;
-    /* TODO: Add a GL/virgl payload when 3D scanout is implemented. The display
-     * bridge currently transports CPU-owned 2D frames only.
-     */
+    struct vgpu_display_gl_payload gl;
 };
 
 enum vgpu_display_publish_result {
