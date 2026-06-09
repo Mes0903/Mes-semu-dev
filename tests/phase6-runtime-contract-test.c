@@ -10,6 +10,52 @@
 #include "../main.c"
 #undef main
 
+
+static bool gdbstub_init_result;
+static bool gdbstub_run_result;
+static int gdbstub_init_calls;
+static int gdbstub_run_calls;
+static int gdbstub_close_calls;
+
+void u8250_update_interrupts(u8250_state_t *uart UNUSED)
+{
+}
+
+void u8250_check_ready(u8250_state_t *uart UNUSED)
+{
+}
+
+void u8250_flush_out(u8250_state_t *uart UNUSED)
+{
+}
+
+void semu_irq_source_set(emu_state_t *emu UNUSED,
+                         enum semu_irq_source source UNUSED,
+                         bool level UNUSED)
+{
+}
+
+bool gdbstub_init(gdbstub_t *gdbstub UNUSED,
+                  struct target_ops *ops UNUSED,
+                  arch_info_t arch UNUSED,
+                  char *s UNUSED)
+{
+    gdbstub_init_calls++;
+    return gdbstub_init_result;
+}
+
+bool gdbstub_run(gdbstub_t *gdbstub UNUSED, void *args UNUSED)
+{
+    gdbstub_run_calls++;
+    return gdbstub_run_result;
+}
+
+void gdbstub_close(gdbstub_t *gdbstub UNUSED)
+{
+    gdbstub_close_calls++;
+}
+
+
 static void require_bool(const char *name, bool got, bool want)
 {
     if (got == want)
@@ -113,6 +159,9 @@ static void test_single_hart_wfi_clears_wait_flag_with_interrupt(void)
 static int lifecycle_stop_start_calls;
 static int lifecycle_stop_request_stop_calls;
 static int lifecycle_stop_join_calls;
+static int lifecycle_start_failure_start_calls;
+static int lifecycle_start_failure_request_stop_calls;
+static int lifecycle_start_failure_join_calls;
 static emu_state_t *lifecycle_stop_expected_emu;
 
 static int lifecycle_stop_start(struct emu_state *emu)
@@ -146,6 +195,104 @@ static const struct hart_executor_ops lifecycle_stop_ops = {
     .join = lifecycle_stop_join,
 };
 
+static int lifecycle_start_failure_start(struct emu_state *emu)
+{
+    lifecycle_start_failure_start_calls++;
+    require_int("start failure lifecycle running before start",
+                semu_vm_lifecycle_state(&emu->lifecycle), SEMU_VM_RUNNING);
+    require_bool("start failure accepting before start",
+                 semu_vm_accepting_device_work(&emu->lifecycle), true);
+    return -EIO;
+}
+
+static void lifecycle_start_failure_request_stop(struct emu_state *emu)
+{
+    lifecycle_start_failure_request_stop_calls++;
+    semu_set_stopped(emu, true);
+}
+
+static int lifecycle_start_failure_join(struct emu_state *emu UNUSED)
+{
+    lifecycle_start_failure_join_calls++;
+    return 0;
+}
+
+static const struct hart_executor_ops lifecycle_start_failure_ops = {
+    .start = lifecycle_start_failure_start,
+    .request_stop = lifecycle_start_failure_request_stop,
+    .join = lifecycle_start_failure_join,
+};
+
+
+static void test_threaded_start_failure_leaves_lifecycle_failed(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.executor.ops = &lifecycle_start_failure_ops;
+    lifecycle_start_failure_start_calls = 0;
+    lifecycle_start_failure_request_stop_calls = 0;
+    lifecycle_start_failure_join_calls = 0;
+
+    semu_run_threaded(&emu);
+
+    require_int("start failure start called", lifecycle_start_failure_start_calls,
+                1);
+    require_int("start failure request_stop called",
+                lifecycle_start_failure_request_stop_calls, 1);
+    require_int("start failure join called", lifecycle_start_failure_join_calls,
+                1);
+    require_int("start failure exit code", emu.exit_code, 1);
+    require_int("start failure lifecycle failed",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_FAILED);
+    require_bool("start failure lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
+static void test_single_thread_runtime_exit_stops_lifecycle(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.executor_backend = HART_EXEC_SINGLE_THREAD;
+    semu_set_stopped(&emu, true);
+
+    semu_run(&emu);
+
+    require_int("single-thread exit code", emu.exit_code, 0);
+    require_int("single-thread lifecycle stopped",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPED);
+    require_bool("single-thread lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
+static void test_debug_runtime_exit_stops_lifecycle(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.vm.n_hart = 1;
+    gdbstub_init_result = true;
+    gdbstub_run_result = true;
+    gdbstub_init_calls = 0;
+    gdbstub_run_calls = 0;
+    gdbstub_close_calls = 0;
+
+    semu_run_debug(&emu);
+
+    require_int("debug init called", gdbstub_init_calls, 1);
+    require_int("debug run called", gdbstub_run_calls, 1);
+    require_int("debug close called", gdbstub_close_calls, 1);
+    require_int("debug exit code", emu.exit_code, 0);
+    require_int("debug lifecycle stopped",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPED);
+    require_bool("debug lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 static void test_runtime_enters_running_before_threaded_executor_start(void)
 {
     emu_state_t emu;
@@ -178,6 +325,9 @@ int main(void)
     test_runtime_follows_explicit_executor_backend();
     test_single_hart_wfi_does_not_block_without_interrupt();
     test_single_hart_wfi_clears_wait_flag_with_interrupt();
+    test_threaded_start_failure_leaves_lifecycle_failed();
+    test_single_thread_runtime_exit_stops_lifecycle();
+    test_debug_runtime_exit_stops_lifecycle();
     test_runtime_enters_running_before_threaded_executor_start();
     return 0;
 }

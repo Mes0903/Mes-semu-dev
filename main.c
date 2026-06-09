@@ -270,6 +270,48 @@ static int semu_enter_runtime_running(emu_state_t *emu)
     return semu_vm_lifecycle_enter_running(&emu->lifecycle);
 }
 
+static void semu_runtime_enter_stopping(emu_state_t *emu)
+{
+    enum semu_vm_lifecycle_state state;
+
+    if (!emu)
+        return;
+
+    state = semu_vm_lifecycle_state(&emu->lifecycle);
+    if (state == SEMU_VM_STOPPING || state == SEMU_VM_STOPPED ||
+        state == SEMU_VM_FAILED)
+        return;
+
+    (void) semu_vm_lifecycle_enter_stopping(&emu->lifecycle);
+}
+
+static void semu_runtime_enter_stopped(emu_state_t *emu)
+{
+    enum semu_vm_lifecycle_state state;
+
+    if (!emu)
+        return;
+
+    semu_runtime_enter_stopping(emu);
+    state = semu_vm_lifecycle_state(&emu->lifecycle);
+    if (state == SEMU_VM_STOPPING)
+        (void) semu_vm_lifecycle_enter_stopped(&emu->lifecycle);
+}
+
+static void semu_runtime_enter_failed(emu_state_t *emu)
+{
+    enum semu_vm_lifecycle_state state;
+
+    if (!emu)
+        return;
+
+    state = semu_vm_lifecycle_state(&emu->lifecycle);
+    if (state == SEMU_VM_STOPPED || state == SEMU_VM_FAILED)
+        return;
+
+    (void) semu_vm_lifecycle_enter_failed(&emu->lifecycle);
+}
+
 static void semu_lifecycle_notify(emu_state_t *emu)
 {
     pthread_mutex_lock(&emu->lifecycle.lock);
@@ -2838,6 +2880,7 @@ static void semu_run_threaded(emu_state_t *emu)
     if (ret < 0) {
         errno = -ret;
         perror("hart executor start");
+        semu_runtime_enter_failed(emu);
         hart_executor_request_stop(emu);
         hart_executor_join(emu);
         emu->exit_code = 1;
@@ -2852,17 +2895,16 @@ static void semu_run_threaded(emu_state_t *emu)
         poll(NULL, 0, 10);
     }
 
-    if (!semu_lifecycle_terminal(semu_vm_lifecycle_state(&emu->lifecycle)))
-        (void) semu_vm_lifecycle_enter_stopping(&emu->lifecycle);
+    semu_runtime_enter_stopping(emu);
 
     hart_executor_request_stop(emu);
     hart_executor_join(emu);
 
     if (emu_threaded_fatal_load(emu)) {
-        (void) semu_vm_lifecycle_enter_failed(&emu->lifecycle);
+        semu_runtime_enter_failed(emu);
         emu->exit_code = 1;
     } else {
-        (void) semu_vm_lifecycle_enter_stopped(&emu->lifecycle);
+        semu_runtime_enter_stopped(emu);
         emu->exit_code = 0;
     }
 }
@@ -2917,6 +2959,7 @@ static void semu_run(emu_state_t *emu)
 
                 ret = semu_run_chunk(emu, steps, &next_hart);
                 if (ret) {
+                    semu_runtime_enter_failed(emu);
                     emu->exit_code = ret;
                     return;
                 }
@@ -2926,13 +2969,14 @@ static void semu_run(emu_state_t *emu)
         {
             ret = semu_run_chunk(emu, SEMU_SINGLE_SLICE_STEPS, &next_hart);
             if (ret) {
+                semu_runtime_enter_failed(emu);
                 emu->exit_code = ret;
                 return;
             }
         }
     }
 
-    /* unreachable */
+    semu_runtime_enter_stopped(emu);
     emu->exit_code = 0;
 }
 
@@ -3109,6 +3153,11 @@ static void semu_run_debug(emu_state_t *emu)
 
     __atomic_store_n(&emu->is_interrupted, false, __ATOMIC_RELAXED);
     bool ok = gdbstub_run(&gdbstub, (void *) emu);
+
+    if (ok)
+        semu_runtime_enter_stopped(emu);
+    else
+        semu_runtime_enter_failed(emu);
 
     gdbstub_close(&gdbstub);
 
