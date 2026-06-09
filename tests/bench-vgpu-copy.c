@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +91,20 @@ static double seconds_between(struct timespec start, struct timespec end)
            (double) (end.tv_nsec - start.tv_nsec) / 1000000000.0;
 }
 
+static uint64_t ns_between(struct timespec start, struct timespec end)
+{
+    return (uint64_t) (end.tv_sec - start.tv_sec) * 1000000000ULL +
+           (uint64_t) (end.tv_nsec - start.tv_nsec);
+}
+
+static void monotonic_now(struct timespec *ts, const char *name)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, ts) != 0) {
+        perror(name);
+        exit(1);
+    }
+}
+
 static void fill_source(uint8_t *src, size_t size)
 {
     uint32_t state = 0x12345678u;
@@ -110,8 +125,8 @@ static void copy_snapshot(uint8_t *dst,
                           uint32_t bytes_per_pixel)
 {
     size_t row_bytes = (size_t) width * bytes_per_pixel;
-    const uint8_t *src_pixels = src + (size_t) y * src_stride +
-                                (size_t) x * bytes_per_pixel;
+    const uint8_t *src_pixels =
+        src + (size_t) y * src_stride + (size_t) x * bytes_per_pixel;
 
     if (x == 0 && src_stride == row_bytes) {
         memcpy(dst, src_pixels, row_bytes * height);
@@ -124,7 +139,8 @@ static void copy_snapshot(uint8_t *dst,
     }
 }
 
-static uint64_t run_case(const struct copy_case *c, uint64_t scale)
+static uint64_t run_snapshot_copy_case(const struct copy_case *c,
+                                       uint64_t scale)
 {
     size_t src_stride = (size_t) c->texture_width * c->bytes_per_pixel;
     size_t src_size = src_stride * c->texture_height;
@@ -140,30 +156,100 @@ static uint64_t run_case(const struct copy_case *c, uint64_t scale)
     fill_source(src, src_size);
     memset(dst, 0, dst_size);
 
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        perror("clock_gettime start");
-        exit(1);
-    }
+    monotonic_now(&start, "snapshot-copy start");
     for (uint64_t i = 0; i < iterations; i++) {
         copy_snapshot(dst, src, src_stride, c->x, c->y, c->width, c->height,
                       c->bytes_per_pixel);
         checksum += dst[(i * 2654435761u) % dst_size];
     }
-    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
-        perror("clock_gettime end");
-        exit(1);
-    }
+    monotonic_now(&end, "snapshot-copy end");
 
     double seconds = seconds_between(start, end);
     double mib = (double) dst_size * (double) iterations / (1024.0 * 1024.0);
     double mib_per_second = seconds > 0.0 ? mib / seconds : 0.0;
+    double ns_per_iter = seconds * 1000000000.0 / (double) iterations;
 
-    printf("%-12s rect=%ux%u@%u,%u bytes=%zu iterations=%llu "
-           "time=%.6f MiB/s=%.2f checksum=%llu\n",
-           c->name, c->width, c->height, c->x, c->y, dst_size,
-           (unsigned long long) iterations, seconds, mib_per_second,
-           (unsigned long long) checksum);
+    printf(
+        "snapshot-copy          %-12s rect=%ux%u@%u,%u "
+        "snapshot_bytes=%zu iterations=%llu time=%.6f ns/iter=%.1f "
+        "MiB/s=%.2f checksum=%llu\n",
+        c->name, c->width, c->height, c->x, c->y, dst_size,
+        (unsigned long long) iterations, seconds, ns_per_iter, mib_per_second,
+        (unsigned long long) checksum);
 
+    free(dst);
+    free(src);
+    return checksum;
+}
+
+static uint64_t run_direct_lock_case(const struct copy_case *c, uint64_t scale)
+{
+    size_t src_stride = (size_t) c->texture_width * c->bytes_per_pixel;
+    size_t src_size = src_stride * c->texture_height;
+    size_t row_bytes = (size_t) c->width * c->bytes_per_pixel;
+    size_t dst_size = row_bytes * c->height;
+    uint64_t iterations = c->base_iterations * scale;
+    uint8_t *src = xmalloc(src_size);
+    uint8_t *dst = xmalloc(dst_size);
+    pthread_mutex_t resource_lock;
+    uint64_t acquire_ns = 0;
+    uint64_t hold_ns = 0;
+    uint64_t total_ns = 0;
+    uint64_t checksum = 0;
+
+    fill_source(src, src_size);
+    memset(dst, 0, dst_size);
+
+    if (pthread_mutex_init(&resource_lock, NULL) != 0) {
+        fprintf(stderr, "pthread_mutex_init failed\n");
+        exit(1);
+    }
+
+    for (uint64_t i = 0; i < iterations; i++) {
+        struct timespec before_lock;
+        struct timespec after_lock;
+        struct timespec after_copy;
+
+        monotonic_now(&before_lock, "direct-lock before lock");
+        if (pthread_mutex_lock(&resource_lock) != 0) {
+            fprintf(stderr, "pthread_mutex_lock failed\n");
+            exit(1);
+        }
+        monotonic_now(&after_lock, "direct-lock after lock");
+        copy_snapshot(dst, src, src_stride, c->x, c->y, c->width, c->height,
+                      c->bytes_per_pixel);
+        checksum += dst[(i * 2654435761u) % dst_size];
+        monotonic_now(&after_copy, "direct-lock after copy");
+        if (pthread_mutex_unlock(&resource_lock) != 0) {
+            fprintf(stderr, "pthread_mutex_unlock failed\n");
+            exit(1);
+        }
+
+        acquire_ns += ns_between(before_lock, after_lock);
+        hold_ns += ns_between(after_lock, after_copy);
+        total_ns += ns_between(before_lock, after_copy);
+    }
+
+    double acquire_per_iter = (double) acquire_ns / (double) iterations;
+    double hold_per_iter = (double) hold_ns / (double) iterations;
+    double total_per_iter = (double) total_ns / (double) iterations;
+    double hold_seconds = (double) hold_ns / 1000000000.0;
+    double mib = (double) dst_size * (double) iterations / (1024.0 * 1024.0);
+    double hold_mib_per_second = hold_seconds > 0.0 ? mib / hold_seconds : 0.0;
+
+    printf(
+        "direct-lock-prototype  %-12s rect=%ux%u@%u,%u "
+        "critical_bytes=%zu iterations=%llu acquire_ns/iter=%.1f "
+        "hold_ns/iter=%.1f total_ns/iter=%.1f hold_MiB/s=%.2f "
+        "checksum=%llu\n",
+        c->name, c->width, c->height, c->x, c->y, dst_size,
+        (unsigned long long) iterations, acquire_per_iter, hold_per_iter,
+        total_per_iter, hold_mib_per_second, (unsigned long long) checksum);
+
+    if (pthread_mutex_destroy(&resource_lock) != 0) {
+        fprintf(stderr, "pthread_mutex_destroy failed\n");
+        exit(1);
+    }
     free(dst);
     free(src);
     return checksum;
@@ -175,8 +261,20 @@ int main(void)
     uint64_t checksum = 0;
 
     printf("vgpu copy benchmark scale=%llu\n", (unsigned long long) scale);
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
-        checksum ^= run_case(&cases[i], scale) + i;
+    printf(
+        "snapshot-copy cases model actor-owned payload creation before the "
+        "display queue.\n");
+    printf(
+        "direct-lock-prototype is benchmark-only: it locks a host resource "
+        "image and copies the bounded rect while locked as a stand-in for "
+        "synchronous texture upload. No SDL context is created, so driver "
+        "or GPU upload latency is not measured and this is not a runtime "
+        "ownership path.\n");
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        checksum ^= run_snapshot_copy_case(&cases[i], scale) + i;
+        checksum ^= run_direct_lock_case(&cases[i], scale) + i + 17U;
+    }
 
     printf("combined-checksum=%llu\n", (unsigned long long) checksum);
     return 0;
