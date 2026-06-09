@@ -290,7 +290,7 @@ void virtio_rng_write(hart_t *vm,
 
 void virtio_rng_init(void)
 {
-    rng_fd = open("/dev/random", O_RDONLY);
+    rng_fd = open("/dev/random", O_RDONLY | O_NONBLOCK);
     if (rng_fd < 0) {
         fprintf(stderr, "Could not open /dev/random\n");
         exit(2);

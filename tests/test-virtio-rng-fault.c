@@ -197,6 +197,22 @@ static void test_short_read_completes_actual_length(void)
     require_u8("entropy byte 2", buf[2], 0x5a);
 }
 
+static void test_init_opens_entropy_fd_nonblocking(void)
+{
+    int flags;
+
+    rng_fd = -1;
+    virtio_rng_init();
+
+    flags = fcntl(rng_fd, F_GETFL);
+    require_bool("rng fd flags readable", flags >= 0, true);
+    require_bool("rng fd nonblocking flag", (flags & O_NONBLOCK) != 0,
+                 true);
+
+    close(rng_fd);
+    rng_fd = -1;
+}
+
 #define TEST_RAM_WORDS 256
 #define DESC_ADDR 0x80
 #define AVAIL_ADDR 0x100
@@ -296,6 +312,7 @@ int main(void)
     test_ewouldblock_transient_zero_completion();
     test_eio_completes_zero_and_reports_permanent_failure();
     test_short_read_completes_actual_length();
+    test_init_opens_entropy_fd_nonblocking();
     test_queue_notify_transient_zero_completion_without_reset(EAGAIN);
     test_queue_notify_transient_zero_completion_without_reset(EWOULDBLOCK);
     test_queue_notify_eio_marks_needs_reset_and_conf_change();
