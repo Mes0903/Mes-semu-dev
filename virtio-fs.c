@@ -929,20 +929,132 @@ static int virtio_fs_process_chain_common(virtio_fs_state_t *vfs,
 
 static void virtio_fs_set_fail(virtio_fs_state_t *vfs);
 
-static int virtio_fs_drain_queue_common(virtio_fs_state_t *vfs,
-                                        struct virtq *queue)
+static bool virtio_fs_actor_generation_current(virtio_fs_state_t *vfs,
+                                               struct virtio_actor *actor,
+                                               uint64_t generation)
 {
-    bool consumed = false;
-    uint16_t available;
-    int ret;
+    (void) vfs;
+    return actor && virtio_actor_generation(actor) == generation;
+}
 
-    ret = virtio_fs_queue_available(vfs, queue, &available);
-    if (ret < 0) {
-        virtio_fs_set_fail(vfs);
-        return ret;
+static bool virtio_fs_queue_ready_for_actor(virtio_fs_state_t *vfs,
+                                            const struct virtq *queue)
+{
+    unsigned status;
+
+    if (!vfs || !queue || !queue->ready)
+        return false;
+
+    status = virtio_fs_status_load(vfs);
+    return !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) &&
+           (status & VIRTIO_STATUS__DRIVER_OK);
+}
+
+static bool virtio_fs_common_generation_current(virtio_fs_state_t *vfs,
+                                                uint64_t generation)
+{
+    bool current;
+
+    if (!vfs || !vfs->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vfs->common.transport_lock);
+    current =
+        vfs->common.generation == generation && !vfs->common.reset_in_progress;
+    pthread_mutex_unlock(&vfs->common.transport_lock);
+    return current;
+}
+
+static bool virtio_fs_capture_common_generation(virtio_fs_state_t *vfs,
+                                                uint64_t *generation)
+{
+    unsigned status;
+    bool current;
+
+    if (!vfs || !vfs->common.initialized || !generation)
+        return false;
+
+    pthread_mutex_lock(&vfs->common.transport_lock);
+    status = virtio_fs_status_load(vfs);
+    current = !vfs->common.reset_in_progress &&
+              (status & VIRTIO_STATUS__DRIVER_OK) &&
+              !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    if (current)
+        *generation = vfs->common.generation;
+    pthread_mutex_unlock(&vfs->common.transport_lock);
+    return current;
+}
+
+static bool virtio_fs_begin_actor_completion(virtio_fs_state_t *vfs,
+                                             uint64_t actor_generation,
+                                             uint64_t common_generation)
+{
+    bool common_current;
+
+    if (!vfs || !vfs->actor_initialized || !vfs->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vfs->common.transport_lock);
+    common_current = vfs->common.generation == common_generation &&
+                     !vfs->common.reset_in_progress;
+    if (!common_current) {
+        pthread_mutex_unlock(&vfs->common.transport_lock);
+        return false;
     }
 
-    while (available-- > 0) {
+    if (!virtio_actor_begin_completion(&vfs->actor, actor_generation)) {
+        pthread_mutex_unlock(&vfs->common.transport_lock);
+        return false;
+    }
+    return true;
+}
+
+static void virtio_fs_end_actor_completion(virtio_fs_state_t *vfs)
+{
+    if (!vfs || !vfs->actor_initialized)
+        return;
+
+    virtio_actor_end_completion(&vfs->actor);
+    pthread_mutex_unlock(&vfs->common.transport_lock);
+}
+
+static void virtio_fs_set_fail_for_actor(virtio_fs_state_t *vfs,
+                                         uint64_t actor_generation,
+                                         uint64_t common_generation)
+{
+    if (!virtio_fs_begin_actor_completion(vfs, actor_generation,
+                                          common_generation))
+        return;
+    virtio_fs_set_fail(vfs);
+    virtio_fs_end_actor_completion(vfs);
+}
+
+static int virtio_fs_actor_drain_queue(void *opaque,
+                                       struct virtio_actor *actor,
+                                       uint16_t queue_index,
+                                       uint64_t generation)
+{
+    virtio_fs_state_t *vfs = opaque;
+    struct virtq *queue;
+    bool consumed = false;
+    uint64_t common_generation = 0;
+
+    if (!vfs || queue_index >= VFS_NUM_QUEUES) {
+        if (vfs)
+            virtio_fs_set_fail(vfs);
+        return 0;
+    }
+
+    queue = &vfs->common.queues[queue_index];
+
+    if (!virtio_fs_actor_generation_current(vfs, actor, generation))
+        return 0;
+    if (!virtio_fs_queue_ready_for_actor(vfs, queue))
+        return 0;
+    if (!virtio_fs_capture_common_generation(vfs, &common_generation))
+        return 0;
+
+    for (;;) {
         struct virtq_iov readable[VFS_MAX_CHAIN_IOVS];
         struct virtq_iov writable[VFS_MAX_CHAIN_IOVS];
         struct virtq_chain chain = {
@@ -951,41 +1063,146 @@ static int virtio_fs_drain_queue_common(virtio_fs_state_t *vfs,
             .writable = writable,
             .writable_capacity = ARRAY_SIZE(writable),
         };
+        uint16_t available = 0;
         uint32_t used_len = 0;
+        int ret;
+
+        if (!virtio_fs_actor_generation_current(vfs, actor, generation))
+            return 0;
+        if (!virtio_fs_common_generation_current(vfs, common_generation))
+            return 0;
+        ret = virtio_fs_queue_available(vfs, queue, &available);
+        if (ret < 0) {
+            virtio_fs_set_fail_for_actor(vfs, generation, common_generation);
+            return 0;
+        }
+        if (available == 0)
+            break;
 
         ret = virtq_pop(vfs->common.dma, queue, &chain);
+        if (!virtio_fs_actor_generation_current(vfs, actor, generation))
+            return 0;
+        if (!virtio_fs_common_generation_current(vfs, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_fs_set_fail(vfs);
-            return ret;
+            virtio_fs_set_fail_for_actor(vfs, generation, common_generation);
+            return 0;
         }
         if (ret == 0)
             break;
 
         ret = virtio_fs_process_chain_common(vfs, &chain, &used_len);
+        if (!virtio_fs_actor_generation_current(vfs, actor, generation))
+            return 0;
+        if (!virtio_fs_common_generation_current(vfs, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_fs_set_fail(vfs);
-            return ret;
+            virtio_fs_set_fail_for_actor(vfs, generation, common_generation);
+            return 0;
         }
 
+        if (!virtio_fs_begin_actor_completion(vfs, generation,
+                                              common_generation))
+            return 0;
         ret = virtq_add_used(vfs->common.dma, queue, chain.head, used_len);
         if (ret < 0) {
             virtio_fs_set_fail(vfs);
-            return ret;
+            virtio_fs_end_actor_completion(vfs);
+            return 0;
         }
+        virtio_fs_end_actor_completion(vfs);
         consumed = true;
     }
 
-    if (consumed && !virtq_interrupt_suppressed(vfs->common.dma, queue))
-        virtio_irq_trigger(&vfs->common.irq, VIRTIO_INT__USED_RING);
-
+    if (consumed &&
+        virtio_fs_begin_actor_completion(vfs, generation, common_generation)) {
+        if (!virtq_interrupt_suppressed(vfs->common.dma, queue))
+            virtio_irq_trigger(&vfs->common.irq, VIRTIO_INT__USED_RING);
+        virtio_fs_end_actor_completion(vfs);
+    }
     return 0;
 }
+
+static bool virtio_fs_actor_queue_has_work(void *opaque,
+                                           struct virtio_actor *actor,
+                                           uint16_t queue_index,
+                                           uint64_t generation)
+{
+    virtio_fs_state_t *vfs = opaque;
+    uint16_t available = 0;
+    uint64_t common_generation = 0;
+    int ret;
+
+    if (!vfs || queue_index >= VFS_NUM_QUEUES)
+        return false;
+    if (!virtio_fs_actor_generation_current(vfs, actor, generation))
+        return false;
+    if (!virtio_fs_queue_ready_for_actor(vfs, &vfs->common.queues[queue_index]))
+        return false;
+    if (!virtio_fs_capture_common_generation(vfs, &common_generation))
+        return false;
+
+    ret = virtio_fs_queue_available(vfs, &vfs->common.queues[queue_index],
+                                    &available);
+    if (ret < 0) {
+        virtio_fs_set_fail_for_actor(vfs, generation, common_generation);
+        return false;
+    }
+    return available != 0;
+}
+
+static void virtio_fs_actor_failed(void *opaque,
+                                   struct virtio_actor *actor UNUSED)
+{
+    virtio_fs_state_t *vfs = opaque;
+
+    if (vfs)
+        virtio_fs_set_fail(vfs);
+}
+
+static const struct virtio_actor_ops virtio_fs_actor_ops = {
+    .drain_queue = virtio_fs_actor_drain_queue,
+    .queue_has_work = virtio_fs_actor_queue_has_work,
+    .on_failed = virtio_fs_actor_failed,
+};
 
 static int virtio_fs_activate(void *opaque,
                               const struct virtio_activation_context *ctx)
 {
-    (void) opaque;
+    virtio_fs_state_t *vfs = opaque;
+    int ret;
+
     (void) ctx;
+
+    if (!vfs || !vfs->actor_initialized)
+        return -EINVAL;
+
+    ret = virtio_actor_start(&vfs->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vfs->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vfs->actor);
+}
+
+static int virtio_fs_prepare_reset(void *opaque,
+                                   uint64_t old_generation,
+                                   uint64_t new_generation)
+{
+    virtio_fs_state_t *vfs = opaque;
+    int ret = 0;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (vfs && vfs->actor_initialized)
+        ret = virtio_actor_reset(&vfs->actor);
+    if (ret < 0)
+        return ret;
+
+    virtio_fs_close_all_handles(vfs);
     return 0;
 }
 
@@ -993,11 +1210,9 @@ static int virtio_fs_reset(void *opaque,
                            uint64_t old_generation,
                            uint64_t new_generation)
 {
-    virtio_fs_state_t *vfs = opaque;
-
+    (void) opaque;
     (void) old_generation;
     (void) new_generation;
-    virtio_fs_close_all_handles(vfs);
     return 0;
 }
 
@@ -1006,6 +1221,7 @@ static int virtio_fs_notify_queue(void *opaque,
                                   uint64_t generation)
 {
     virtio_fs_state_t *vfs = opaque;
+    int ret;
 
     (void) generation;
 
@@ -1015,17 +1231,17 @@ static int virtio_fs_notify_queue(void *opaque,
         return -EINVAL;
     }
 
-    if (!(virtio_fs_status_load(vfs) & VIRTIO_STATUS__DRIVER_OK)) {
-        virtio_fs_set_fail(vfs);
-        return -EINVAL;
-    }
+    ret = virtio_actor_notify_queue(&vfs->actor, queue_index);
+    if (ret == 0 || ret == -EAGAIN)
+        return 0;
 
-    return virtio_fs_drain_queue_common(vfs, &vfs->common.queues[queue_index]);
+    virtio_fs_set_fail(vfs);
+    return ret;
 }
 
 static const struct virtio_device_ops virtio_fs_ops = {
     .activate = virtio_fs_activate,
-    .prepare_reset = virtio_fs_reset,
+    .prepare_reset = virtio_fs_prepare_reset,
     .reset = virtio_fs_reset,
     .notify_queue = virtio_fs_notify_queue,
     .read_config = virtio_fs_read_config,
@@ -2052,6 +2268,14 @@ bool virtio_fs_init(virtio_fs_state_t *vfs,
         exit(2);
     }
 
+    if (virtio_actor_init(&vfs->actor, &virtio_fs_actor_ops, vfs,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vfs->common);
+        fprintf(stderr, "Failed to initialize virtio-fs actor.\n");
+        exit(2);
+    }
+    vfs->actor_initialized = true;
+
     if (!dir) {
         /* -s parameter is empty; keep the MMIO device initialized but report
          * that no host filesystem share is active.
@@ -2094,6 +2318,12 @@ void virtio_fs_destroy(virtio_fs_state_t *vfs)
 {
     if (!vfs)
         return;
+
+    if (vfs->actor_initialized) {
+        virtio_actor_stop(&vfs->actor);
+        virtio_actor_destroy(&vfs->actor);
+        vfs->actor_initialized = false;
+    }
 
     virtio_fs_close_all_handles(vfs);
     if (vfs->common.initialized)

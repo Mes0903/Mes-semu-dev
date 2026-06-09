@@ -1,16 +1,26 @@
 #define _XOPEN_SOURCE 700
 
+#include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../ram_access.h"
 #include "../riscv_private.h"
 
+static bool test_ram_dma_write(ram_dma_t *dma,
+                               guest_paddr_t addr,
+                               const void *buf,
+                               guest_size_t len);
+
+#define ram_dma_write test_ram_dma_write
 #include "../virtio-fs.c"
+#undef ram_dma_write
 
 #define REG(reg) ((uint32_t) VIRTIO_##reg << 2)
 #define TEST_RAM_SIZE 16384
@@ -37,6 +47,44 @@
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static emu_state_t emu;
 static unsigned wake_count;
+
+struct dma_gate {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool enabled;
+    bool entered;
+    bool release;
+    guest_paddr_t addr;
+    guest_size_t len;
+};
+
+static struct dma_gate fs_dma_write_gate = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+
+static void dma_gate_block_if_enabled(struct dma_gate *gate,
+                                      guest_paddr_t addr,
+                                      guest_size_t len)
+{
+    pthread_mutex_lock(&gate->lock);
+    if (gate->enabled && addr == gate->addr && len == gate->len) {
+        gate->entered = true;
+        pthread_cond_broadcast(&gate->cond);
+        while (!gate->release)
+            pthread_cond_wait(&gate->cond, &gate->lock);
+    }
+    pthread_mutex_unlock(&gate->lock);
+}
+
+static bool test_ram_dma_write(ram_dma_t *dma,
+                               guest_paddr_t addr,
+                               const void *buf,
+                               guest_size_t len)
+{
+    dma_gate_block_if_enabled(&fs_dma_write_gate, addr, len);
+    return ram_dma_write(dma, addr, buf, len);
+}
 
 void vm_set_exception(hart_t *hart, uint32_t cause, uint32_t val)
 {
@@ -68,6 +116,68 @@ static void require_int(const char *name, int got, int want)
 
     fprintf(stderr, "%s: got %d, want %d\n", name, got, want);
     exit(1);
+}
+
+static struct timespec deadline_after_ms(unsigned timeout_ms)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long) (timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return ts;
+}
+
+static void sleep_one_ms(void)
+{
+    const struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000L,
+    };
+
+    nanosleep(&ts, NULL);
+}
+
+static void dma_gate_enable(struct dma_gate *gate,
+                            guest_paddr_t addr,
+                            guest_size_t len)
+{
+    pthread_mutex_lock(&gate->lock);
+    gate->enabled = true;
+    gate->entered = false;
+    gate->release = false;
+    gate->addr = addr;
+    gate->len = len;
+    pthread_mutex_unlock(&gate->lock);
+}
+
+static bool dma_gate_wait_entered(struct dma_gate *gate, unsigned timeout_ms)
+{
+    struct timespec deadline = deadline_after_ms(timeout_ms);
+    bool entered;
+
+    pthread_mutex_lock(&gate->lock);
+    while (!gate->entered) {
+        int ret = pthread_cond_timedwait(&gate->cond, &gate->lock, &deadline);
+        if (ret == ETIMEDOUT)
+            break;
+    }
+    entered = gate->entered;
+    pthread_mutex_unlock(&gate->lock);
+    return entered;
+}
+
+static void dma_gate_release(struct dma_gate *gate)
+{
+    pthread_mutex_lock(&gate->lock);
+    gate->enabled = false;
+    gate->release = true;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->lock);
 }
 
 static void require_u8(const char *name, uint8_t got, uint8_t want)
@@ -249,6 +359,153 @@ static bool source_asserted(emu_state_t *emu_arg, enum semu_irq_source source)
     return (emu_arg->plic.active & semu_irq_source_plic_bit(source)) != 0;
 }
 
+static bool wait_for_used_idx(uint16_t queue, uint16_t idx)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if (read16(USED_ADDR(queue) + 2) == idx)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
+static bool wait_for_fs_actor_state(virtio_fs_state_t *vfs,
+                                    enum virtio_actor_state state)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if (virtio_actor_get_state(&vfs->actor) == state)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
+static bool wait_for_status_bits(uint32_t bits)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if ((mmio_read(REG(Status)) & bits) == bits)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
+static bool wait_for_interrupt_status(uint32_t status)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if (mmio_read(REG(InterruptStatus)) == status)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
+struct async_fs_call {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    virtio_fs_state_t *vfs;
+    uint16_t queue;
+    int ret;
+    bool done;
+};
+
+static void async_fs_call_init(struct async_fs_call *call,
+                               virtio_fs_state_t *vfs,
+                               uint16_t queue)
+{
+    memset(call, 0, sizeof(*call));
+    call->vfs = vfs;
+    call->queue = queue;
+    require_int("async lock init", pthread_mutex_init(&call->lock, NULL), 0);
+    require_int("async cond init", pthread_cond_init(&call->cond, NULL), 0);
+}
+
+static void async_fs_call_destroy(struct async_fs_call *call)
+{
+    pthread_cond_destroy(&call->cond);
+    pthread_mutex_destroy(&call->lock);
+}
+
+static void async_fs_call_finish(struct async_fs_call *call, int ret)
+{
+    pthread_mutex_lock(&call->lock);
+    call->ret = ret;
+    call->done = true;
+    pthread_cond_broadcast(&call->cond);
+    pthread_mutex_unlock(&call->lock);
+}
+
+static bool async_fs_call_wait_done(struct async_fs_call *call,
+                                    unsigned timeout_ms)
+{
+    struct timespec deadline = deadline_after_ms(timeout_ms);
+    bool done;
+
+    pthread_mutex_lock(&call->lock);
+    while (!call->done) {
+        int ret = pthread_cond_timedwait(&call->cond, &call->lock, &deadline);
+        if (ret == ETIMEDOUT)
+            break;
+    }
+    done = call->done;
+    pthread_mutex_unlock(&call->lock);
+    return done;
+}
+
+static void async_fs_call_join(struct async_fs_call *call)
+{
+    require_int("async join", pthread_join(call->thread, NULL), 0);
+}
+
+static void *notify_queue_thread(void *opaque)
+{
+    struct async_fs_call *call = opaque;
+    int ret =
+        virtio_mmio_write(&call->vfs->common, REG(QueueNotify), 4, call->queue);
+
+    async_fs_call_finish(call, ret);
+    return NULL;
+}
+
+static void *reset_fs_thread(void *opaque)
+{
+    struct async_fs_call *call = opaque;
+    int ret = virtio_device_common_reset(&call->vfs->common);
+
+    async_fs_call_finish(call, ret);
+    return NULL;
+}
+
+static void *destroy_fs_thread(void *opaque)
+{
+    struct async_fs_call *call = opaque;
+
+    virtio_fs_destroy(call->vfs);
+    async_fs_call_finish(call, 0);
+    return NULL;
+}
+
+static void async_fs_call_start_notify(struct async_fs_call *call)
+{
+    require_int("notify thread create",
+                pthread_create(&call->thread, NULL, notify_queue_thread, call),
+                0);
+}
+
+static void async_fs_call_start_reset(struct async_fs_call *call)
+{
+    require_int("reset thread create",
+                pthread_create(&call->thread, NULL, reset_fs_thread, call), 0);
+}
+
+static void async_fs_call_start_destroy(struct async_fs_call *call)
+{
+    require_int("destroy thread create",
+                pthread_create(&call->thread, NULL, destroy_fs_thread, call),
+                0);
+}
+
 static void test_config_reads_tag_and_request_queue_count(void)
 {
     setup_fixture();
@@ -322,6 +579,8 @@ static void submit_queue_head(uint16_t queue, uint16_t avail_idx, uint16_t head)
             head);
     write16(AVAIL_ADDR(queue) + 2, (uint16_t) (avail_idx + 1));
     mmio_write(REG(QueueNotify), queue);
+    require_bool("actor published submitted queue head",
+                 wait_for_used_idx(queue, (uint16_t) (avail_idx + 1)), true);
 }
 
 static void ack_used_irq(void)
@@ -517,7 +776,7 @@ static void test_config_writes_do_not_mutate_device_config(void)
     teardown_fixture();
 }
 
-static void test_fuse_init_completes_synchronously_and_acks_irq(void)
+static void test_fuse_init_completes_asynchronously_and_acks_irq(void)
 {
     struct vfs_resp_header header;
     struct fuse_init_out init_out;
@@ -529,6 +788,8 @@ static void test_fuse_init_completes_synchronously_and_acks_irq(void)
     publish_fuse_init_request(queue);
 
     mmio_write(REG(QueueNotify), queue);
+    require_bool("actor published fuse init completion",
+                 wait_for_used_idx(queue, 1), true);
 
     dma_read(RESP_HDR_ADDR, &header, sizeof(header));
     dma_read(INIT_OUT_ADDR, &init_out, sizeof(init_out));
@@ -555,6 +816,45 @@ static void test_fuse_init_completes_synchronously_and_acks_irq(void)
     teardown_fixture();
 }
 
+static void test_queue_notify_returns_before_used_ring_publication(void)
+{
+    struct async_fs_call notify;
+    struct vfs_resp_header header = {0};
+    const uint16_t queue = 1;
+
+    setup_fixture();
+    publish_fuse_init_request(queue);
+    dma_gate_enable(&fs_dma_write_gate, RESP_HDR_ADDR,
+                    sizeof(struct vfs_resp_header));
+    async_fs_call_init(&notify, &emu.vfs, queue);
+    async_fs_call_start_notify(&notify);
+
+    require_bool("actor entered response header write",
+                 dma_gate_wait_entered(&fs_dma_write_gate, 1000), true);
+    require_bool("QueueNotify returned while actor response write is blocked",
+                 async_fs_call_wait_done(&notify, 1000), true);
+    require_int("QueueNotify return", notify.ret, 0);
+    require_u16("no used completion before actor write returns",
+                read16(USED_ADDR(queue) + 2), 0);
+    require_u32("no interrupt before actor write returns",
+                mmio_read(REG(InterruptStatus)), 0);
+
+    dma_gate_release(&fs_dma_write_gate);
+    async_fs_call_join(&notify);
+    require_bool("actor published async fs completion",
+                 wait_for_used_idx(queue, 1), true);
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    require_u32("async response len", header.out.len,
+                sizeof(struct fuse_out_header) + sizeof(struct fuse_init_out));
+    require_u32("async interrupt", mmio_read(REG(InterruptStatus)),
+                VIRTIO_INT__USED_RING);
+    require_bool("async irq line", source_asserted(&emu, SEMU_IRQ_SOURCE_VFS),
+                 true);
+
+    async_fs_call_destroy(&notify);
+    teardown_fixture();
+}
+
 static void test_getattr_root_uses_common_dma_path(void)
 {
     struct vfs_resp_header header;
@@ -567,6 +867,8 @@ static void test_getattr_root_uses_common_dma_path(void)
     publish_getattr_root_request(queue);
 
     mmio_write(REG(QueueNotify), queue);
+    require_bool("actor published getattr completion",
+                 wait_for_used_idx(queue, 1), true);
 
     dma_read(RESP_HDR_ADDR, &header, sizeof(header));
     dma_read(ATTR_OUT_ADDR, &outattr, sizeof(outattr));
@@ -723,6 +1025,102 @@ static void test_invalid_releasedir_handle_returns_ebadf(void)
     teardown_fixture();
 }
 
+static void test_invalid_queue_notify_sets_needs_reset(void)
+{
+    int ret;
+
+    setup_fixture();
+
+    ret = virtio_fs_notify_queue(&emu.vfs, VFS_NUM_QUEUES,
+                                 emu.vfs.common.generation);
+
+    require_int("invalid notify return", ret, -EINVAL);
+    require_u32("invalid notify needs reset",
+                mmio_read(REG(Status)) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    require_u32("invalid notify conf change irq",
+                mmio_read(REG(InterruptStatus)), VIRTIO_INT__CONF_CHANGE);
+
+    teardown_fixture();
+}
+
+static void test_reset_cancels_stale_pending_actor_completion(void)
+{
+    struct async_fs_call notify;
+    struct async_fs_call reset;
+    const uint16_t queue = 1;
+
+    setup_fixture();
+    publish_fuse_init_request(queue);
+    dma_gate_enable(&fs_dma_write_gate, RESP_HDR_ADDR,
+                    sizeof(struct vfs_resp_header));
+    async_fs_call_init(&notify, &emu.vfs, queue);
+    async_fs_call_start_notify(&notify);
+    require_bool("actor entered response write before reset",
+                 dma_gate_wait_entered(&fs_dma_write_gate, 1000), true);
+    require_bool("QueueNotify returned before reset",
+                 async_fs_call_wait_done(&notify, 1000), true);
+
+    async_fs_call_init(&reset, &emu.vfs, 0);
+    async_fs_call_start_reset(&reset);
+    require_bool("reset advanced actor generation",
+                 wait_for_fs_actor_state(&emu.vfs, VIRTIO_ACTOR_RESETTING),
+                 true);
+
+    dma_gate_release(&fs_dma_write_gate);
+    async_fs_call_join(&notify);
+    async_fs_call_join(&reset);
+    require_int("reset return", reset.ret, 0);
+    require_u16("reset stale used idx remains clear",
+                read16(USED_ADDR(queue) + 2), 0);
+    require_u32("reset stale interrupt remains clear",
+                mmio_read(REG(InterruptStatus)), 0);
+    require_bool("reset stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), false);
+
+    async_fs_call_destroy(&reset);
+    async_fs_call_destroy(&notify);
+    teardown_fixture();
+}
+
+static void test_stop_cancels_stale_pending_actor_completion(void)
+{
+    struct async_fs_call notify;
+    struct async_fs_call destroy;
+    const uint16_t queue = 1;
+
+    setup_fixture();
+    publish_fuse_init_request(queue);
+    dma_gate_enable(&fs_dma_write_gate, RESP_HDR_ADDR,
+                    sizeof(struct vfs_resp_header));
+    async_fs_call_init(&notify, &emu.vfs, queue);
+    async_fs_call_start_notify(&notify);
+    require_bool("actor entered response write before stop",
+                 dma_gate_wait_entered(&fs_dma_write_gate, 1000), true);
+    require_bool("QueueNotify returned before stop",
+                 async_fs_call_wait_done(&notify, 1000), true);
+
+    async_fs_call_init(&destroy, &emu.vfs, 0);
+    async_fs_call_start_destroy(&destroy);
+    require_bool("stop advanced actor generation",
+                 wait_for_fs_actor_state(&emu.vfs, VIRTIO_ACTOR_STOPPING),
+                 true);
+
+    dma_gate_release(&fs_dma_write_gate);
+    async_fs_call_join(&notify);
+    async_fs_call_join(&destroy);
+    require_int("destroy return", destroy.ret, 0);
+    require_u16("stop stale used idx remains clear",
+                read16(USED_ADDR(queue) + 2), 0);
+    require_bool("stop stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), false);
+
+    async_fs_call_destroy(&destroy);
+    async_fs_call_destroy(&notify);
+    pthread_mutex_destroy(&emu.plic_lock);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 static void test_malformed_avail_sets_needs_reset_and_conf_change_irq(void)
 {
     int ret;
@@ -733,12 +1131,14 @@ static void test_malformed_avail_sets_needs_reset_and_conf_change_irq(void)
 
     ret = mmio_write_result(REG(QueueNotify), queue);
 
-    require_int("malformed notify return", ret, -EINVAL);
+    require_int("malformed notify return", ret, 0);
+    require_bool("malformed avail actor sets needs reset",
+                 wait_for_status_bits(VIRTIO_STATUS__DEVICE_NEEDS_RESET), true);
     require_u32("needs reset",
                 mmio_read(REG(Status)) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
                 VIRTIO_STATUS__DEVICE_NEEDS_RESET);
-    require_u32("conf change irq", mmio_read(REG(InterruptStatus)),
-                VIRTIO_INT__CONF_CHANGE);
+    require_bool("conf change irq",
+                 wait_for_interrupt_status(VIRTIO_INT__CONF_CHANGE), true);
 
     mmio_write(REG(InterruptACK), VIRTIO_INT__CONF_CHANGE);
     require_u32("conf change acked", mmio_read(REG(InterruptStatus)), 0);
@@ -750,13 +1150,17 @@ int main(void)
 {
     test_config_reads_tag_and_request_queue_count();
     test_config_writes_do_not_mutate_device_config();
-    test_fuse_init_completes_synchronously_and_acks_irq();
+    test_fuse_init_completes_asynchronously_and_acks_irq();
+    test_queue_notify_returns_before_used_ring_publication();
     test_getattr_root_uses_common_dma_path();
     test_lookup_rejects_path_escape_name();
     test_lookup_rejects_embedded_nul_name();
     test_lookup_open_read_release_valid_file();
     test_invalid_read_handle_returns_ebadf();
     test_invalid_releasedir_handle_returns_ebadf();
+    test_invalid_queue_notify_sets_needs_reset();
+    test_reset_cancels_stale_pending_actor_completion();
+    test_stop_cancels_stale_pending_actor_completion();
     test_malformed_avail_sets_needs_reset_and_conf_change_irq();
     return 0;
 }

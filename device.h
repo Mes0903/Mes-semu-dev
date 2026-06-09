@@ -537,6 +537,8 @@ typedef struct {
 
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
 
     /* feature negotiation */
     uint32_t DeviceFeaturesSel;
