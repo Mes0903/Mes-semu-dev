@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <virglrenderer.h>
 
@@ -31,6 +32,16 @@ static uint32_t fake_last_context_fence_ring_idx;
 static uint64_t fake_last_context_fence_id;
 static int fake_poll_count;
 static int fake_reset_count;
+static int fake_get_cap_set_count;
+static int fake_fill_caps_count;
+static uint32_t fake_last_fill_caps_set;
+static uint32_t fake_last_fill_caps_version;
+static int fake_context_create_count;
+static uint32_t fake_last_context_create_handle;
+static uint32_t fake_last_context_create_nlen;
+static char fake_last_context_create_name[64];
+static int fake_context_destroy_count;
+static uint32_t fake_last_context_destroy_handle;
 static int wake_renderer_count;
 static int wake_frontend_count;
 static int fake_cookie_marker;
@@ -82,6 +93,54 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
     fake_last_context_fence_ring_idx = ring_idx;
     fake_last_context_fence_id = fence_id;
     return 0;
+}
+
+void virgl_renderer_get_cap_set(uint32_t set,
+                                uint32_t *max_ver,
+                                uint32_t *max_size)
+{
+    fake_get_cap_set_count++;
+    if (set == VIRTIO_GPU_CAPSET_VIRGL) {
+        *max_ver = 2;
+        *max_size = 4;
+    } else if (set == VIRTIO_GPU_CAPSET_VIRGL2) {
+        *max_ver = 0;
+        *max_size = 0;
+    } else {
+        *max_ver = 0;
+        *max_size = 0;
+    }
+}
+
+void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps)
+{
+    uint8_t *bytes = caps;
+
+    fake_fill_caps_count++;
+    fake_last_fill_caps_set = set;
+    fake_last_fill_caps_version = version;
+    for (uint32_t i = 0; i < 4; i++)
+        bytes[i] = (uint8_t) (0xa0 + i);
+}
+
+int virgl_renderer_context_create(uint32_t handle,
+                                  uint32_t nlen,
+                                  const char *name)
+{
+    fake_context_create_count++;
+    fake_last_context_create_handle = handle;
+    fake_last_context_create_nlen = nlen;
+    memset(fake_last_context_create_name, 0,
+           sizeof(fake_last_context_create_name));
+    if (name && nlen < sizeof(fake_last_context_create_name))
+        memcpy(fake_last_context_create_name, name, nlen);
+    return 0;
+}
+
+void virgl_renderer_context_destroy(uint32_t handle)
+{
+    fake_context_destroy_count++;
+    fake_last_context_destroy_handle = handle;
 }
 
 void virgl_renderer_reset(void)
@@ -142,6 +201,17 @@ static void reset_test_state(uint64_t generation)
     fake_last_context_fence_id = 0;
     fake_poll_count = 0;
     fake_reset_count = 0;
+    fake_get_cap_set_count = 0;
+    fake_fill_caps_count = 0;
+    fake_last_fill_caps_set = 0;
+    fake_last_fill_caps_version = 0;
+    fake_context_create_count = 0;
+    fake_last_context_create_handle = 0;
+    fake_last_context_create_nlen = 0;
+    memset(fake_last_context_create_name, 0,
+           sizeof(fake_last_context_create_name));
+    fake_context_destroy_count = 0;
+    fake_last_context_destroy_handle = 0;
     wake_renderer_count = 0;
     wake_frontend_count = 0;
     fake_window_create_count = 0;
@@ -371,6 +441,200 @@ static void test_poll_requests_coalesce_until_executed(void)
     CHECK(stats.poll_requests_executed == before.poll_requests_executed + 1);
 }
 
+static void test_ctrl_request_executes_get_capset_info_completion(void)
+{
+    reset_test_state(31);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO},
+        .cmd.get_capset_info =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO},
+                .capset_index = 0,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_resp_capset_info),
+        .response_type = VIRTIO_GPU_RESP_OK_CAPSET_INFO,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 11,
+                .actor_generation = 22,
+                .common_generation = 31,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0x80,
+                .len = sizeof(struct virtio_gpu_resp_capset_info),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 31},
+        .command_type = VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.type == VGPU_RENDERER_DONE_CTRL);
+    CHECK(completion.token.generation == 31);
+    CHECK(completion.has_ctrl_completion);
+    CHECK(completion.ctrl_completion.desc_head == 11);
+    CHECK(completion.has_response_desc);
+    CHECK(completion.response_size ==
+          sizeof(struct virtio_gpu_resp_capset_info));
+
+    struct virtio_gpu_resp_capset_info *response = completion.response;
+    CHECK(response->hdr.type == VIRTIO_GPU_RESP_OK_CAPSET_INFO);
+    CHECK(response->capset_id == VIRTIO_GPU_CAPSET_VIRGL);
+    CHECK(response->capset_max_version == 2);
+    CHECK(response->capset_max_size == 4);
+    completion.release_response(completion.response);
+}
+
+static void test_ctrl_request_executes_get_capset_completion(void)
+{
+    reset_test_state(32);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET},
+        .cmd.get_capset =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET},
+                .capset_id = VIRTIO_GPU_CAPSET_VIRGL,
+                .capset_version = 2,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_resp_capset) + 4,
+        .response_type = VIRTIO_GPU_RESP_OK_CAPSET,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 12,
+                .actor_generation = 23,
+                .common_generation = 32,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0x90,
+                .len = sizeof(struct virtio_gpu_resp_capset) + 4,
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 32},
+        .command_type = VIRTIO_GPU_CMD_GET_CAPSET,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.type == VGPU_RENDERER_DONE_CTRL);
+    CHECK(completion.response_size ==
+          sizeof(struct virtio_gpu_resp_capset) + 4);
+    CHECK(fake_fill_caps_count == 1);
+    CHECK(fake_last_fill_caps_set == VIRTIO_GPU_CAPSET_VIRGL);
+    CHECK(fake_last_fill_caps_version == 2);
+
+    struct virtio_gpu_resp_capset *response = completion.response;
+    CHECK(response->hdr.type == VIRTIO_GPU_RESP_OK_CAPSET);
+    CHECK(response->capset_data[0] == 0xa0);
+    CHECK(response->capset_data[3] == 0xa3);
+    completion.release_response(completion.response);
+}
+
+static void test_ctrl_request_executes_context_create_destroy(void)
+{
+    reset_test_state(33);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_CTX_CREATE, .ctx_id = 77},
+        .cmd.ctx_create =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_CTX_CREATE, .ctx_id = 77},
+                .nlen = 4,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 13,
+                .actor_generation = 24,
+                .common_generation = 33,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0xa0,
+                .len = sizeof(struct virtio_gpu_ctrl_hdr),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    memcpy(payload.cmd.ctx_create.debug_name, "ctxB", 4);
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 33},
+        .command_type = VIRTIO_GPU_CMD_CTX_CREATE,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    struct vgpu_renderer_completion completion = {0};
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.response == NULL);
+    CHECK(fake_context_create_count == 1);
+    CHECK(fake_last_context_create_handle == 77);
+    CHECK(fake_last_context_create_nlen == 4);
+    CHECK(memcmp(fake_last_context_create_name, "ctxB", 4) == 0);
+
+    payload = (struct vgpu_renderer_ctrl_payload) {
+        .hdr = {.type = VIRTIO_GPU_CMD_CTX_DESTROY, .ctx_id = 77},
+        .cmd.ctx_destroy =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_CTX_DESTROY, .ctx_id = 77},
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 14,
+                .actor_generation = 24,
+                .common_generation = 33,
+                .trigger_irq = true,
+            },
+        .response_desc =
+            {
+                .addr = 0xb0,
+                .len = sizeof(struct virtio_gpu_ctrl_hdr),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+    };
+    request.command_type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    request.payload = &payload;
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.response == NULL);
+    CHECK(fake_context_destroy_count == 1);
+    CHECK(fake_last_context_destroy_handle == 77);
+}
+
 static void test_callback_completes_newest_matching_fence_and_clears_older(void)
 {
     reset_test_state(19);
@@ -438,6 +702,9 @@ int main(void)
     test_ctx0_fence_completion_preserves_guest_id_and_generation();
     test_context_fence_completion_preserves_stream_metadata();
     test_poll_requests_coalesce_until_executed();
+    test_ctrl_request_executes_get_capset_info_completion();
+    test_ctrl_request_executes_get_capset_completion();
+    test_ctrl_request_executes_context_create_destroy();
     test_callback_completes_newest_matching_fence_and_clears_older();
     test_reset_drops_pending_fences_and_ignores_stale_callbacks();
     return 0;

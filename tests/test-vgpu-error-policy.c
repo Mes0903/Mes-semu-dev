@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "device.h"
 #include "virtio-gpu.h"
@@ -132,6 +133,15 @@ static void require_u16(const char *name, uint16_t got, uint16_t want)
 }
 
 #if SEMU_HAS(VIRGL)
+static void require_ptr(const char *name, const void *got, const void *want)
+{
+    if (got == want)
+        return;
+
+    fprintf(stderr, "%s: got %p, want %p\n", name, got, want);
+    exit(1);
+}
+
 static uint32_t renderer_release_response_count;
 
 static void renderer_release_response(void *response)
@@ -139,6 +149,8 @@ static void renderer_release_response(void *response)
     renderer_release_response_count++;
     free(response);
 }
+
+
 #endif
 
 static void require_false(const char *name, bool got)
@@ -224,6 +236,30 @@ static uint32_t load_u32(const uint32_t *ram, uint32_t addr)
 }
 
 #if SEMU_HAS(VIRGL)
+static void store_u16(uint32_t *ram, uint32_t addr, uint16_t value)
+{
+    memcpy((uint8_t *) ram + addr, &value, sizeof(value));
+}
+
+static void wait_for_used_idx(const uint32_t *ram,
+                              uint32_t used_idx_addr,
+                              uint16_t want)
+{
+    const struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000,
+    };
+
+    for (int i = 0; i < 1000; i++) {
+        if (load_u16(ram, used_idx_addr) == want)
+            return;
+        nanosleep(&delay, NULL);
+    }
+
+    fprintf(stderr, "used idx at 0x%x did not reach %u\n", used_idx_addr, want);
+    exit(1);
+}
+
 static uint64_t load_u64(const uint32_t *ram, uint32_t addr)
 {
     uint64_t value;
@@ -247,6 +283,267 @@ static void configure_test_queue(emu_state_t *emu,
                         desc_addr, driver_addr, device_addr, 0),
         0);
 }
+
+#if SEMU_HAS(VIRGL)
+static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_get_capset_info *request =
+        (struct virtio_gpu_get_capset_info *) ((uint8_t *) ram + 0x40);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x71;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    vgpu.common.generation = renderer_generation;
+    vgpu.actor_drain_generation = virtio_actor_generation(&vgpu.actor);
+    vgpu.ctrl_dispatch = (struct virtio_gpu_ctrl_dispatch_context) {
+        .active = true,
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = 7,
+        .actor_generation = vgpu.actor_drain_generation,
+        .common_generation = vgpu.common.generation,
+        .trigger_irq = true,
+    };
+    vgpu_renderer_reset_queues(renderer_generation);
+
+    request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    request->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    request->hdr.fence_id = UINT64_C(0x1234);
+    request->capset_index = 3;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*request);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(struct virtio_gpu_resp_capset_info);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.get_capset_info(&vgpu, desc, &len);
+    request->capset_index = 99;
+    request->hdr.fence_id = UINT64_C(0x9999);
+
+    require_u32("capset info is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("renderer ctrl request queued",
+                vgpu_renderer_pop_request(&queued), true);
+    require_u32("renderer ctrl request type", queued.type,
+                VGPU_RENDERER_REQ_CTRL);
+    require_u32("renderer command type", queued.command_type,
+                VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+    require_u64("renderer generation", queued.token.generation,
+                renderer_generation);
+    require_u32("renderer token id remains zero", queued.token.id, 0);
+    require_u32("payload size", queued.payload_size,
+                sizeof(struct vgpu_renderer_ctrl_payload));
+    require_ptr("payload release hook", (const void *) queued.release_payload,
+                (const void *) free);
+
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    require_u32("snapshot command type", payload->hdr.type,
+                VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+    require_u64("snapshot fence id", payload->hdr.fence_id, UINT64_C(0x1234));
+    require_u32("snapshot capset index",
+                payload->cmd.get_capset_info.capset_index, 3);
+    require_u32("response capacity", payload->response_capacity,
+                sizeof(struct virtio_gpu_resp_capset_info));
+    require_u32("completion queue", payload->ctrl_completion.queue_index,
+                VIRTIO_GPU_CONTROLQ);
+    require_u32("completion desc head", payload->ctrl_completion.desc_head, 7);
+    require_u64("completion actor generation",
+                payload->ctrl_completion.actor_generation,
+                vgpu.actor_drain_generation);
+    require_u64("completion common generation",
+                payload->ctrl_completion.common_generation,
+                renderer_generation);
+    require_u32("completion triggers irq", payload->ctrl_completion.trigger_irq,
+                true);
+    require_u32("response desc addr", payload->response_desc.addr, 0x100);
+    require_u32("response desc len", payload->response_desc.len,
+                sizeof(struct virtio_gpu_resp_capset_info));
+    queued.release_payload(queued.payload);
+
+    struct virtio_gpu_get_capset *capset_request =
+        (struct virtio_gpu_get_capset *) ((uint8_t *) ram + 0x140);
+    vgpu.ctrl_dispatch.desc_head = 8;
+    capset_request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    capset_request->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    capset_request->hdr.fence_id = UINT64_C(0x5678);
+    capset_request->capset_id = VIRTIO_GPU_CAPSET_VIRGL;
+    capset_request->capset_version = 2;
+    desc[0].addr = 0x140;
+    desc[0].len = sizeof(*capset_request);
+    desc[1].addr = 0x180;
+    desc[1].len = sizeof(struct virtio_gpu_resp_capset) + 16;
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+
+    g_virtio_gpu_backend.get_capset(&vgpu, desc, &len);
+    capset_request->capset_id = 99;
+    capset_request->capset_version = 99;
+    capset_request->hdr.fence_id = UINT64_C(0x9999);
+
+    require_u32("capset is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("capset request queued", vgpu_renderer_pop_request(&queued),
+                true);
+    require_u32("capset command type", queued.command_type,
+                VIRTIO_GPU_CMD_GET_CAPSET);
+    payload = queued.payload;
+    require_u32("snapshot capset id", payload->cmd.get_capset.capset_id,
+                VIRTIO_GPU_CAPSET_VIRGL);
+    require_u32("snapshot capset version",
+                payload->cmd.get_capset.capset_version, 2);
+    require_u32("capset desc head", payload->ctrl_completion.desc_head, 8);
+    require_u32("capset response capacity", payload->response_capacity,
+                sizeof(struct virtio_gpu_resp_capset) + 16);
+    require_u32("capset response desc addr", payload->response_desc.addr,
+                0x180);
+    queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
+    void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtio_gpu_get_capset_info *request =
+        (struct virtio_gpu_get_capset_info *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x80);
+    struct virtq_desc desc0 = {
+        .addr = 0x40,
+        .len = sizeof(*request),
+        .flags = VIRTIO_DESC_F_NEXT,
+        .next = 1,
+    };
+    struct virtq_desc desc1 = {
+        .addr = 0x80,
+        .len = sizeof(*response),
+        .flags = VIRTIO_DESC_F_WRITE,
+    };
+    struct vgpu_renderer_request queued = {0};
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+    vgpu_renderer_reset_queues(vgpu.common.generation);
+
+    request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    request->capset_index = 0;
+    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
+    memcpy((uint8_t *) ram + 0x110, &desc1, sizeof(desc1));
+    store_u16(ram, 0x200, 0);
+    store_u16(ram, 0x202, 1);
+    store_u16(ram, 0x204, 0);
+    store_u16(ram, 0x302, 0);
+
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    require_int("start actor", virtio_actor_start(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    require_int(
+        "notify hidden capset info",
+        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
+                                      vgpu.common.generation),
+        0);
+    wait_for_used_idx(ram, 0x302, 1);
+
+    require_u32("hidden capset response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_u32("hidden capset used id", load_u32(ram, 0x304), 0);
+    require_u32("hidden capset used len", load_u32(ram, 0x308),
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_int("hidden command queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_ctx_create *create =
+        (struct virtio_gpu_ctx_create *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctx_destroy *destroy =
+        (struct virtio_gpu_ctx_destroy *) ((uint8_t *) ram + 0x140);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x72;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    vgpu.common.generation = renderer_generation;
+    vgpu.actor_drain_generation = virtio_actor_generation(&vgpu.actor);
+    vgpu.ctrl_dispatch = (struct virtio_gpu_ctrl_dispatch_context) {
+        .active = true,
+        .queue_index = VIRTIO_GPU_CONTROLQ,
+        .desc_head = 8,
+        .actor_generation = vgpu.actor_drain_generation,
+        .common_generation = vgpu.common.generation,
+        .trigger_irq = true,
+    };
+    vgpu_renderer_reset_queues(renderer_generation);
+
+    create->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    create->hdr.ctx_id = 44;
+    create->nlen = 4;
+    memcpy(create->debug_name, "ctxA", 4);
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*create);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(struct virtio_gpu_ctrl_hdr);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.ctx_create(&vgpu, desc, &len);
+    require_u32("ctx create is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("ctx create queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("ctx create command type", queued.command_type,
+                VIRTIO_GPU_CMD_CTX_CREATE);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    require_u32("ctx create id snapshot", payload->cmd.ctx_create.hdr.ctx_id,
+                44);
+    require_u32("ctx create nlen snapshot", payload->cmd.ctx_create.nlen, 4);
+    require_u32("ctx create response capacity", payload->response_capacity,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 9;
+    destroy->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    destroy->hdr.ctx_id = 44;
+    desc[0].addr = 0x140;
+    desc[0].len = sizeof(*destroy);
+    len = 0;
+
+    g_virtio_gpu_backend.ctx_destroy(&vgpu, desc, &len);
+    require_u32("ctx destroy is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    require_int("ctx destroy queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("ctx destroy command type", queued.command_type,
+                VIRTIO_GPU_CMD_CTX_DESTROY);
+    payload = queued.payload;
+    require_u32("ctx destroy id snapshot", payload->cmd.ctx_destroy.hdr.ctx_id,
+                44);
+    require_u32("ctx destroy desc head", payload->ctrl_completion.desc_head, 9);
+    queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+#endif
 
 static void test_vgpu_debug_counters_init_and_reset_to_zero(void)
 {
@@ -727,6 +1024,9 @@ int main(void)
     test_vgpu_virgl_gate_keeps_unsupported_features_hidden();
     test_deferred_ctrl_completion_revalidates_generations();
 #if SEMU_HAS(VIRGL)
+    test_hidden_virgl_command_returns_undefined_without_renderer_work();
+    test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
+    test_virgl_context_handlers_submit_ctrl_skeletons();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_completion_drops_stale_common_generation();
     test_renderer_ctrl_completion_without_metadata_fails();

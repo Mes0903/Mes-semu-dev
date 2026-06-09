@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <virglrenderer.h>
@@ -315,6 +316,148 @@ void vgpu_virgl_reset_renderer(void)
     virgl_renderer_reset();
 }
 
+static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
+{
+    uint32_t max_version = 0;
+    uint32_t max_size = 0;
+    uint32_t index = 0;
+
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL, &max_version,
+                               &max_size);
+    if (max_version && max_size) {
+        if (capset_index == index)
+            return VIRTIO_GPU_CAPSET_VIRGL;
+        index++;
+    }
+
+    max_version = 0;
+    max_size = 0;
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_version,
+                               &max_size);
+    if (max_version && max_size && capset_index == index)
+        return VIRTIO_GPU_CAPSET_VIRGL2;
+
+    return 0;
+}
+
+static void vgpu_virgl_complete_ctrl_request(
+    const struct vgpu_renderer_request *request,
+    const struct vgpu_renderer_ctrl_payload *payload,
+    uint32_t response_type,
+    void *response,
+    size_t response_size)
+{
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = request->token,
+        .response_type = response_type,
+        .response = response,
+        .response_size = response_size,
+        .release_response = free,
+        .has_ctrl_completion = true,
+        .ctrl_completion = payload->ctrl_completion,
+        .has_response_desc = true,
+        .request_hdr = payload->hdr,
+        .response_desc = payload->response_desc,
+    };
+
+    (void) vgpu_renderer_complete(&completion);
+}
+
+static void vgpu_virgl_execute_ctrl_request(
+    const struct vgpu_renderer_request *request,
+    const struct vgpu_renderer_ctrl_payload *payload)
+{
+    uint32_t response_type = payload->response_type;
+    void *response = NULL;
+    size_t response_size = 0;
+
+    switch (request->command_type) {
+    case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
+        const struct virtio_gpu_get_capset_info *cmd =
+            &payload->cmd.get_capset_info;
+        struct virtio_gpu_resp_capset_info *out = calloc(1, sizeof(*out));
+        if (!out) {
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            break;
+        }
+
+        out->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            out->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+            out->hdr.fence_id = cmd->hdr.fence_id;
+        }
+        out->capset_id = vgpu_virgl_capset_id_for_index(cmd->capset_index);
+        if (out->capset_id) {
+            uint32_t max_version = 0;
+            uint32_t max_size = 0;
+
+            virgl_renderer_get_cap_set(out->capset_id, &max_version, &max_size);
+            out->capset_max_version = max_version;
+            out->capset_max_size = max_size;
+        }
+        response = out;
+        response_size = sizeof(*out);
+        response_type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+        break;
+    }
+    case VIRTIO_GPU_CMD_GET_CAPSET: {
+        const struct virtio_gpu_get_capset *cmd = &payload->cmd.get_capset;
+        uint32_t max_version = 0;
+        uint32_t max_size = 0;
+
+        virgl_renderer_get_cap_set(cmd->capset_id, &max_version, &max_size);
+        if (!max_version || !max_size || cmd->capset_version > max_version) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+
+        response_size = sizeof(struct virtio_gpu_resp_capset) + max_size;
+        if (response_size < max_size || response_size > UINT32_MAX ||
+            payload->response_capacity < response_size) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            response_size = 0;
+            break;
+        }
+
+        struct virtio_gpu_resp_capset *out = calloc(1, response_size);
+        if (!out) {
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            response_size = 0;
+            break;
+        }
+        out->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            out->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+            out->hdr.fence_id = cmd->hdr.fence_id;
+        }
+        virgl_renderer_fill_caps(cmd->capset_id, cmd->capset_version,
+                                 out->capset_data);
+        response = out;
+        response_type = VIRTIO_GPU_RESP_OK_CAPSET;
+        break;
+    }
+    case VIRTIO_GPU_CMD_CTX_CREATE: {
+        const struct virtio_gpu_ctx_create *cmd = &payload->cmd.ctx_create;
+        int ret = virgl_renderer_context_create(cmd->hdr.ctx_id, cmd->nlen,
+                                                cmd->debug_name);
+        response_type =
+            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
+    case VIRTIO_GPU_CMD_CTX_DESTROY:
+        virgl_renderer_context_destroy(payload->cmd.ctx_destroy.hdr.ctx_id);
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    default:
+        response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        break;
+    }
+
+    vgpu_virgl_complete_ctrl_request(request, payload, response_type, response,
+                                     response_size);
+}
+
 bool vgpu_virgl_submit_fence(uint64_t generation,
                              bool context_fence,
                              uint32_t ctx_id,
@@ -372,6 +515,13 @@ void vgpu_virgl_execute_renderer_request(
         break;
     case VGPU_RENDERER_REQ_RESET:
         vgpu_virgl_reset_renderer();
+        break;
+    case VGPU_RENDERER_REQ_CTRL:
+        vgpu_virgl_execute_ctrl_request(
+            request,
+            (const struct vgpu_renderer_ctrl_payload *) request->payload);
+        if (request->release_payload)
+            request->release_payload(request->payload);
         break;
     default:
         break;

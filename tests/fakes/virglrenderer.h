@@ -43,4 +43,12 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
                                         uint32_t flags,
                                         uint32_t ring_idx,
                                         uint64_t fence_id);
+void virgl_renderer_get_cap_set(uint32_t set,
+                                uint32_t *max_ver,
+                                uint32_t *max_size);
+void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps);
+int virgl_renderer_context_create(uint32_t handle,
+                                  uint32_t nlen,
+                                  const char *name);
+void virgl_renderer_context_destroy(uint32_t handle);
 void virgl_renderer_reset(void);

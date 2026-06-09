@@ -15,6 +15,7 @@
 #define VIRTIO_GPU_MAX_SCANOUTS 16
 #define VIRTIO_GPU_LOG_PREFIX "[SEMU VGPU] "
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
+#define VIRTIO_GPU_RESPONSE_DEFERRED UINT32_MAX
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 #define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
 
@@ -22,6 +23,9 @@
 #define VIRTIO_GPU_F_EDID (UINT64_C(1) << 1)
 #define VIRTIO_GPU_F_CONTEXT_INIT (UINT64_C(1) << 4)
 #define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
+
+#define VIRTIO_GPU_CAPSET_VIRGL 1
+#define VIRTIO_GPU_CAPSET_VIRGL2 2
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
@@ -372,6 +376,8 @@ struct virtio_gpu_cmd_backend {
     virtio_gpu_cmd_func move_cursor;
 };
 
+extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
+
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
                                    uint32_t size);
@@ -444,6 +450,20 @@ void virtio_gpu_get_display_info_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_get_edid_handler(virtio_gpu_state_t *vgpu,
                                  struct virtq_desc *vq_desc,
                                  uint32_t *plen);
+#if SEMU_HAS(VIRGL)
+void virtio_gpu_virgl_get_capset_info_handler(virtio_gpu_state_t *vgpu,
+                                              struct virtq_desc *vq_desc,
+                                              uint32_t *plen);
+void virtio_gpu_virgl_get_capset_handler(virtio_gpu_state_t *vgpu,
+                                         struct virtq_desc *vq_desc,
+                                         uint32_t *plen);
+void virtio_gpu_virgl_ctx_create_handler(virtio_gpu_state_t *vgpu,
+                                         struct virtq_desc *vq_desc,
+                                         uint32_t *plen);
+void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
+                                          struct virtq_desc *vq_desc,
+                                          uint32_t *plen);
+#endif
 void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
                                       struct virtq_desc *vq_desc,
                                       uint32_t *plen);

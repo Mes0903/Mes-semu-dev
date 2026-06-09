@@ -49,6 +49,20 @@ struct vgpu_renderer_token {
     uint64_t generation;
 };
 
+struct vgpu_renderer_ctrl_payload {
+    struct virtio_gpu_ctrl_hdr hdr;
+    union {
+        struct virtio_gpu_get_capset_info get_capset_info;
+        struct virtio_gpu_get_capset get_capset;
+        struct virtio_gpu_ctx_create ctx_create;
+        struct virtio_gpu_ctx_destroy ctx_destroy;
+    } cmd;
+    size_t response_capacity;
+    uint32_t response_type;
+    struct virtio_gpu_deferred_ctrl_completion ctrl_completion;
+    struct virtq_desc response_desc;
+};
+
 struct vgpu_renderer_request {
     enum vgpu_renderer_request_type type;
     struct vgpu_renderer_token token;

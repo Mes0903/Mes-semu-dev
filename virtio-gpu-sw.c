@@ -1800,14 +1800,24 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .transfer_to_host_2d = vgpu_sw_cmd_transfer_to_host_2d_handler,
     .resource_attach_backing = vgpu_sw_cmd_resource_attach_backing_handler,
     .resource_detach_backing = vgpu_sw_cmd_resource_detach_backing_handler,
+#if SEMU_HAS(VIRGL)
+    .get_capset_info = virtio_gpu_virgl_get_capset_info_handler,
+    .get_capset = virtio_gpu_virgl_get_capset_handler,
+#else
     .get_capset_info = VIRTIO_GPU_CMD_UNDEF,
     .get_capset = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .get_edid = virtio_gpu_get_edid_handler,
     .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
     .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
     .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
+#if SEMU_HAS(VIRGL)
+    .ctx_create = virtio_gpu_virgl_ctx_create_handler,
+    .ctx_destroy = virtio_gpu_virgl_ctx_destroy_handler,
+#else
     .ctx_create = VIRTIO_GPU_CMD_UNDEF,
     .ctx_destroy = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .ctx_attach_resource = VIRTIO_GPU_CMD_UNDEF,
     .ctx_detach_resource = VIRTIO_GPU_CMD_UNDEF,
     .resource_create_3d = VIRTIO_GPU_CMD_UNDEF,

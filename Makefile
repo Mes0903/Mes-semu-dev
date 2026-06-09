@@ -404,6 +404,11 @@ test-vgpu-error-policy:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c vgpu-display.c vgpu-rect.c -Wl,--gc-sections -o /tmp/test-vgpu-error-policy $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-error-policy
 
+.PHONY: test-vgpu-deferred-drain
+test-vgpu-deferred-drain:
+	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-deferred-drain.c virtio-gpu.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c -Wl,--gc-sections -o /tmp/test-vgpu-deferred-drain $(HOST_TEST_LDLIBS)
+	/tmp/test-vgpu-deferred-drain
+
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:
 	$(Q)bash tests/test-vgpu-virgl-make-gate.sh
@@ -456,7 +461,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-virgl-gate test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-virtio-blk-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-executor-config test-hart-executor
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
