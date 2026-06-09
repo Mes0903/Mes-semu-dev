@@ -42,6 +42,7 @@ enum vgpu_virgl_resource_side_effect_type {
 struct vgpu_virgl_scanout_side_effect {
     uint32_t scanout_id;
     uint64_t scanout_generation;
+    uint64_t resource_generation;
     struct virtio_gpu_scanout_info scanout;
 };
 
@@ -60,6 +61,7 @@ struct vgpu_renderer_ctrl_payload {
         struct virtio_gpu_res_unref resource_unref;
         struct virtio_gpu_res_attach_backing resource_attach_backing;
         struct virtio_gpu_res_detach_backing resource_detach_backing;
+        struct virtio_gpu_set_scanout set_scanout;
         struct virtio_gpu_resource_create_blob resource_create_blob;
         struct virtio_gpu_resource_create_3d resource_create_3d;
         struct virtio_gpu_transfer_host_3d transfer_3d;
@@ -70,6 +72,8 @@ struct vgpu_renderer_ctrl_payload {
     void *submit_data;
     size_t submit_data_size;
     uint64_t resource_generation;
+    uint64_t scanout_generation;
+    struct virtio_gpu_scanout_info scanout;
     size_t response_capacity;
     uint32_t response_type;
     struct virtio_gpu_deferred_ctrl_completion ctrl_completion;

@@ -1108,6 +1108,782 @@ static void test_virgl_resource_create_3d_rejects_live_2d_resource_id(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_virgl_set_scanout_3d_defers_and_commits_by_generation(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 39);
+    data = vgpu.priv;
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 62;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 320;
+    create->height = 240;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create for scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create for scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.x = 4;
+    scanout->r.y = 8;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 62;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 40;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("3d set scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_u32("3d set scanout does not commit before renderer",
+                data->scanouts[0].primary_resource_id, 0);
+
+    require_int("3d set scanout queued", vgpu_renderer_pop_request(&queued),
+                true);
+    require_u32("3d set scanout command type", queued.command_type,
+                VIRTIO_GPU_CMD_SET_SCANOUT);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    require_u32("3d set scanout snapshots scanout id",
+                payload->cmd.set_scanout.scanout_id, 0);
+    require_u32("3d set scanout snapshots resource id",
+                payload->cmd.set_scanout.resource_id, 62);
+    require_u32("3d set scanout snapshots rect x", payload->cmd.set_scanout.r.x,
+                4);
+    require_u32("3d set scanout snapshots rect width",
+                payload->cmd.set_scanout.r.width, 160);
+    require_false("3d set scanout generation assigned",
+                  payload->scanout_generation == 0);
+
+    scanout->resource_id = 999;
+    scanout->r.width = 1;
+    require_u32("3d set scanout payload is host-owned resource id",
+                payload->cmd.set_scanout.resource_id, 62);
+    require_u32("3d set scanout payload is host-owned width",
+                payload->cmd.set_scanout.r.width, 160);
+
+    struct vgpu_renderer_completion stale = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation =
+                                payload->scanout_generation + 1,
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 62,
+                                    .src_x = 4,
+                                    .src_y = 8,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale);
+    require_u32("stale 3d set scanout side effect does not commit",
+                data->scanouts[0].primary_resource_id, 0);
+
+    stale.virgl_resource.scanouts[0].scanout_generation =
+        payload->scanout_generation;
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale);
+    require_u32("3d set scanout commit resource",
+                data->scanouts[0].primary_resource_id, 62);
+    require_u32("3d set scanout commit src x", data->scanouts[0].src_x, 4);
+    require_u32("3d set scanout commit src y", data->scanouts[0].src_y, 8);
+    require_u32("3d set scanout commit src width", data->scanouts[0].src_w,
+                160);
+    require_u32("3d set scanout commit src height", data->scanouts[0].src_h,
+                120);
+
+    queued.release_payload(queued.payload);
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_set_scanout_3d_enqueue_failure_cancels_generation(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 40);
+    data = vgpu.priv;
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 63;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 320;
+    create->height = 240;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create for failed scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create for failed scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.x = 0;
+    scanout->r.y = 0;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 63;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 41;
+    len = 0;
+
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("first 3d set scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("first 3d set scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t first_generation = payload->scanout_generation;
+    require_false("first 3d set scanout generation assigned",
+                  first_generation == 0);
+    queued.release_payload(queued.payload);
+
+    for (uint32_t i = 0; i < VGPU_RENDERER_QUEUE_CAPACITY; i++) {
+        struct vgpu_renderer_request filler = {
+            .type = VGPU_RENDERER_REQ_RESET,
+            .token = {.generation = renderer_generation},
+        };
+        require_int("fill renderer queue before failed scanout",
+                    vgpu_renderer_submit(&filler), true);
+    }
+
+    vgpu.ctrl_dispatch.desc_head = 42;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("failed 3d set scanout response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("failed 3d set scanout response", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+
+    struct vgpu_renderer_completion stale = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation = first_generation + 1,
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 63,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale);
+    require_u32("failed 3d set scanout generation is cancelled",
+                data->scanouts[0].primary_resource_id, 0);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_set_scanout_3d_stale_after_2d_bind_is_ignored(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_3d_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc create_2d_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create_3d =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_res_create_2d *create_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x200);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 43);
+    data = vgpu.priv;
+
+    create_3d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create_3d->resource_id = 64;
+    create_3d->target = 2;
+    create_3d->format = 3;
+    create_3d->bind = 4;
+    create_3d->width = 320;
+    create_3d->height = 240;
+    create_3d->depth = 1;
+    create_3d->array_size = 1;
+    create_3d->nr_samples = 1;
+    create_3d_desc[0].addr = 0x40;
+    create_3d_desc[0].len = sizeof(*create_3d);
+    create_3d_desc[1].addr = 0x180;
+    create_3d_desc[1].len = sizeof(*response);
+    create_3d_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_3d_desc, &len);
+    require_u32("3d create before 2d bind race is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before 2d bind race queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.x = 4;
+    scanout->r.y = 8;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 64;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 43;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("3d set scanout before 2d bind race is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d set scanout before 2d bind race queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    uint64_t old_generation = payload->scanout_generation;
+    queued.release_payload(queued.payload);
+
+    create_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create_2d->resource_id = 65;
+    create_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create_2d->width = 320;
+    create_2d->height = 240;
+    create_2d_desc[0].addr = 0x200;
+    create_2d_desc[0].len = sizeof(*create_2d);
+    create_2d_desc[1].addr = 0x180;
+    create_2d_desc[1].len = sizeof(*response);
+    create_2d_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, create_2d_desc, &len);
+    require_u32("2d create for bind race response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d create for bind race response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    scanout->resource_id = 65;
+    scanout->r.x = 0;
+    scanout->r.y = 0;
+    scanout->r.width = 320;
+    scanout->r.height = 240;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("2d bind after pending 3d response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d bind after pending 3d response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+    require_u32("2d bind wins before stale 3d side effect",
+                data->scanouts[0].primary_resource_id, 65);
+
+    struct vgpu_renderer_completion stale = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation = old_generation,
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 64,
+                                    .src_x = 4,
+                                    .src_y = 8,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &stale);
+    require_u32("stale 3d side effect cannot replace newer 2d bind",
+                data->scanouts[0].primary_resource_id, 65);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_unref_clears_committed_3d_scanout(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc unref_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 44);
+    data = vgpu.priv;
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 66;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 320;
+    create->height = 240;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before unref scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before unref scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    uint64_t resource_generation = create_payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 66;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 44;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("3d set scanout before unref is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d set scanout before unref queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *scanout_payload = queued.payload;
+    uint64_t scanout_generation = scanout_payload->scanout_generation;
+    queued.release_payload(queued.payload);
+
+    struct vgpu_renderer_completion set_scanout = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation = scanout_generation,
+                            .resource_generation = resource_generation,
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 66,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &set_scanout);
+    require_u32("3d scanout committed before unref",
+                data->scanouts[0].primary_resource_id, 66);
+
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 66;
+    unref_desc[0].addr = 0x140;
+    unref_desc[0].len = sizeof(*unref);
+    unref_desc[1].addr = 0x180;
+    unref_desc[1].len = sizeof(*response);
+    unref_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    require_u32("3d unref scanout resource is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d unref scanout resource queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    struct vgpu_renderer_completion unref_done = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF,
+                .resource_id = 66,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &unref_done);
+    require_u32("3d unref clears committed scanout resource",
+                data->scanouts[0].primary_resource_id, 0);
+    require_u32("3d unref clears committed scanout width",
+                data->scanouts[0].src_w, 0);
+    require_u32("3d unref clears committed scanout height",
+                data->scanouts[0].src_h, 0);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_unref_completion_preserves_reused_2d_scanout(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_3d_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc create_2d_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc unref_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create_3d =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_res_unref *unref =
+        (struct virtio_gpu_res_unref *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_res_create_2d *create_2d =
+        (struct virtio_gpu_res_create_2d *) ((uint8_t *) ram + 0x1c0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x220);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 45);
+    data = vgpu.priv;
+
+    create_3d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create_3d->resource_id = 67;
+    create_3d->target = 2;
+    create_3d->format = 3;
+    create_3d->bind = 4;
+    create_3d->width = 320;
+    create_3d->height = 240;
+    create_3d->depth = 1;
+    create_3d->array_size = 1;
+    create_3d->nr_samples = 1;
+    create_3d_desc[0].addr = 0x40;
+    create_3d_desc[0].len = sizeof(*create_3d);
+    create_3d_desc[1].addr = 0x220;
+    create_3d_desc[1].len = sizeof(*response);
+    create_3d_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_3d_desc, &len);
+    require_u32("3d create before 2d scanout reuse is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before 2d scanout reuse queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *create_payload = queued.payload;
+    uint64_t resource_generation = create_payload->resource_generation;
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 67;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x220;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 45;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("3d set scanout before 2d reuse is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d set scanout before 2d reuse queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *scanout_payload = queued.payload;
+    uint64_t scanout_generation = scanout_payload->scanout_generation;
+    queued.release_payload(queued.payload);
+
+    struct vgpu_renderer_completion set_scanout = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation = scanout_generation,
+                            .resource_generation = resource_generation,
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 67,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &set_scanout);
+    require_u32("3d scanout committed before 2d reuse",
+                data->scanouts[0].primary_resource_id, 67);
+
+    unref->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    unref->resource_id = 67;
+    unref_desc[0].addr = 0x140;
+    unref_desc[0].len = sizeof(*unref);
+    unref_desc[1].addr = 0x220;
+    unref_desc[1].len = sizeof(*response);
+    unref_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_unref(&vgpu, unref_desc, &len);
+    require_u32("3d unref before 2d scanout reuse is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d unref before 2d scanout reuse queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    create_2d->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create_2d->resource_id = 67;
+    create_2d->format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create_2d->width = 64;
+    create_2d->height = 64;
+    create_2d_desc[0].addr = 0x1c0;
+    create_2d_desc[0].len = sizeof(*create_2d);
+    create_2d_desc[1].addr = 0x220;
+    create_2d_desc[1].len = sizeof(*response);
+    create_2d_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_2d(&vgpu, create_2d_desc, &len);
+    require_u32("2d reuse after 3d scanout unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d reuse after 3d scanout unref response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+
+    scanout->resource_id = 67;
+    scanout->r.x = 0;
+    scanout->r.y = 0;
+    scanout->r.width = 64;
+    scanout->r.height = 64;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("2d scanout bind after 3d unref response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("2d scanout bind after 3d unref response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+    require_u32("2d scanout bind wins before stale 3d unref",
+                data->scanouts[0].primary_resource_id, 67);
+    require_u32("2d scanout bind width before stale 3d unref",
+                data->scanouts[0].src_w, 64);
+
+    struct vgpu_renderer_completion unref_done = {
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_UNREF,
+                .resource_id = 67,
+                .resource_generation = resource_generation,
+            },
+    };
+    g_virtio_gpu_backend.apply_renderer_side_effect(&vgpu, &unref_done);
+    require_u32("stale 3d unref cannot clear reused 2d scanout resource",
+                data->scanouts[0].primary_resource_id, 67);
+    require_u32("stale 3d unref cannot clear reused 2d scanout width",
+                data->scanouts[0].src_w, 64);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_set_scanout_3d_rejects_invalid_inputs(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x76;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 41);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->r.width = 16;
+    scanout->r.height = 16;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 999;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("missing 3d set scanout response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("missing 3d set scanout response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    struct vgpu_renderer_request queued = {0};
+    require_int("missing 3d set scanout queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 62;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 320;
+    create->height = 240;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    len = 0;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create for invalid scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d create for invalid scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    scanout->resource_id = 62;
+    scanout->scanout_id = VIRTIO_GPU_MAX_SCANOUTS;
+    response->type = 0;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("invalid 3d scanout response len", len,
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("invalid 3d scanout response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
+    require_int("invalid 3d scanout queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+
 static void test_virgl_resource_unref_handler_defers_and_frees_namespace(void)
 {
     uint32_t ram[1024] = {0};
@@ -2891,6 +3667,12 @@ int main(void)
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
     test_virgl_resource_create_blob_handler_tracks_pending_resource();
     test_virgl_resource_create_3d_rejects_live_2d_resource_id();
+    test_virgl_set_scanout_3d_defers_and_commits_by_generation();
+    test_virgl_set_scanout_3d_enqueue_failure_cancels_generation();
+    test_virgl_set_scanout_3d_stale_after_2d_bind_is_ignored();
+    test_virgl_unref_clears_committed_3d_scanout();
+    test_virgl_unref_completion_preserves_reused_2d_scanout();
+    test_virgl_set_scanout_3d_rejects_invalid_inputs();
     test_virgl_resource_unref_handler_defers_and_frees_namespace();
     test_virgl_resource_unref_sync_submit_failure_restores_namespace();
     test_virgl_resource_unref_stale_rollback_after_2d_reuse();
