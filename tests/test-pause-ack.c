@@ -640,6 +640,47 @@ static void test_threaded_rfence_failure_drains_published_ack(void)
     test_emu_destroy(&emu);
 }
 
+static void test_dma_invalidation_callback_does_not_issue_blocking_rfence(void)
+{
+    emu_state_t emu;
+    test_emu_init(&emu, 2);
+    emu.executor_backend = HART_EXEC_DEDICATED_THREADS;
+    emu.executor.ops = &spy_rfence_ops;
+    __atomic_store_n(&spy_rfence_request_calls, 0, __ATOMIC_RELEASE);
+    spy_rfence_fail_on_call = 1;
+
+    semu_ram_dma_write_invalidate(&emu, 0x1000, 4);
+
+    require_int("DMA invalidation does not request RFENCE",
+                __atomic_load_n(&spy_rfence_request_calls, __ATOMIC_ACQUIRE),
+                0);
+    require_int("DMA invalidation leaves RFENCE pending count",
+                semu_rfence_pending_count_load(&emu), 0);
+    require_int("DMA invalidation leaves RFENCE type",
+                semu_rfence_type_load(&emu), SEMU_RFENCE_NONE);
+    require_int("DMA invalidation leaves hart 0 RFENCE clear",
+                hart_pending_rfence_load(emu.vm.hart[0]), false);
+    require_int("DMA invalidation leaves hart 1 RFENCE clear",
+                hart_pending_rfence_load(emu.vm.hart[1]), false);
+    require_int("DMA invalidation does not stop VM", emu_stopped_load(&emu),
+                false);
+
+    uint64_t generation = __atomic_load_n(
+        &emu.vm.dma_write_invalidate_generation, __ATOMIC_ACQUIRE);
+    require_u64("DMA invalidation generation published", generation, 1);
+
+    emu.vm.hart[0]->cache_fetch[0].n_pages = 7;
+    emu.vm.hart[0]->cache_fetch[0].page_addr = (uint32_t *) &emu;
+    semu_process_pending_rfence(emu.vm.hart[0]);
+    require_u64("DMA invalidation generation consumed",
+                emu.vm.hart[0]->dma_write_invalidate_generation_seen,
+                generation);
+    require_u32("DMA invalidation safe point drops fetch cache",
+                emu.vm.hart[0]->cache_fetch[0].n_pages, 0xFFFFFFFFU);
+
+    test_emu_destroy(&emu);
+}
+
 static void test_hsm_start_rejected_while_pause_active(void)
 {
     emu_state_t emu;
@@ -833,6 +874,7 @@ int main(void)
     test_pause_target_parked_before_publish_is_acknowledged();
     test_paused_hart_services_rfence_without_guest_progress();
     test_threaded_rfence_failure_drains_published_ack();
+    test_dma_invalidation_callback_does_not_issue_blocking_rfence();
     test_hsm_start_rejected_while_pause_active();
     test_hsm_start_holds_lifecycle_lock_until_started_publish();
     test_suspended_interrupt_resume_defers_while_paused();

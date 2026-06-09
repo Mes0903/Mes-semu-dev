@@ -50,11 +50,11 @@ static void *io_thread_func(void *arg);
 static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu);
 static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu);
 static volatile sig_atomic_t signal_received = 0;
-static __thread hart_t *semu_current_hart = NULL;
 #if SEMU_PAUSE_ACK_TEST_HOOKS
 static void (*semu_hsm_start_before_publish_hook)(emu_state_t *emu,
                                                   hart_t *target);
 #endif
+static void semu_process_pending_dma_invalidation(hart_t *hart);
 static void semu_process_pending_rfence(hart_t *hart);
 static void semu_ram_dma_write_invalidate(void *opaque,
                                           guest_paddr_t addr,
@@ -479,6 +479,8 @@ static void UNUSED semu_rfence_ack(emu_state_t *emu)
 
 static void semu_process_pending_rfence(hart_t *hart)
 {
+    semu_process_pending_dma_invalidation(hart);
+
     if (!hart_pending_rfence_load(hart))
         return;
 
@@ -1743,113 +1745,18 @@ static sbi_ret_t semu_rfence_request(hart_t *hart,
                                 start_addr, size, asid);
 }
 
-static void semu_ram_dma_write_invalidate_direct(emu_state_t *emu)
+static void semu_process_pending_dma_invalidation(hart_t *hart)
 {
-    if (!emu || !emu->vm.hart)
+    if (!hart || !hart->vm)
         return;
 
-    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
-        hart_t *hart = emu->vm.hart[i];
-        if (hart)
-            semu_apply_rfence(hart, SEMU_RFENCE_I, 0, (uint32_t) -1);
-    }
-}
-
-static bool semu_ram_dma_wait_for_rfence(emu_state_t *emu)
-{
-    bool stopped;
-
-    pthread_mutex_lock(&emu->rfence.completion_mutex);
-    while (semu_rfence_pending_count_load(emu) > 0 && !emu_stopped_load(emu))
-        pthread_cond_wait(&emu->rfence.completion_cond,
-                          &emu->rfence.completion_mutex);
-    stopped = semu_rfence_pending_count_load(emu) > 0;
-    pthread_mutex_unlock(&emu->rfence.completion_mutex);
-    return !stopped;
-}
-
-static void semu_ram_dma_rfence_failed(emu_state_t *emu)
-{
-    emu_threaded_fatal_store(emu, true);
-    semu_runtime_enter_failed(emu);
-    semu_set_stopped(emu, true);
-}
-
-static void semu_ram_dma_write_invalidate_threaded(emu_state_t *emu)
-{
-    vm_t *vm = &emu->vm;
-    hart_t *current = semu_current_hart;
-    int32_t pending_count = 0;
-    int32_t published_count = 0;
-    bool publish_failed = false;
-
-    if (!vm->hart || vm->n_hart == 0)
+    uint64_t generation = __atomic_load_n(
+        &hart->vm->dma_write_invalidate_generation, __ATOMIC_ACQUIRE);
+    if (hart->dma_write_invalidate_generation_seen == generation)
         return;
-    if (current && current->vm != vm)
-        current = NULL;
 
-    bool pending_targets[vm->n_hart];
-    memset(pending_targets, 0, sizeof(pending_targets));
-
-    if (current)
-        semu_lock_rfence_issue(emu, current);
-    else
-        pthread_mutex_lock(&emu->rfence.issue_mutex);
-
-    emu->rfence.start_addr = 0;
-    emu->rfence.size = (uint32_t) -1;
-    emu->rfence.asid = 0;
-    semu_rfence_type_store(emu, SEMU_RFENCE_I);
-
-    for (uint32_t i = 0; i < vm->n_hart; i++) {
-        hart_t *target = vm->hart[i];
-        if (!target)
-            continue;
-
-        if (target == current ||
-            hart_hsm_status_load(target) != SBI_HSM_STATE_STARTED) {
-            semu_apply_rfence(target, SEMU_RFENCE_I, 0, (uint32_t) -1);
-            continue;
-        }
-
-        pending_targets[i] = true;
-        pending_count++;
-    }
-
-    semu_rfence_pending_count_store(emu, pending_count);
-    for (uint32_t i = 0; i < vm->n_hart; i++) {
-        if (!pending_targets[i])
-            continue;
-
-        int ret = hart_executor_request_rfence(emu, UINT32_C(1), i, 0);
-        if (ret < 0) {
-            int32_t unpublished_count = pending_count - published_count;
-            if (unpublished_count > 0) {
-                int32_t previous = __atomic_fetch_sub(
-                    &emu->rfence.pending_count, unpublished_count,
-                    __ATOMIC_ACQ_REL);
-                if (previous <= unpublished_count) {
-                    pthread_mutex_lock(&emu->rfence.completion_mutex);
-                    pthread_cond_broadcast(&emu->rfence.completion_cond);
-                    pthread_mutex_unlock(&emu->rfence.completion_mutex);
-                }
-            }
-            publish_failed = true;
-            break;
-        }
-        published_count++;
-    }
-
-    if (published_count > 0)
-        semu_lifecycle_notify(emu);
-
-    bool completed = semu_ram_dma_wait_for_rfence(emu);
-    if (completed)
-        semu_rfence_type_store(emu, SEMU_RFENCE_NONE);
-    pthread_mutex_unlock(&emu->rfence.issue_mutex);
-
-    if (publish_failed)
-        semu_ram_dma_rfence_failed(emu);
+    hart->dma_write_invalidate_generation_seen = generation;
+    semu_apply_rfence(hart, SEMU_RFENCE_I, 0, (uint32_t) -1);
 }
 
 static void semu_ram_dma_write_invalidate(void *opaque,
@@ -1861,19 +1768,16 @@ static void semu_ram_dma_write_invalidate(void *opaque,
     if (!emu || len == 0)
         return;
 
-    /* DMA reports a guest physical range. The current per-hart caches are
-     * virtual-address translation/fetch caches, so aliases make a physical
-     * range flush unsafe. Until caches or future JIT state are PA-tagged,
-     * treat any DMA write as a conservative RFENCE.I-equivalent full drop.
+    /* DMA reports a guest physical range, while current hart caches are
+     * virtual-address translation/fetch caches. Publish a conservative VM-wide
+     * generation and let harts drop local cache state at safe points. This
+     * callback may run under device/actor locks, so it must not issue or wait
+     * for a synchronous remote RFENCE.
      */
     (void) addr;
-    if (!semu_should_use_threaded_runtime(emu) ||
-        !semu_rfence_initialized_load(emu)) {
-        semu_ram_dma_write_invalidate_direct(emu);
-        return;
-    }
-
-    semu_ram_dma_write_invalidate_threaded(emu);
+    __atomic_fetch_add(&emu->vm.dma_write_invalidate_generation, 1,
+                       __ATOMIC_RELEASE);
+    semu_signal_all_harts(emu);
 }
 
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
@@ -2667,7 +2571,6 @@ static void *hart_thread_func(void *arg)
     hart_t *hart = (hart_t *) arg;
     emu_state_t *emu = PRIV(hart);
 
-    semu_current_hart = hart;
     while (!emu_stopped_load(emu)) {
         if (signal_received) {
             semu_set_stopped(emu, true);
@@ -2709,7 +2612,6 @@ static void *hart_thread_func(void *arg)
         }
     }
 
-    semu_current_hart = NULL;
     return NULL;
 }
 
