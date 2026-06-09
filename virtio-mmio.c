@@ -220,21 +220,43 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                        uint16_t queue_index,
                                        uint64_t generation)
 {
+    bool lifecycle_locked = false;
+    bool lifecycle_accepting;
     bool still_current;
     int ret;
 
     pthread_mutex_lock(&common->backend_lock);
+    ret = virtio_mmio_lock_notify_lifecycle_gate(common, &lifecycle_locked);
+    if (ret < 0) {
+        pthread_mutex_unlock(&common->backend_lock);
+        return ret;
+    }
+
     pthread_mutex_lock(&common->transport_lock);
     still_current = common->generation == generation &&
                     queue_index < common->num_queues &&
                     common->queues[queue_index].ready;
+    lifecycle_accepting = virtio_mmio_notify_lifecycle_accepting(
+        common, lifecycle_locked);
     pthread_mutex_unlock(&common->transport_lock);
 
     if (!still_current) {
+        virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
         pthread_mutex_unlock(&common->backend_lock);
         return -ECANCELED;
     }
 
+    if (!lifecycle_accepting) {
+        virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
+        pthread_mutex_unlock(&common->backend_lock);
+        return 0;
+    }
+
+    /* The decision to enqueue backend work is serialized with lifecycle
+     * accepting state; release before running potentially blocking backend
+     * work.
+     */
+    virtio_mmio_unlock_notify_lifecycle_gate(common, lifecycle_locked);
     ret = ops->notify_queue(opaque, queue_index, generation);
     pthread_mutex_unlock(&common->backend_lock);
     return ret;
@@ -692,7 +714,7 @@ int virtio_mmio_write(struct virtio_device_common *common,
         }
         if (!virtio_mmio_notify_lifecycle_accepting(
                 common, notify_lifecycle_locked)) {
-            ret = -ESHUTDOWN;
+            /* Lifecycle-canceled notifies are valid guest MMIO stores. */
             break;
         }
         if (common->ops && common->ops->notify_queue) {

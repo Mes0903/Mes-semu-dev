@@ -293,6 +293,58 @@ static void test_debug_runtime_exit_stops_lifecycle(void)
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
+static void test_debug_unsupported_config_fails_lifecycle(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.vm.n_hart = 2;
+    emu.exit_code = 99;
+    gdbstub_init_result = true;
+    gdbstub_run_result = true;
+    gdbstub_init_calls = 0;
+    gdbstub_run_calls = 0;
+    gdbstub_close_calls = 0;
+
+    semu_run_debug(&emu);
+
+    require_int("debug unsupported exit code", emu.exit_code, 1);
+    require_int("debug unsupported skips init", gdbstub_init_calls, 0);
+    require_int("debug unsupported skips run", gdbstub_run_calls, 0);
+    require_int("debug unsupported skips close", gdbstub_close_calls, 0);
+    require_int("debug unsupported lifecycle failed",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_FAILED);
+    require_bool("debug unsupported lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
+static void test_debug_init_failure_fails_lifecycle(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.vm.n_hart = 1;
+    emu.exit_code = 99;
+    gdbstub_init_result = false;
+    gdbstub_run_result = true;
+    gdbstub_init_calls = 0;
+    gdbstub_run_calls = 0;
+    gdbstub_close_calls = 0;
+
+    semu_run_debug(&emu);
+
+    require_int("debug init failure init called", gdbstub_init_calls, 1);
+    require_int("debug init failure skips run", gdbstub_run_calls, 0);
+    require_int("debug init failure skips close", gdbstub_close_calls, 0);
+    require_int("debug init failure exit code", emu.exit_code, 1);
+    require_int("debug init failure lifecycle failed",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_FAILED);
+    require_bool("debug init failure lifecycle not accepting",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 static void test_runtime_enters_running_before_threaded_executor_start(void)
 {
     emu_state_t emu;
@@ -328,6 +380,8 @@ int main(void)
     test_threaded_start_failure_leaves_lifecycle_failed();
     test_single_thread_runtime_exit_stops_lifecycle();
     test_debug_runtime_exit_stops_lifecycle();
+    test_debug_unsupported_config_fails_lifecycle();
+    test_debug_init_failure_fails_lifecycle();
     test_runtime_enters_running_before_threaded_executor_start();
     return 0;
 }

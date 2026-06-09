@@ -331,7 +331,7 @@ test-vgpu-rect:
 
 .PHONY: test-debug-gate
 test-debug-gate: mini-gdbstub/Makefile
-	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c hart-executor.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-debug-gate
 
 .PHONY: test-executor-config

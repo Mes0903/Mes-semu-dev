@@ -568,9 +568,8 @@ static void test_queue_notify_is_gated_when_lifecycle_not_accepting(void)
                 semu_vm_lifecycle_request_pause(&emu.lifecycle), 0);
     require_false("pause request stops device work",
                   semu_vm_accepting_device_work(&emu.lifecycle));
-    require_int("paused notify rejected",
-                virtio_mmio_write(&common, REG(QueueNotify), 4, 0),
-                -ESHUTDOWN);
+    require_int("paused notify ignored",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
     require_int("paused notify skipped backend", backend.notify_count, 0);
 
     require_int("paused", semu_vm_lifecycle_enter_paused(&emu.lifecycle), 0);
@@ -580,9 +579,8 @@ static void test_queue_notify_is_gated_when_lifecycle_not_accepting(void)
                 0);
     require_false("resetting stops device work",
                   semu_vm_accepting_device_work(&emu.lifecycle));
-    require_int("resetting notify rejected",
-                virtio_mmio_write(&common, REG(QueueNotify), 4, 0),
-                -ESHUTDOWN);
+    require_int("resetting notify ignored",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
     require_int("resetting notify skipped backend", backend.notify_count, 0);
 
     require_int("running after reset",
@@ -591,9 +589,8 @@ static void test_queue_notify_is_gated_when_lifecycle_not_accepting(void)
                 0);
     require_false("stopping stops device work",
                   semu_vm_accepting_device_work(&emu.lifecycle));
-    require_int("stopping notify rejected",
-                virtio_mmio_write(&common, REG(QueueNotify), 4, 0),
-                -ESHUTDOWN);
+    require_int("stopping notify ignored",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
     require_int("stopping notify skipped backend", backend.notify_count, 0);
 
     virtio_device_common_destroy(&common);
@@ -682,6 +679,68 @@ static void test_queue_notify_stale_generation_is_canceled_at_completion(void)
     require_int("join notify thread", pthread_join(thread, NULL), 0);
     require_int("stale notify canceled", args.ret, -ECANCELED);
     require_int("stale notify skipped backend", backend.notify_count, 0);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
+static void test_queue_notify_lifecycle_stop_before_backend_is_ignored(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    struct notify_thread_args args = {.common = &common, .ret = -EAGAIN};
+    pthread_t thread;
+    const uint16_t queue_max_sizes[] = {8};
+    bool saw_lifecycle_gate = false;
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+
+    require_int("hold backend lock", pthread_mutex_lock(&common.backend_lock),
+                0);
+    require_int("hold transport lock",
+                pthread_mutex_lock(&common.transport_lock), 0);
+    require_int("start notify thread",
+                pthread_create(&thread, NULL, notify_thread_main, &args), 0);
+
+    for (int i = 0; i < 100000; i++) {
+        int ret = pthread_mutex_trylock(&emu.lifecycle.lock);
+
+        if (ret == EBUSY) {
+            saw_lifecycle_gate = true;
+            break;
+        }
+        require_int("try lifecycle lock while notify starts", ret, 0);
+        require_int("unlock lifecycle probe",
+                    pthread_mutex_unlock(&emu.lifecycle.lock), 0);
+        sched_yield();
+    }
+    require_true("notify entered lifecycle gate", saw_lifecycle_gate);
+
+    require_int("release transport for notify capture",
+                pthread_mutex_unlock(&common.transport_lock), 0);
+    require_int("wait for notify capture",
+                pthread_mutex_lock(&emu.lifecycle.lock), 0);
+    require_int("release lifecycle after capture",
+                pthread_mutex_unlock(&emu.lifecycle.lock), 0);
+
+    require_int("pause request before backend scheduling",
+                semu_vm_lifecycle_request_pause(&emu.lifecycle), 0);
+    require_false("pause request stops device work",
+                  semu_vm_accepting_device_work(&emu.lifecycle));
+
+    require_int("release backend lock",
+                pthread_mutex_unlock(&common.backend_lock), 0);
+    require_int("join notify thread", pthread_join(thread, NULL), 0);
+    require_int("lifecycle-stopped notify ignored", args.ret, 0);
+    require_int("lifecycle-stopped notify skipped backend",
+                backend.notify_count, 0);
 
     virtio_device_common_destroy(&common);
     destroy_test_emu(&emu);
@@ -993,6 +1052,7 @@ int main(void)
     test_queue_notify_is_gated_when_lifecycle_not_accepting();
     test_queue_notify_without_emu_has_no_lifecycle_gate();
     test_queue_notify_stale_generation_is_canceled_at_completion();
+    test_queue_notify_lifecycle_stop_before_backend_is_ignored();
     test_queue_notify_propagates_async_enqueue_failure();
     test_status_order_rejects_bare_driver_ok();
     test_driver_ok_activation_edge();

@@ -2999,6 +2999,7 @@ static bool semu_debug_reject_unsupported_config(emu_state_t *emu)
             "SMP gdbstub/debug is unsupported until stop-all-harts debug "
             "semantics exist; use -c 1 with --gdbstub, or run SMP without "
             "--gdbstub.\n");
+    semu_runtime_enter_failed(emu);
     emu->exit_code = 1;
     return true;
 }
@@ -3138,6 +3139,7 @@ static void semu_run_debug(emu_state_t *emu)
                           .target_desc = TARGET_RV32,
                       },
                       "127.0.0.1:1234")) {
+        semu_runtime_enter_failed(emu);
         emu->exit_code = 1;
         return;
     }

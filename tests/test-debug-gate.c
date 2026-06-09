@@ -72,6 +72,7 @@ static void test_multi_hart_debug_is_rejected_before_gdbstub(void)
 {
     emu_state_t emu;
     memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
     reset_gdbstub_stubs();
 
     emu.debug = true;
@@ -87,12 +88,14 @@ static void test_multi_hart_debug_is_rejected_before_gdbstub(void)
     require_int("multi-hart debug skips gdbstub init", gdbstub_init_calls, 0);
     require_int("multi-hart debug skips gdbstub run", gdbstub_run_calls, 0);
     require_int("multi-hart debug skips gdbstub close", gdbstub_close_calls, 0);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
 static void test_single_hart_debug_config_is_accepted(void)
 {
     emu_state_t emu;
     memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
     reset_gdbstub_stubs();
 
     emu.debug = true;
@@ -109,6 +112,7 @@ static void test_single_hart_debug_config_is_accepted(void)
     require_int("single-hart failed init exit code", emu.exit_code, 1);
     require_int("failed init skips gdbstub run", gdbstub_run_calls, 0);
     require_int("failed init skips gdbstub close", gdbstub_close_calls, 0);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
 static void test_invalid_cpu_selection_does_not_change_current_cpu(void)
