@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,35 @@ static void virtio_rng_set_fail(virtio_rng_state_t *vrng)
     vrng->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
     if (vrng->Status & VIRTIO_STATUS__DRIVER_OK)
         vrng->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+}
+
+static size_t virtio_rng_read_entropy(void *buf,
+                                      size_t len,
+                                      bool *permanent_failure)
+{
+    if (permanent_failure)
+        *permanent_failure = false;
+
+    for (;;) {
+        ssize_t total = read(rng_fd, buf, len);
+
+        if (total >= 0)
+            return (size_t) total;
+
+        if (errno == EINTR)
+            continue;
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Legacy rng has no actor/event retry path yet, so publish a
+             * deterministic zero-byte completion and let the guest requeue.
+             */
+            return 0;
+        }
+
+        if (permanent_failure)
+            *permanent_failure = true;
+        return 0;
+    }
 }
 
 static inline uint32_t vrng_preprocess(virtio_rng_state_t *vrng, uint32_t addr)
@@ -69,9 +99,11 @@ static void virtio_queue_notify_handler(virtio_rng_state_t *vrng,
     /* Write entropy buffer */
     void *entropy_buf =
         (void *) ((uintptr_t) vrng->ram + (uintptr_t) vq_desc->addr);
-    ssize_t total = read(rng_fd, entropy_buf, vq_desc->len);
-    if (total < 0)
-        total = 0;
+    bool permanent_failure;
+    size_t total =
+        virtio_rng_read_entropy(entropy_buf, vq_desc->len, &permanent_failure);
+    if (permanent_failure)
+        virtio_rng_set_fail(vrng);
 
     /* Clear write flag */
     vq_desc->flags = 0;

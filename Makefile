@@ -353,6 +353,11 @@ test-virtio-input-config:
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=1 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-input-config.c -Wl,--gc-sections -o /tmp/test-virtio-input-config $(HOST_TEST_LDLIBS)
 	/tmp/test-virtio-input-config
 
+.PHONY: test-virtio-rng-fault
+test-virtio-rng-fault:
+	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=1 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-rng-fault.c -Wl,--gc-sections -o /tmp/test-virtio-rng-fault $(HOST_TEST_LDLIBS)
+	/tmp/test-virtio-rng-fault
+
 .PHONY: test-vgpu-rect
 test-vgpu-rect:
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 tests/test-vgpu-rect.c vgpu-rect.c vgpu-display.c -Wl,--wrap=free -o /tmp/test-vgpu-rect $(HOST_TEST_LDLIBS)
@@ -399,7 +404,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-vgpu-rect test-vgpu-error-policy test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-rng-fault test-vgpu-rect test-vgpu-error-policy test-debug-gate test-executor-config test-hart-executor
 
 OBJS := \
 	riscv.o \
