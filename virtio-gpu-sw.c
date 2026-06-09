@@ -243,9 +243,34 @@ static void vgpu_sw_count_publish_backpressure(
     virtio_gpu_state_t *vgpu,
     enum vgpu_display_publish_result result)
 {
-    if (result == VGPU_DISPLAY_PUBLISH_QUEUE_FULL ||
-        result == VGPU_DISPLAY_PUBLISH_BACKPRESSURE)
-        SW(vgpu)->display_counters.queue_backpressure++;
+    switch (result) {
+    case VGPU_DISPLAY_PUBLISH_QUEUE_FULL:
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.queue_backpressure);
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_queue_full);
+        break;
+    case VGPU_DISPLAY_PUBLISH_BACKPRESSURE:
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.queue_backpressure);
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_backpressure);
+        break;
+    case VGPU_DISPLAY_PUBLISH_UNAVAILABLE:
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_unavailable);
+        break;
+    case VGPU_DISPLAY_PUBLISH_OK:
+        break;
+    }
+}
+
+static void vgpu_sw_count_can_publish_false(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.queue_backpressure);
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.publish_can_publish_false);
 }
 
 static enum vgpu_display_publish_result vgpu_sw_publish_primary_clear(
@@ -439,13 +464,14 @@ static void vgpu_sw_accumulate_primary_dirty(
     struct vgpu_dirty_rect merged;
     if (vgpu_dirty_rect_merge_exact(&dirty->rect, src_rect, &merged)) {
         dirty->rect = merged;
-        SW(vgpu)->display_counters.dirty_merges++;
+        virtio_gpu_debug_counter_inc(&SW(vgpu)->display_counters.dirty_merges);
         return;
     }
 
     dirty->needs_full_resync = true;
     dirty->rect = vgpu_sw_scanout_src_rect(scanout);
-    SW(vgpu)->display_counters.full_resync_escalations++;
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.full_resync_escalations);
 }
 
 static struct vgpu_display_payload *vgpu_sw_create_window_payload(
@@ -594,14 +620,15 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
     } else if (!vgpu_rect_compute_update(&scanout_src, &dirty->rect, &update)) {
         dirty->needs_full_resync = true;
         dirty->rect = scanout_src;
-        SW(vgpu)->display_counters.full_resync_escalations++;
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.full_resync_escalations);
         full_resync = true;
         if (!vgpu_rect_compute_full_update(&scanout_src, &update))
             return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
     }
 
     if (!vgpu_sw_can_publish_command(vgpu)) {
-        SW(vgpu)->display_counters.queue_backpressure++;
+        vgpu_sw_count_can_publish_false(vgpu);
         return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
     }
 
@@ -623,9 +650,11 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
     }
 
     if (full_resync || full_frame_payload)
-        SW(vgpu)->display_counters.full_frame_bytes += bytes;
+        virtio_gpu_debug_counter_add(
+            &SW(vgpu)->display_counters.full_frame_bytes, bytes);
     else
-        SW(vgpu)->display_counters.dirty_rect_bytes += bytes;
+        virtio_gpu_debug_counter_add(
+            &SW(vgpu)->display_counters.dirty_rect_bytes, bytes);
     vgpu_sw_reset_primary_dirty_state(
         scanout, vgpu_display_primary_generation(scanout_id));
     return VGPU_DISPLAY_PUBLISH_OK;
@@ -1066,7 +1095,7 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
          * Preserve the old backend state and keep the existing OK_NODATA guest
          * completion policy for this recoverable display backpressure case.
          */
-        SW(vgpu)->display_counters.queue_backpressure++;
+        vgpu_sw_count_can_publish_false(vgpu);
         goto leave;
     }
 
@@ -1672,7 +1701,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
      * a clear.
      */
     if (!vgpu_sw_can_publish_command(vgpu)) {
-        SW(vgpu)->display_counters.queue_backpressure++;
+        vgpu_sw_count_can_publish_false(vgpu);
         *plen = 0;
         return;
     }

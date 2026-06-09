@@ -26,8 +26,6 @@
 #define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
-#define VIRTIO_GPU_CONTROLQ 0
-#define VIRTIO_GPU_CURSORQ 1
 
 /* DMT usage macro */
 #define EDID_BLOCK_SIZE 128U
@@ -64,6 +62,137 @@
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
 static bool virtio_gpu_instance_initialized;
+
+static void virtio_gpu_init_display_counters(
+    struct virtio_gpu_sw_display_counter_storage *counters)
+{
+    atomic_init(&counters->full_frame_bytes, 0);
+    atomic_init(&counters->dirty_rect_bytes, 0);
+    atomic_init(&counters->queue_backpressure, 0);
+    atomic_init(&counters->publish_queue_full, 0);
+    atomic_init(&counters->publish_backpressure, 0);
+    atomic_init(&counters->publish_unavailable, 0);
+    atomic_init(&counters->publish_can_publish_false, 0);
+    atomic_init(&counters->dirty_merges, 0);
+    atomic_init(&counters->full_resync_escalations, 0);
+}
+
+static void virtio_gpu_init_actor_debug_counters(
+    struct virtio_gpu_debug_counter_storage *counters)
+{
+    atomic_init(&counters->actor_notify_ok, 0);
+    atomic_init(&counters->actor_notify_eagain, 0);
+    atomic_init(&counters->actor_notify_eio, 0);
+    atomic_init(&counters->actor_notify_einval, 0);
+    atomic_init(&counters->actor_notify_other_error, 0);
+    atomic_init(&counters->actor_drain_calls, 0);
+    atomic_init(&counters->actor_queue_index_invalid, 0);
+    atomic_init(&counters->actor_stale_generation, 0);
+    atomic_init(&counters->actor_completion_rejected, 0);
+    atomic_init(&counters->actor_failed_callbacks, 0);
+}
+
+static void virtio_gpu_init_debug_counters(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_init_display_counters(&vgpu->sw_backend.display_counters);
+    virtio_gpu_init_actor_debug_counters(&vgpu->debug_counters);
+}
+
+static void virtio_gpu_reset_display_counters(
+    struct virtio_gpu_sw_display_counter_storage *counters)
+{
+    virtio_gpu_debug_counter_store(&counters->full_frame_bytes, 0);
+    virtio_gpu_debug_counter_store(&counters->dirty_rect_bytes, 0);
+    virtio_gpu_debug_counter_store(&counters->queue_backpressure, 0);
+    virtio_gpu_debug_counter_store(&counters->publish_queue_full, 0);
+    virtio_gpu_debug_counter_store(&counters->publish_backpressure, 0);
+    virtio_gpu_debug_counter_store(&counters->publish_unavailable, 0);
+    virtio_gpu_debug_counter_store(&counters->publish_can_publish_false, 0);
+    virtio_gpu_debug_counter_store(&counters->dirty_merges, 0);
+    virtio_gpu_debug_counter_store(&counters->full_resync_escalations, 0);
+}
+
+static void virtio_gpu_reset_actor_debug_counters(
+    struct virtio_gpu_debug_counter_storage *counters)
+{
+    virtio_gpu_debug_counter_store(&counters->actor_notify_ok, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_notify_eagain, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_notify_eio, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_notify_einval, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_notify_other_error, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_drain_calls, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_queue_index_invalid, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_stale_generation, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_completion_rejected, 0);
+    virtio_gpu_debug_counter_store(&counters->actor_failed_callbacks, 0);
+}
+
+static void virtio_gpu_reset_debug_counters(virtio_gpu_state_t *vgpu)
+{
+    if (!vgpu)
+        return;
+
+    virtio_gpu_reset_display_counters(&vgpu->sw_backend.display_counters);
+    virtio_gpu_reset_actor_debug_counters(&vgpu->debug_counters);
+}
+
+static struct virtio_gpu_sw_display_counters
+virtio_gpu_display_counters_snapshot(
+    const struct virtio_gpu_sw_display_counter_storage *counters)
+{
+    return (struct virtio_gpu_sw_display_counters) {
+        .full_frame_bytes =
+            virtio_gpu_debug_counter_load(&counters->full_frame_bytes),
+        .dirty_rect_bytes =
+            virtio_gpu_debug_counter_load(&counters->dirty_rect_bytes),
+        .queue_backpressure =
+            virtio_gpu_debug_counter_load(&counters->queue_backpressure),
+        .publish_queue_full =
+            virtio_gpu_debug_counter_load(&counters->publish_queue_full),
+        .publish_backpressure =
+            virtio_gpu_debug_counter_load(&counters->publish_backpressure),
+        .publish_unavailable =
+            virtio_gpu_debug_counter_load(&counters->publish_unavailable),
+        .publish_can_publish_false =
+            virtio_gpu_debug_counter_load(&counters->publish_can_publish_false),
+        .dirty_merges = virtio_gpu_debug_counter_load(&counters->dirty_merges),
+        .full_resync_escalations =
+            virtio_gpu_debug_counter_load(&counters->full_resync_escalations),
+    };
+}
+
+struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
+    virtio_gpu_state_t *vgpu)
+{
+    struct virtio_gpu_debug_counters counters = {0};
+
+    if (!vgpu)
+        return counters;
+
+    counters.display = virtio_gpu_display_counters_snapshot(
+        &vgpu->sw_backend.display_counters);
+    counters.actor_notify_ok =
+        virtio_gpu_debug_counter_load(&vgpu->debug_counters.actor_notify_ok);
+    counters.actor_notify_eagain = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_notify_eagain);
+    counters.actor_notify_eio =
+        virtio_gpu_debug_counter_load(&vgpu->debug_counters.actor_notify_eio);
+    counters.actor_notify_einval = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_notify_einval);
+    counters.actor_notify_other_error = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_notify_other_error);
+    counters.actor_drain_calls =
+        virtio_gpu_debug_counter_load(&vgpu->debug_counters.actor_drain_calls);
+    counters.actor_queue_index_invalid = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_queue_index_invalid);
+    counters.actor_stale_generation = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_stale_generation);
+    counters.actor_completion_rejected = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_completion_rejected);
+    counters.actor_failed_callbacks = virtio_gpu_debug_counter_load(
+        &vgpu->debug_counters.actor_failed_callbacks);
+    return counters;
+}
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
@@ -102,9 +231,14 @@ bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu)
 
 bool virtio_gpu_begin_actor_completion(virtio_gpu_state_t *vgpu)
 {
-    return vgpu && vgpu->actor_initialized &&
-           virtio_actor_begin_completion(&vgpu->actor,
-                                         vgpu->actor_drain_generation);
+    bool accepted = vgpu && vgpu->actor_initialized &&
+                    virtio_actor_begin_completion(&vgpu->actor,
+                                                  vgpu->actor_drain_generation);
+
+    if (vgpu && !accepted)
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_completion_rejected);
+    return accepted;
 }
 
 int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu)
@@ -798,10 +932,16 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
     return 0;
 }
 
-static bool virtio_gpu_actor_generation_current(struct virtio_actor *actor,
+static bool virtio_gpu_actor_generation_current(virtio_gpu_state_t *vgpu,
+                                                struct virtio_actor *actor,
                                                 uint64_t generation)
 {
-    return actor && virtio_actor_generation(actor) == generation;
+    bool current = actor && virtio_actor_generation(actor) == generation;
+
+    if (vgpu && !current)
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_stale_generation);
+    return current;
 }
 
 static bool virtio_gpu_queue_ready_for_actor(virtio_gpu_state_t *vgpu,
@@ -829,16 +969,22 @@ static int virtio_gpu_actor_drain_queue(void *opaque,
     struct virtq_iov writable[VIRTIO_GPU_QUEUE_NUM_MAX];
     bool consumed = false;
 
+    if (vgpu)
+        virtio_gpu_debug_counter_inc(&vgpu->debug_counters.actor_drain_calls);
+
     if (!vgpu || queue_index >= vgpu->common.num_queues) {
-        if (vgpu)
+        if (vgpu) {
+            virtio_gpu_debug_counter_inc(
+                &vgpu->debug_counters.actor_queue_index_invalid);
             virtio_gpu_set_fail(vgpu);
+        }
         return 0;
     }
 
     queue = &vgpu->common.queues[queue_index];
     vgpu->actor_drain_generation = generation;
 
-    if (!virtio_gpu_actor_generation_current(actor, generation))
+    if (!virtio_gpu_actor_generation_current(vgpu, actor, generation))
         return 0;
     if (!virtio_gpu_queue_ready_for_actor(vgpu, queue))
         return 0;
@@ -854,7 +1000,7 @@ static int virtio_gpu_actor_drain_queue(void *opaque,
         uint32_t len = 0;
         int ret;
 
-        if (!virtio_gpu_actor_generation_current(actor, generation))
+        if (!virtio_gpu_actor_generation_current(vgpu, actor, generation))
             return 0;
         if (!virtio_gpu_queue_available(vgpu, queue, &available))
             return 0;
@@ -869,15 +1015,15 @@ static int virtio_gpu_actor_drain_queue(void *opaque,
         if (ret == 0)
             break;
 
-        if (!virtio_gpu_actor_generation_current(actor, generation))
+        if (!virtio_gpu_actor_generation_current(vgpu, actor, generation))
             return 0;
         if (virtio_gpu_desc_handler(vgpu, queue_index, &chain, &len) != 0)
             return 0;
 
-        if (!virtio_actor_begin_completion(actor, generation))
+        if (!virtio_gpu_begin_actor_completion(vgpu))
             return 0;
         ret = virtq_add_used(vgpu->common.dma, queue, chain.head, len);
-        virtio_actor_end_completion(actor);
+        virtio_gpu_end_actor_completion(vgpu);
         if (ret < 0) {
             virtio_gpu_set_fail(vgpu);
             return 0;
@@ -888,10 +1034,10 @@ static int virtio_gpu_actor_drain_queue(void *opaque,
             break;
     }
 
-    if (consumed && virtio_actor_begin_completion(actor, generation)) {
+    if (consumed && virtio_gpu_begin_actor_completion(vgpu)) {
         if (!virtq_interrupt_suppressed(vgpu->common.dma, queue))
             virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
-        virtio_actor_end_completion(actor);
+        virtio_gpu_end_actor_completion(vgpu);
     }
     return 0;
 }
@@ -904,9 +1050,13 @@ static bool virtio_gpu_actor_queue_has_work(void *opaque,
     virtio_gpu_state_t *vgpu = opaque;
     uint16_t available = 0;
 
-    if (!vgpu || queue_index >= vgpu->common.num_queues)
+    if (!vgpu || queue_index >= vgpu->common.num_queues) {
+        if (vgpu)
+            virtio_gpu_debug_counter_inc(
+                &vgpu->debug_counters.actor_queue_index_invalid);
         return false;
-    if (!virtio_gpu_actor_generation_current(actor, generation))
+    }
+    if (!virtio_gpu_actor_generation_current(vgpu, actor, generation))
         return false;
     if (!virtio_gpu_queue_ready_for_actor(vgpu,
                                           &vgpu->common.queues[queue_index]))
@@ -922,8 +1072,11 @@ static void virtio_gpu_actor_failed(void *opaque,
 {
     virtio_gpu_state_t *vgpu = opaque;
 
-    if (vgpu)
+    if (vgpu) {
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_failed_callbacks);
         virtio_gpu_set_fail(vgpu);
+    }
 }
 
 static const struct virtio_actor_ops virtio_gpu_actor_ops = {
@@ -1152,6 +1305,7 @@ static int virtio_gpu_reset(void *opaque,
 
     if (g_virtio_gpu_backend.reset)
         g_virtio_gpu_backend.reset(vgpu);
+    virtio_gpu_reset_debug_counters(vgpu);
     return 0;
 }
 
@@ -1166,18 +1320,32 @@ static int virtio_gpu_notify_queue(void *opaque,
 
     if (queue_index != VIRTIO_GPU_CONTROLQ &&
         queue_index != VIRTIO_GPU_CURSORQ) {
+        if (vgpu)
+            virtio_gpu_debug_counter_inc(
+                &vgpu->debug_counters.actor_notify_einval);
         virtio_gpu_set_fail(vgpu);
         return -EINVAL;
     }
 
     ret = virtio_actor_notify_queue(&vgpu->actor, queue_index);
-    if (ret == -EAGAIN)
+    if (ret == 0) {
+        virtio_gpu_debug_counter_inc(&vgpu->debug_counters.actor_notify_ok);
         return 0;
-    if (ret < 0) {
-        virtio_gpu_set_fail(vgpu);
-        return ret;
     }
-    return 0;
+    if (ret == -EAGAIN) {
+        virtio_gpu_debug_counter_inc(&vgpu->debug_counters.actor_notify_eagain);
+        return 0;
+    }
+    if (ret == -EIO)
+        virtio_gpu_debug_counter_inc(&vgpu->debug_counters.actor_notify_eio);
+    else if (ret == -EINVAL)
+        virtio_gpu_debug_counter_inc(&vgpu->debug_counters.actor_notify_einval);
+    else
+        virtio_gpu_debug_counter_inc(
+            &vgpu->debug_counters.actor_notify_other_error);
+
+    virtio_gpu_set_fail(vgpu);
+    return ret;
 }
 
 static const struct virtio_device_ops virtio_gpu_ops = {
@@ -1209,6 +1377,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
     memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
     vgpu->ram = emu->ram;
     vgpu->priv = &virtio_gpu_data;
+    virtio_gpu_init_debug_counters(vgpu);
     virtio_gpu_sw_backend_init(vgpu);
 
     config = (struct virtio_device_common_config) {

@@ -23,6 +23,8 @@
  * the old request + data + response shape.
  */
 #define VIRTIO_GPU_MAX_DESC 1024
+#define VIRTIO_GPU_CONTROLQ 0
+#define VIRTIO_GPU_CURSORQ 1
 
 /* Core per-scanout metadata keyed by the guest-visible 'scanout_id'. This
  * combines guest-visible display info ('width'/'height'/'enabled') with the
@@ -376,6 +378,32 @@ uint32_t virtio_gpu_write_ctrl_response(
     uint32_t type);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
+struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
+    virtio_gpu_state_t *vgpu);
+
+static inline void virtio_gpu_debug_counter_inc(_Atomic uint64_t *counter)
+{
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+}
+
+static inline void virtio_gpu_debug_counter_add(_Atomic uint64_t *counter,
+                                                uint64_t value)
+{
+    atomic_fetch_add_explicit(counter, value, memory_order_relaxed);
+}
+
+static inline void virtio_gpu_debug_counter_store(_Atomic uint64_t *counter,
+                                                  uint64_t value)
+{
+    atomic_store_explicit(counter, value, memory_order_relaxed);
+}
+
+static inline uint64_t virtio_gpu_debug_counter_load(
+    const _Atomic uint64_t *counter)
+{
+    return atomic_load_explicit(counter, memory_order_relaxed);
+}
+
 void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu);
 bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu);
 bool virtio_gpu_begin_actor_completion(virtio_gpu_state_t *vgpu);
