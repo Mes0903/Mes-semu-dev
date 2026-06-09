@@ -11,6 +11,7 @@
 
 #include "device.h"
 #include "irq-source.h"
+#include "lock-order.h"
 #include "platform.h"
 #include "ram_access.h"
 #include "riscv_private.h"
@@ -770,6 +771,35 @@ static void test_queue_notify_propagates_async_enqueue_failure(void)
     destroy_test_emu(&emu);
 }
 
+static void test_queue_notify_rejects_tracked_rank_inversion(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    struct semu_lock_order_guard backend_guard;
+    const uint16_t queue_max_sizes[] = {8};
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+
+    require_int(
+        "enter tracked backend rank",
+        semu_lock_order_enter(SEMU_LOCK_RANK_BACKEND_LOCAL, &backend_guard), 0);
+    require_int("QueueNotify rejects lifecycle below backend",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), -EDEADLK);
+    require_int("inverted notify skipped backend", backend.notify_count, 0);
+    require_int("leave tracked backend rank",
+                semu_lock_order_leave(&backend_guard), 0);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
 static void test_status_order_rejects_bare_driver_ok(void)
 {
     emu_state_t emu;
@@ -1054,6 +1084,7 @@ int main(void)
     test_queue_notify_stale_generation_is_canceled_at_completion();
     test_queue_notify_lifecycle_stop_before_backend_is_ignored();
     test_queue_notify_propagates_async_enqueue_failure();
+    test_queue_notify_rejects_tracked_rank_inversion();
     test_status_order_rejects_bare_driver_ok();
     test_driver_ok_activation_edge();
     test_activation_failure_marks_needs_reset();

@@ -316,8 +316,13 @@ test-virtio-irq:
 
 .PHONY: test-virtio-mmio
 test-virtio-mmio:
-	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-mmio.c virtio-mmio.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c vm-lifecycle.c -o /tmp/test-virtio-mmio $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-virtio-mmio.c virtio-mmio.c lock-order.c virtq.c virtio-irq.c ram_access.c irq-source.c plic.c vm-lifecycle.c -o /tmp/test-virtio-mmio $(HOST_TEST_LDLIBS)
 	/tmp/test-virtio-mmio
+
+.PHONY: test-lock-order
+test-lock-order:
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-lock-order.c lock-order.c -o /tmp/test-lock-order $(HOST_TEST_LDLIBS)
+	/tmp/test-lock-order
 
 .PHONY: test-virtio-input-config
 test-virtio-input-config:
@@ -347,7 +352,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-virtio-input-config test-vgpu-rect test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-vgpu-rect test-debug-gate test-executor-config test-hart-executor
 
 OBJS := \
 	riscv.o \
@@ -363,6 +368,7 @@ OBJS := \
 	virtio-irq.o \
 	virtq.o \
 	virtio-mmio.o \
+	lock-order.o \
 	uart.o \
 	mmio-bus.o \
 	platform.o \
