@@ -445,6 +445,15 @@ static void *reset_snd_thread(void *opaque)
     return NULL;
 }
 
+static void *stop_snd_thread(void *opaque)
+{
+    struct async_snd_call *call = opaque;
+    int ret = virtio_actor_stop(&call->vsnd->actor);
+
+    async_snd_call_finish(call, ret);
+    return NULL;
+}
+
 static void *destroy_snd_thread(void *opaque)
 {
     struct async_snd_call *call = opaque;
@@ -728,6 +737,44 @@ static void test_reset_closes_stream_opened_by_inflight_actor(void)
     destroy_snd_fixture();
 }
 
+static void test_standalone_stop_drops_inflight_actor_completion(void)
+{
+    struct async_snd_call call;
+
+    configure_snd_fixture();
+    configure_all_snd_queues();
+    publish_pcm_prepare_request();
+    dma_gate_enable(&snd_dma_read_gate, CTRL_PREPARE_REQ_ADDR,
+                    sizeof(virtio_snd_pcm_hdr_t));
+    mmio_write(REG(QueueNotify), VSND_QUEUE_CTRL);
+
+    require_bool("actor entered PCM_PREPARE read",
+                 dma_gate_wait_entered(&snd_dma_read_gate, 1000), true);
+    async_snd_call_init(&call, &emu.vsnd);
+    require_int("stop thread create",
+                pthread_create(&call.thread, NULL, stop_snd_thread, &call),
+                0);
+    require_bool("stop waits for actor quiescence",
+                 async_snd_call_wait_done(&call, 200), false);
+
+    dma_gate_release(&snd_dma_read_gate);
+    require_bool("stop completes after actor quiesces",
+                 async_snd_call_wait_done(&call, 1000), true);
+    async_snd_call_join(&call);
+    require_int("stop result", call.ret, 0);
+    require_int("stopped actor does not publish used idx",
+                read16(USED_ADDR(VSND_QUEUE_CTRL) + 2), 0);
+    require_u32("stopped actor does not raise IRQ status",
+                virtio_irq_read_status(&emu.vsnd.common.irq), 0);
+    require_bool("stopped actor has no pending IRQ",
+                 virtio_snd_irq_pending(&emu.vsnd), false);
+    async_snd_call_destroy(&call);
+
+    destroy_snd_fixture();
+    require_bool("standalone stop destroy leaves no unclosed stream",
+                 fake_terminate_saw_unclosed_stream, false);
+}
+
 static void test_destroy_closes_stream_opened_by_inflight_actor(void)
 {
     struct async_snd_call call;
@@ -773,6 +820,7 @@ int main(void)
     test_pcm_start_failure_reset_closes_prepared_stream();
     test_reset_closes_callbacks_before_freeing_buffers();
     test_reset_closes_stream_opened_by_inflight_actor();
+    test_standalone_stop_drops_inflight_actor_completion();
     test_destroy_closes_stream_opened_by_inflight_actor();
     return 0;
 }
