@@ -787,8 +787,7 @@ static void UNUSED emu_update_vsnd_interrupts(vm_t *vm)
     bool pending;
 
     EMU_DEVICE_CALL(data->vsnd_lock,
-                    pending = __atomic_load_n(&data->vsnd.InterruptStatus,
-                                              __ATOMIC_ACQUIRE) != 0);
+                    pending = virtio_snd_irq_pending(&data->vsnd));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VSND, pending);
 }
 #endif
@@ -854,8 +853,7 @@ static void io_poll_peripherals(emu_state_t *emu)
 
 #if SEMU_HAS(VIRTIOSND)
     EMU_DEVICE_CALL(emu->vsnd_lock,
-                    pending = __atomic_load_n(&emu->vsnd.InterruptStatus,
-                                              __ATOMIC_ACQUIRE) != 0);
+                    pending = virtio_snd_irq_pending(&emu->vsnd));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VSND, pending);
 #endif
 
@@ -1274,8 +1272,7 @@ static bool semu_mmio_vsnd_write(hart_t *hart,
     EMU_DEVICE_CALL(data->vsnd_lock,
                     virtio_snd_write(hart, &data->vsnd, (uint32_t) off, width,
                                      value);
-                    pending = __atomic_load_n(&data->vsnd.InterruptStatus,
-                                              __ATOMIC_ACQUIRE) != 0);
+                    pending = virtio_snd_irq_pending(&data->vsnd));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VSND, pending);
     return true;
 }
@@ -2425,9 +2422,8 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     emu->sswi.ssip = calloc(vm->n_hart, sizeof(*emu->sswi.ssip));
     emu->sswi.n_hart = vm->n_hart;
 #if SEMU_HAS(VIRTIOSND)
-    if (!virtio_snd_init(&(emu->vsnd)))
+    if (!virtio_snd_init(&(emu->vsnd), emu))
         fprintf(stderr, "No virtio-snd functioned\n");
-    emu->vsnd.ram = emu->ram;
 #endif
 #if SEMU_HAS(VIRTIOFS)
     if (!virtio_fs_init(&(emu->vfs), emu, "myfs", shared_dir))
@@ -2467,6 +2463,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIONET)
             virtio_net_destroy(&emu->vnet);
 #endif
+#if SEMU_HAS(VIRTIOSND)
+            virtio_snd_destroy(&emu->vsnd);
+#endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu->vblk);
 #endif
@@ -2499,6 +2498,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 #if SEMU_HAS(VIRTIONET)
             virtio_net_destroy(&emu->vnet);
+#endif
+#if SEMU_HAS(VIRTIOSND)
+            virtio_snd_destroy(&emu->vsnd);
 #endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu->vblk);
@@ -3374,6 +3376,9 @@ int main(int argc, char **argv)
 #if SEMU_HAS(VIRTIONET)
             virtio_net_destroy(&emu.vnet);
 #endif
+#if SEMU_HAS(VIRTIOSND)
+            virtio_snd_destroy(&emu.vsnd);
+#endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu.vblk);
 #endif
@@ -3421,6 +3426,9 @@ int main(int argc, char **argv)
 
 #if SEMU_HAS(VIRTIONET)
     virtio_net_destroy(&emu.vnet);
+#endif
+#if SEMU_HAS(VIRTIOSND)
+    virtio_snd_destroy(&emu.vsnd);
 #endif
 #if SEMU_HAS(VIRTIOBLK)
     virtio_blk_destroy(&emu.vblk);
