@@ -100,6 +100,10 @@ void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps);
 int virgl_renderer_context_create(uint32_t handle,
                                   uint32_t nlen,
                                   const char *name);
+int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
+                                             uint32_t ctx_flags,
+                                             uint32_t nlen,
+                                             const char *name);
 void virgl_renderer_context_destroy(uint32_t handle);
 void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle);
 void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle);

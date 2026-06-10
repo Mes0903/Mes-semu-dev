@@ -4132,6 +4132,7 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     create->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
     create->hdr.ctx_id = 44;
     create->nlen = 4;
+    create->context_init = VIRTIO_GPU_CAPSET_VIRGL;
     memcpy(create->debug_name, "ctxA", 4);
     desc[0].addr = 0x40;
     desc[0].len = sizeof(*create);
@@ -4150,6 +4151,8 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     require_u32("ctx create id snapshot", payload->cmd.ctx_create.hdr.ctx_id,
                 44);
     require_u32("ctx create nlen snapshot", payload->cmd.ctx_create.nlen, 4);
+    require_u32("ctx create context init snapshot",
+                payload->cmd.ctx_create.context_init, VIRTIO_GPU_CAPSET_VIRGL);
     require_u32("ctx create response capacity", payload->response_capacity,
                 sizeof(struct virtio_gpu_ctrl_hdr));
     queued.release_payload(queued.payload);
@@ -4660,6 +4663,11 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
                 SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
     require_u64("host-visible SHM length", vgpu.common.shm_region.length,
                 SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+    num_capsets = vgpu.common.ops->read_config(
+        vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    require_u32("classic virgl initial capsets visible", num_capsets, 1);
+
     virtio_gpu_set_num_capsets(&vgpu, 5);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),

@@ -1455,9 +1455,10 @@ void virtio_gpu_virgl_ctx_create_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    if (snapshot.context_init) {
+    if (snapshot.context_init & ~VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK) {
         *plen = virtio_gpu_write_ctrl_response(
-            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
         if (!*plen)
             virtio_gpu_set_fail(vgpu);
         return;
@@ -3996,6 +3997,9 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
     vgpu->priv = &virtio_gpu_data;
     virtio_gpu_init_debug_counters(vgpu);
     virtio_gpu_sw_backend_init(vgpu);
+#if SEMU_HAS(VIRGL)
+    virtio_gpu_set_num_capsets(vgpu, 1);
+#endif
 
     config = (struct virtio_device_common_config) {
         .emu = emu,

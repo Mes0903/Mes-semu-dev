@@ -1283,6 +1283,21 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         vgpu_display_set_unavailable();
         return;
     }
+    if (vgpu_virgl_init_renderer(NULL) < 0) {
+        fprintf(stderr,
+                "window_init_sw(): failed to initialize virglrenderer\n"
+                "Running in headless mode.\n");
+        sdl_scanout_detach_gl_context();
+        SDL_GL_DeleteContext(scanout->gl_context);
+        scanout->gl_context = NULL;
+        SDL_DestroyWindow(scanout->window);
+        scanout->window = NULL;
+        headless_mode = true;
+        SDL_Quit();
+        sdl_initialized = false;
+        vgpu_display_set_unavailable();
+        return;
+    }
 #else
     scanout->renderer =
         SDL_CreateRenderer(scanout->window, -1, SDL_RENDERER_ACCELERATED);

@@ -885,7 +885,13 @@ static void vgpu_virgl_execute_ctrl_request(
     }
     case VIRTIO_GPU_CMD_CTX_CREATE: {
         const struct virtio_gpu_ctx_create *cmd = &payload->cmd.ctx_create;
-        int ret = virgl_renderer_context_create(cmd->hdr.ctx_id, cmd->nlen,
+        int ret;
+
+        if (cmd->context_init)
+            ret = virgl_renderer_context_create_with_flags(
+                cmd->hdr.ctx_id, cmd->context_init, cmd->nlen, cmd->debug_name);
+        else
+            ret = virgl_renderer_context_create(cmd->hdr.ctx_id, cmd->nlen,
                                                 cmd->debug_name);
         response_type =
             ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;

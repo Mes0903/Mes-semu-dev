@@ -43,6 +43,11 @@ static int fake_context_create_count;
 static uint32_t fake_last_context_create_handle;
 static uint32_t fake_last_context_create_nlen;
 static char fake_last_context_create_name[64];
+static int fake_context_create_with_flags_count;
+static uint32_t fake_last_context_create_with_flags_ctx_id;
+static uint32_t fake_last_context_create_with_flags_flags;
+static uint32_t fake_last_context_create_with_flags_nlen;
+static char fake_last_context_create_with_flags_name[64];
 static int fake_context_destroy_count;
 static uint32_t fake_last_context_destroy_handle;
 static int fake_context_attach_count;
@@ -209,6 +214,22 @@ int virgl_renderer_context_create(uint32_t handle,
            sizeof(fake_last_context_create_name));
     if (name && nlen < sizeof(fake_last_context_create_name))
         memcpy(fake_last_context_create_name, name, nlen);
+    return 0;
+}
+
+int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
+                                             uint32_t ctx_flags,
+                                             uint32_t nlen,
+                                             const char *name)
+{
+    fake_context_create_with_flags_count++;
+    fake_last_context_create_with_flags_ctx_id = ctx_id;
+    fake_last_context_create_with_flags_flags = ctx_flags;
+    fake_last_context_create_with_flags_nlen = nlen;
+    memset(fake_last_context_create_with_flags_name, 0,
+           sizeof(fake_last_context_create_with_flags_name));
+    if (name && nlen < sizeof(fake_last_context_create_with_flags_name))
+        memcpy(fake_last_context_create_with_flags_name, name, nlen);
     return 0;
 }
 
@@ -467,6 +488,12 @@ static void reset_test_state(uint64_t generation)
     fake_last_context_create_nlen = 0;
     memset(fake_last_context_create_name, 0,
            sizeof(fake_last_context_create_name));
+    fake_context_create_with_flags_count = 0;
+    fake_last_context_create_with_flags_ctx_id = 0;
+    fake_last_context_create_with_flags_flags = 0;
+    fake_last_context_create_with_flags_nlen = 0;
+    memset(fake_last_context_create_with_flags_name, 0,
+           sizeof(fake_last_context_create_with_flags_name));
     fake_context_destroy_count = 0;
     fake_last_context_destroy_handle = 0;
     fake_context_attach_count = 0;
@@ -933,6 +960,33 @@ static void test_ctrl_request_executes_context_create_destroy(void)
     CHECK(fake_last_context_create_handle == 77);
     CHECK(fake_last_context_create_nlen == 4);
     CHECK(memcmp(fake_last_context_create_name, "ctxB", 4) == 0);
+    CHECK(fake_context_create_with_flags_count == 0);
+
+    payload = (struct vgpu_renderer_ctrl_payload) {
+        .hdr = {.type = VIRTIO_GPU_CMD_CTX_CREATE, .ctx_id = 78},
+        .cmd.ctx_create =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_CTX_CREATE, .ctx_id = 78},
+                .nlen = 4,
+                .context_init = VIRTIO_GPU_CAPSET_VIRGL,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    memcpy(payload.cmd.ctx_create.debug_name, "ctxC", 4);
+    request.command_type = VIRTIO_GPU_CMD_CTX_CREATE;
+    request.payload = &payload;
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(fake_context_create_count == 1);
+    CHECK(fake_context_create_with_flags_count == 1);
+    CHECK(fake_last_context_create_with_flags_ctx_id == 78);
+    CHECK(fake_last_context_create_with_flags_flags == VIRTIO_GPU_CAPSET_VIRGL);
+    CHECK(fake_last_context_create_with_flags_nlen == 4);
+    CHECK(memcmp(fake_last_context_create_with_flags_name, "ctxC", 4) == 0);
 
     payload = (struct vgpu_renderer_ctrl_payload) {
         .hdr = {.type = VIRTIO_GPU_CMD_CTX_DESTROY, .ctx_id = 77},
