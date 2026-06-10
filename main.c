@@ -884,11 +884,7 @@ static void io_poll_peripherals_common(emu_state_t *emu, bool refresh_net)
      * pending work for the emulator thread.
      */
     if (vinput_may_have_pending_cmds()) {
-        emu_device_lock(&emu->vkeyboard_lock);
-        emu_device_lock(&emu->vmouse_lock);
         virtio_input_drain_host_events();
-        emu_device_unlock(&emu->vmouse_lock);
-        emu_device_unlock(&emu->vkeyboard_lock);
     }
 
     EMU_DEVICE_CALL(emu->vkeyboard_lock,
@@ -2491,6 +2487,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOFS)
             virtio_fs_destroy(&emu->vfs);
 #endif
+#if SEMU_HAS(VIRTIOINPUT)
+            virtio_input_destroy(&emu->vkeyboard);
+            virtio_input_destroy(&emu->vmouse);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -2526,6 +2526,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 #if SEMU_HAS(VIRTIOFS)
             virtio_fs_destroy(&emu->vfs);
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+            virtio_input_destroy(&emu->vkeyboard);
+            virtio_input_destroy(&emu->vmouse);
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -3487,6 +3491,10 @@ int main(int argc, char **argv)
 #if SEMU_HAS(VIRTIOFS)
             virtio_fs_destroy(&emu.vfs);
 #endif
+#if SEMU_HAS(VIRTIOINPUT)
+            virtio_input_destroy(&emu.vkeyboard);
+            virtio_input_destroy(&emu.vmouse);
+#endif
             g_window.window_cleanup();
             return 1;
         }
@@ -3519,6 +3527,10 @@ int main(int argc, char **argv)
      */
     virtio_gpu_destroy(&emu.vgpu);
     vgpu_display_shutdown_after_producer_stopped();
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+    virtio_input_destroy(&emu.vkeyboard);
+    virtio_input_destroy(&emu.vmouse);
 #endif
     g_window.window_cleanup();
 #endif

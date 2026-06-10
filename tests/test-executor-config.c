@@ -89,7 +89,7 @@ static void test_virtio_host_io_policy_table(void)
 {
     static const struct expected_policy expected[] = {
         {"virtio-gpu", SEMU_HAS(VIRTIOGPU), true},
-        {"virtio-input", SEMU_HAS(VIRTIOINPUT), false},
+        {"virtio-input", SEMU_HAS(VIRTIOINPUT), true},
         {"virtio-rng", SEMU_HAS(VIRTIORNG), true},
         {"virtio-blk", SEMU_HAS(VIRTIOBLK), true},
         {"virtio-fs", SEMU_HAS(VIRTIOFS), true},
@@ -163,15 +163,15 @@ static void test_actor_gate_names_legacy_devices(void)
     check_true(strcmp(gate.unsupported_devices, expected_unsupported) == 0,
                "actor gate unsupported list follows policy table order");
 
-#if SEMU_HAS(VIRTIOINPUT)
-    check_true(!gate.allowed, "actor mode rejects legacy devices");
+    check_true(gate.allowed == (expected_unsupported[0] == '\0'),
+               "actor gate allow result follows policy table");
 #if SEMU_HAS(VIRTIOBLK)
     check_true(strstr(gate.unsupported_devices, "virtio-blk") == NULL,
                "gate does not name virtio-blk when enabled");
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
-    check_true(strstr(gate.unsupported_devices, "virtio-input") != NULL,
-               "gate names virtio-input when enabled");
+    check_true(strstr(gate.unsupported_devices, "virtio-input") == NULL,
+               "gate does not name virtio-input when enabled");
 #endif
 #if SEMU_HAS(VIRTIONET)
     check_true(strstr(gate.unsupported_devices, "virtio-net") == NULL,
@@ -189,19 +189,11 @@ static void test_actor_gate_names_legacy_devices(void)
     check_true(strstr(gate.unsupported_devices, "virtio-fs") == NULL,
                "gate does not name virtio-fs when enabled");
 #endif
-    check_true(
-        strstr(gate.fallback_command,
-               "--executor=threaded-cpu-with-legacy-device-gate") != NULL,
-        "gate includes fallback command");
-#else
-    check_true(gate.allowed, "actor mode allows actor-ready feature set");
-    check_true(strcmp(gate.unsupported_devices, "") == 0,
-               "actor-ready feature set has no unsupported devices");
-#if SEMU_HAS(VIRTIOBLK)
-    check_true(strstr(gate.unsupported_devices, "virtio-blk") == NULL,
-               "actor-ready virtio-blk is not listed as unsupported");
-#endif
-#endif
+    if (!gate.allowed)
+        check_true(strstr(gate.fallback_command,
+                          "--executor=threaded-cpu-with-legacy-device-gate") !=
+                       NULL,
+                   "gate includes fallback command");
 
     gate = semu_executor_check_actor_device_gate(
         SEMU_EXECUTOR_THREADED_CPU_WITH_LEGACY_DEVICE_GATE);
