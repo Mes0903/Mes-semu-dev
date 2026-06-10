@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../device.h"
 #include "../ram_access.h"
 #include "../riscv_private.h"
 
@@ -18,10 +19,22 @@ static bool test_ram_dma_write(ram_dma_t *dma,
                                guest_paddr_t addr,
                                const void *buf,
                                guest_size_t len);
+static int test_virtio_blk_disk_read_to_guest(virtio_blk_state_t *vblk,
+                                              guest_paddr_t addr,
+                                              const void *disk,
+                                              guest_size_t len);
+static int test_virtio_blk_disk_write_from_guest(virtio_blk_state_t *vblk,
+                                                 guest_paddr_t addr,
+                                                 void *disk,
+                                                 guest_size_t len);
 
 #define ram_dma_read test_ram_dma_read
 #define ram_dma_write test_ram_dma_write
+#define VIRTIO_BLK_DISK_READ_TO_GUEST test_virtio_blk_disk_read_to_guest
+#define VIRTIO_BLK_DISK_WRITE_FROM_GUEST test_virtio_blk_disk_write_from_guest
 #include "../virtio-blk.c"
+#undef VIRTIO_BLK_DISK_WRITE_FROM_GUEST
+#undef VIRTIO_BLK_DISK_READ_TO_GUEST
 #undef ram_dma_write
 #undef ram_dma_read
 
@@ -41,6 +54,22 @@ static emu_state_t emu;
 static unsigned wake_count;
 static struct virtio_device_common *reset_start_on_avail_read_common;
 static guest_paddr_t reset_start_on_avail_read_addr;
+
+enum test_blk_disk_op_kind {
+    TEST_BLK_DISK_READ_TO_GUEST,
+    TEST_BLK_DISK_WRITE_FROM_GUEST,
+};
+
+struct test_blk_disk_op {
+    enum test_blk_disk_op_kind kind;
+    int ret;
+};
+
+static struct {
+    const struct test_blk_disk_op *ops;
+    size_t op_count;
+    size_t call_count;
+} test_blk_disk_script;
 
 struct dma_gate {
     pthread_mutex_t lock;
@@ -73,6 +102,61 @@ static void dma_gate_block_if_enabled(struct dma_gate *gate,
             pthread_cond_wait(&gate->cond, &gate->lock);
     }
     pthread_mutex_unlock(&gate->lock);
+}
+
+static void test_blk_disk_script_clear(void)
+{
+    test_blk_disk_script.ops = NULL;
+    test_blk_disk_script.op_count = 0;
+    test_blk_disk_script.call_count = 0;
+}
+
+static void test_blk_disk_script_set(const struct test_blk_disk_op *ops,
+                                     size_t op_count)
+{
+    test_blk_disk_script.ops = ops;
+    test_blk_disk_script.op_count = op_count;
+    test_blk_disk_script.call_count = 0;
+}
+
+static int test_blk_disk_script_next(enum test_blk_disk_op_kind kind)
+{
+    if (test_blk_disk_script.call_count < test_blk_disk_script.op_count) {
+        const struct test_blk_disk_op *op =
+            &test_blk_disk_script.ops[test_blk_disk_script.call_count++];
+
+        if (op->kind != kind) {
+            fprintf(stderr, "unexpected scripted disk operation\n");
+            exit(1);
+        }
+        return op->ret;
+    }
+    test_blk_disk_script.call_count++;
+    return 0;
+}
+
+static int test_virtio_blk_disk_read_to_guest(virtio_blk_state_t *vblk,
+                                              guest_paddr_t addr,
+                                              const void *disk,
+                                              guest_size_t len)
+{
+    int ret = test_blk_disk_script_next(TEST_BLK_DISK_READ_TO_GUEST);
+
+    if (ret < 0)
+        return ret;
+    return test_ram_dma_write(vblk->common.dma, addr, disk, len) ? 0 : -EFAULT;
+}
+
+static int test_virtio_blk_disk_write_from_guest(virtio_blk_state_t *vblk,
+                                                 guest_paddr_t addr,
+                                                 void *disk,
+                                                 guest_size_t len)
+{
+    int ret = test_blk_disk_script_next(TEST_BLK_DISK_WRITE_FROM_GUEST);
+
+    if (ret < 0)
+        return ret;
+    return test_ram_dma_read(vblk->common.dma, addr, disk, len) ? 0 : -EFAULT;
 }
 
 static bool test_ram_dma_read(const ram_dma_t *dma,
@@ -321,6 +405,7 @@ static void configure_blk(void)
     memset(&emu, 0, sizeof(emu));
     memset(ram_words, 0, sizeof(ram_words));
     memset(disk_words, 0, sizeof(disk_words));
+    test_blk_disk_script_clear();
     ram_dma_init(&emu.ram_dma, ram_words, TEST_RAM_SIZE, NULL);
     emu.ram = ram_words;
     require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
@@ -572,6 +657,162 @@ static void test_out_of_range_sets_ioerr_with_zero_length_completion(void)
                 VIRTIO_INT__USED_RING);
 }
 
+
+static void require_no_device_needs_reset(const char *name)
+{
+    require_u32(name,
+                virtio_blk_status_load(&emu.vblk) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+}
+
+static void require_blk_ioerr_completion_without_reset(const char *name)
+{
+    require_bool(name, wait_for_used_idx(1), true);
+    require_u8("host fault status ioerr", read8(STATUS_ADDR),
+               VIRTIO_BLK_S_IOERR);
+    require_u16("host fault used idx", read16(USED_ADDR + 2), 1);
+    require_u32("host fault used id", read32(USED_ADDR + 4), 0);
+    require_u32("host fault used len", read32(USED_ADDR + 8), 0);
+    require_u32("host fault irq status", mmio_read(REG(InterruptStatus)),
+                VIRTIO_INT__USED_RING);
+    require_bool("host fault irq line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VBLK), true);
+    require_no_device_needs_reset("host fault needs-reset remains clear");
+}
+
+static void test_host_disk_fault_injection(uint32_t type,
+                                           int transient_err,
+                                           bool permanent)
+{
+    uint8_t disk_pattern[DISK_BLK_SIZE];
+    uint8_t guest_pattern[DISK_BLK_SIZE];
+    uint8_t guest_data[DISK_BLK_SIZE];
+    enum test_blk_disk_op_kind kind =
+        type == VIRTIO_BLK_T_IN ? TEST_BLK_DISK_READ_TO_GUEST
+                                : TEST_BLK_DISK_WRITE_FROM_GUEST;
+    const struct test_blk_disk_op transient_ops[] = {
+        {.kind = kind, .ret = -transient_err},
+        {.kind = kind, .ret = 0},
+    };
+    const struct test_blk_disk_op permanent_ops[] = {
+        {.kind = kind, .ret = -EIO},
+    };
+
+    configure_blk();
+    for (size_t i = 0; i < sizeof(disk_pattern); i++) {
+        disk_pattern[i] = (uint8_t) (0x10U + i);
+        guest_pattern[i] = (uint8_t) (0x80U + i);
+    }
+    memcpy(disk_words, disk_pattern, sizeof(disk_pattern));
+    memset(guest_data, 0, sizeof(guest_data));
+    dma_write(DATA_ADDR,
+              type == VIRTIO_BLK_T_IN ? guest_data : guest_pattern,
+              sizeof(guest_data));
+    dma_write(STATUS_ADDR, &(uint8_t) {0xff}, 1);
+    test_blk_disk_script_set(permanent ? permanent_ops : transient_ops,
+                             permanent ? ARRAY_SIZE(permanent_ops)
+                                       : ARRAY_SIZE(transient_ops));
+
+    publish_one_request(type, 0, sizeof(guest_data));
+    mmio_write(REG(QueueNotify), 0);
+
+    if (permanent) {
+        require_blk_ioerr_completion_without_reset(
+            type == VIRTIO_BLK_T_IN ? "host read eio completion"
+                                    : "host write eio completion");
+        require_u32("host eio disk operation calls",
+                    (uint32_t) test_blk_disk_script.call_count, 1);
+        if (type == VIRTIO_BLK_T_OUT)
+            require_mem("host eio leaves disk unchanged", disk_words,
+                        disk_pattern, sizeof(disk_pattern));
+        test_blk_disk_script_clear();
+        return;
+    }
+
+    require_bool("host transient published completion", wait_for_used_idx(1),
+                 true);
+    require_u8("host transient status ok", read8(STATUS_ADDR),
+               VIRTIO_BLK_S_OK);
+    require_u32("host transient used len", read32(USED_ADDR + 8),
+                sizeof(guest_data));
+    require_u32("host transient irq status", mmio_read(REG(InterruptStatus)),
+                VIRTIO_INT__USED_RING);
+    require_no_device_needs_reset("host transient needs-reset remains clear");
+    require_u32("host transient disk operation calls",
+                (uint32_t) test_blk_disk_script.call_count, 2);
+    if (type == VIRTIO_BLK_T_IN) {
+        dma_read(DATA_ADDR, guest_data, sizeof(guest_data));
+        require_mem("host transient read payload", guest_data, disk_pattern,
+                    sizeof(guest_data));
+    } else {
+        require_mem("host transient write payload", disk_words, guest_pattern,
+                    sizeof(guest_pattern));
+    }
+    test_blk_disk_script_clear();
+}
+
+static void test_host_disk_read_eintr_retries_and_succeeds_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_IN, EINTR, false);
+}
+
+static void test_host_disk_write_eintr_retries_and_succeeds_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_OUT, EINTR, false);
+}
+
+static void test_host_disk_read_eagain_retries_and_succeeds_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_IN, EAGAIN, false);
+}
+
+static void test_host_disk_write_eagain_retries_and_succeeds_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_OUT, EAGAIN, false);
+}
+
+static void test_host_disk_read_eagain_retry_exhaustion_completes_ioerr(void)
+{
+    uint8_t disk_pattern[DISK_BLK_SIZE];
+    uint8_t guest_data[DISK_BLK_SIZE] = {0};
+    const struct test_blk_disk_op ops[] = {
+        {.kind = TEST_BLK_DISK_READ_TO_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_READ_TO_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_READ_TO_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_READ_TO_GUEST, .ret = -EAGAIN},
+    };
+
+    configure_blk();
+    for (size_t i = 0; i < sizeof(disk_pattern); i++)
+        disk_pattern[i] = (uint8_t) (0x30U + i);
+    memcpy(disk_words, disk_pattern, sizeof(disk_pattern));
+    dma_write(DATA_ADDR, guest_data, sizeof(guest_data));
+    dma_write(STATUS_ADDR, &(uint8_t) {0xff}, 1);
+    test_blk_disk_script_set(ops, ARRAY_SIZE(ops));
+
+    publish_one_request(VIRTIO_BLK_T_IN, 0, sizeof(guest_data));
+    mmio_write(REG(QueueNotify), 0);
+
+    require_blk_ioerr_completion_without_reset(
+        "host read eagain exhaustion completion");
+    require_u32("host read eagain exhaustion calls",
+                (uint32_t) test_blk_disk_script.call_count, ARRAY_SIZE(ops));
+    dma_read(DATA_ADDR, guest_data, sizeof(guest_data));
+    require_mem("host read eagain exhaustion leaves guest data unchanged",
+                guest_data, (uint8_t[DISK_BLK_SIZE]) {0}, sizeof(guest_data));
+    test_blk_disk_script_clear();
+}
+
+static void test_host_disk_read_eio_completes_ioerr_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_IN, EIO, true);
+}
+
+static void test_host_disk_write_eio_completes_ioerr_without_reset(void)
+{
+    test_host_disk_fault_injection(VIRTIO_BLK_T_OUT, EIO, true);
+}
 
 static void test_queue_notify_enqueues_before_actor_status_write_returns(void)
 {
@@ -829,6 +1070,27 @@ int main(void)
     destroy_blk_fixture();
 
     test_out_of_range_sets_ioerr_with_zero_length_completion();
+    destroy_blk_fixture();
+
+    test_host_disk_read_eintr_retries_and_succeeds_without_reset();
+    destroy_blk_fixture();
+
+    test_host_disk_write_eintr_retries_and_succeeds_without_reset();
+    destroy_blk_fixture();
+
+    test_host_disk_read_eagain_retries_and_succeeds_without_reset();
+    destroy_blk_fixture();
+
+    test_host_disk_write_eagain_retries_and_succeeds_without_reset();
+    destroy_blk_fixture();
+
+    test_host_disk_read_eagain_retry_exhaustion_completes_ioerr();
+    destroy_blk_fixture();
+
+    test_host_disk_read_eio_completes_ioerr_without_reset();
+    destroy_blk_fixture();
+
+    test_host_disk_write_eio_completes_ioerr_without_reset();
     destroy_blk_fixture();
 
     test_queue_notify_enqueues_before_actor_status_write_returns();
