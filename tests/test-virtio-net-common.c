@@ -12,6 +12,7 @@
 
 #include "../ram_access.h"
 #include "../riscv_private.h"
+#include "../semu-event.h"
 
 static bool test_ram_dma_read(const ram_dma_t *dma,
                               guest_paddr_t addr,
@@ -402,6 +403,25 @@ static bool wait_for_used_idx(uint16_t idx)
     return false;
 }
 
+static bool wait_for_rx_used_idx(uint16_t idx)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if (read16(RX_USED_ADDR + 2) == idx)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
+static ssize_t event_loop_find_fd(const struct semu_event_loop *loop, int fd)
+{
+    for (size_t i = 0; i < loop->count; i++) {
+        if (loop->fds[i] == fd)
+            return (ssize_t) i;
+    }
+    return -1;
+}
+
 static void publish_tx_packet(const char *payload)
 {
     uint8_t header[VNET_HEADER_LEN] = {0};
@@ -413,6 +433,30 @@ static void publish_tx_packet(const char *payload)
     write_desc(TX_DESC_ADDR, 1, DATA_ADDR, (uint32_t) strlen(payload), 0, 0);
     write16(TX_AVAIL_ADDR + 4, 0);
     write16(TX_AVAIL_ADDR + 2, 1);
+}
+
+static void publish_rx_buffer(uint32_t len)
+{
+    write_desc(RX_DESC_ADDR, 0, HEADER_ADDR, len, VIRTIO_DESC_F_WRITE, 0);
+    write16(RX_AVAIL_ADDR + 4, 0);
+    write16(RX_AVAIL_ADDR + 2, 1);
+}
+
+static void fill_tx_pipe_until_eagain(void)
+{
+    uint8_t bytes[512] = {0};
+    int fd = user_net.host_to_guest_channel[SLIRP_WRITE_SIDE];
+
+    for (;;) {
+        ssize_t n = write(fd, bytes, sizeof(bytes));
+
+        if (n > 0)
+            continue;
+        require_bool("fill tx pipe hit EAGAIN",
+                     n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                     true);
+        return;
+    }
 }
 
 static void writev_gate_enable(void)
@@ -639,6 +683,156 @@ static void test_common_reset_start_cancels_stale_net_avail_failure(void)
         0);
 }
 
+static void test_net_event_sync_avoids_ready_tx_writable_subscription(void)
+{
+    struct semu_event_loop loop;
+
+    configure_net();
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+
+    require_bool("rx internal read fd registered",
+                 event_loop_find_fd(
+                     &loop,
+                     user_net.guest_to_host_channel[SLIRP_READ_SIDE]) >= 0,
+                 true);
+    require_bool("slirp input read fd registered",
+                 event_loop_find_fd(
+                     &loop,
+                     user_net.host_to_guest_channel[SLIRP_READ_SIDE]) >= 0,
+                 true);
+    require_bool("ready tx write fd not registered",
+                 event_loop_find_fd(
+                     &loop,
+                     user_net.host_to_guest_channel[SLIRP_WRITE_SIDE]) < 0,
+                 true);
+
+    semu_event_loop_destroy(&loop);
+}
+
+static void test_user_internal_rx_event_drives_rx_actor_work(void)
+{
+    struct semu_event_loop loop;
+    struct semu_event event = {0};
+    const char payload[] = "rxpkt";
+
+    configure_net();
+    publish_rx_buffer(VNET_HEADER_LEN + sizeof(payload) - 1);
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_int("write rx packet",
+                (int) write(user_net.guest_to_host_channel[SLIRP_WRITE_SIDE],
+                            payload, sizeof(payload) - 1),
+                (int) sizeof(payload) - 1);
+    require_int("wait rx event", semu_event_wait(&loop, &event, 1, 100), 1);
+
+    require_bool("net rx event handled",
+                 virtio_net_event_handle(&emu.vnet, &event,
+                                         SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                 true);
+    require_bool("rx actor published used completion", wait_for_rx_used_idx(1),
+                 true);
+    require_u32("rx used id", read32(RX_USED_ADDR + 4), 0);
+    require_u32("rx used len", read32(RX_USED_ADDR + 8),
+                VNET_HEADER_LEN + sizeof(payload) - 1);
+
+    semu_event_loop_destroy(&loop);
+}
+
+static void test_tx_eagain_event_restores_tx_readiness(void)
+{
+    struct semu_event_loop loop;
+    struct semu_event event = {0};
+    struct iovec iov = {
+        .iov_base = (void *) "x",
+        .iov_len = 1,
+    };
+    ssize_t written = 0;
+    ssize_t tx_index;
+
+    configure_net();
+    fill_tx_pipe_until_eagain();
+    require_int("host write EAGAIN",
+                virtio_net_host_write(&emu.vnet, &iov, 1, &written), -EAGAIN);
+    require_bool("tx readiness cleared after EAGAIN",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX), false);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    tx_index =
+        event_loop_find_fd(&loop,
+                           user_net.host_to_guest_channel[SLIRP_WRITE_SIDE]);
+    require_bool("tx writable fd registered after EAGAIN", tx_index >= 0,
+                 true);
+
+    event.token = loop.tokens[tx_index];
+    event.events = SEMU_EVENT_WRITABLE;
+    require_bool("tx writable event handled",
+                 virtio_net_event_handle(&emu.vnet, &event,
+                                         SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                 true);
+    require_bool("tx readiness restored",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX), true);
+
+    semu_event_loop_destroy(&loop);
+}
+
+static void test_net_reset_resync_does_not_restore_fd_readiness(void)
+{
+    struct semu_event_loop loop;
+    struct semu_event event = {0};
+
+    configure_net();
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    virtio_net_set_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX, true);
+    virtio_net_set_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX, true);
+
+    require_int("net reset", virtio_net_reset(&emu.vnet, 1, 2), 0);
+    require_bool("reset clears rx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX), false);
+    require_bool("reset clears tx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX), false);
+
+    require_int("net event resync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("resync does not restore rx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX), false);
+    require_bool("resync does not restore tx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX), false);
+
+    ssize_t rx_index =
+        event_loop_find_fd(&loop,
+                           user_net.guest_to_host_channel[SLIRP_READ_SIDE]);
+    require_bool("rx fd still registered", rx_index >= 0, true);
+    event.token = loop.tokens[rx_index];
+    event.events = SEMU_EVENT_READABLE;
+    require_bool("rx readiness event handled",
+                 virtio_net_event_handle(&emu.vnet, &event,
+                                         SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                 true);
+    require_bool("event restores rx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX), true);
+    require_bool("rx event does not restore tx readiness",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_TX), false);
+
+    semu_event_loop_destroy(&loop);
+}
+
 int main(void)
 {
     test_init_without_peer_is_transport_safe();
@@ -651,6 +845,18 @@ int main(void)
     destroy_net_fixture();
 
     test_common_reset_start_cancels_stale_net_avail_failure();
+    destroy_net_fixture();
+
+    test_net_event_sync_avoids_ready_tx_writable_subscription();
+    destroy_net_fixture();
+
+    test_user_internal_rx_event_drives_rx_actor_work();
+    destroy_net_fixture();
+
+    test_tx_eagain_event_restores_tx_readiness();
+    destroy_net_fixture();
+
+    test_net_reset_resync_does_not_restore_fd_readiness();
     destroy_net_fixture();
 
     return 0;
