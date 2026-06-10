@@ -688,6 +688,15 @@ static void *reset_net_thread(void *opaque)
     return NULL;
 }
 
+static void *stop_net_thread(void *opaque)
+{
+    struct async_net_call *call = opaque;
+    int ret = virtio_actor_stop(&call->vnet->actor);
+
+    async_net_call_finish(call, ret);
+    return NULL;
+}
+
 static void async_net_call_start_notify(struct async_net_call *call)
 {
     require_int("notify thread create",
@@ -699,6 +708,12 @@ static void async_net_call_start_reset(struct async_net_call *call)
 {
     require_int("reset thread create",
                 pthread_create(&call->thread, NULL, reset_net_thread, call), 0);
+}
+
+static void async_net_call_start_stop(struct async_net_call *call)
+{
+    require_int("stop thread create",
+                pthread_create(&call->thread, NULL, stop_net_thread, call), 0);
 }
 
 static void async_net_call_join(struct async_net_call *call)
@@ -822,6 +837,41 @@ static void test_reset_cancels_stale_net_completion(void)
     async_net_call_join(&reset);
     async_net_call_destroy(&notify);
     async_net_call_destroy(&reset);
+}
+
+static void test_stop_cancels_stale_net_completion(void)
+{
+    struct async_net_call notify;
+    struct async_net_call stop;
+
+    configure_net();
+    publish_tx_packet("stop");
+    writev_gate_enable();
+    async_net_call_init(&notify, &emu.vnet);
+    async_net_call_init(&stop, &emu.vnet);
+    async_net_call_start_notify(&notify);
+
+    require_bool("actor entered backend write before stop",
+                 writev_gate_wait_entered(1000), true);
+    async_net_call_start_stop(&stop);
+    require_bool("stop waits for in-flight actor backend mutation",
+                 async_net_call_wait_done(&stop, 50), false);
+
+    writev_gate_release();
+    require_bool("stop completed after backend release",
+                 async_net_call_wait_done(&stop, 1000), true);
+    require_int("stop return", stop.ret, 0);
+    require_u16("stop stale used idx remains clear", read16(TX_USED_ADDR + 2),
+                0);
+    require_u32("stop stale interrupt remains clear",
+                virtio_irq_read_status(&emu.vnet.common.irq), 0);
+    require_bool("stop stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VNET), false);
+
+    async_net_call_join(&notify);
+    async_net_call_join(&stop);
+    async_net_call_destroy(&notify);
+    async_net_call_destroy(&stop);
 }
 
 static void test_common_reset_start_cancels_stale_net_avail_failure(void)
@@ -1251,6 +1301,9 @@ int main(void)
     destroy_net_fixture();
 
     test_reset_cancels_stale_net_completion();
+    destroy_net_fixture();
+
+    test_stop_cancels_stale_net_completion();
     destroy_net_fixture();
 
     test_common_reset_start_cancels_stale_net_avail_failure();
