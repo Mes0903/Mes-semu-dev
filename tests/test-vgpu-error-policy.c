@@ -647,19 +647,19 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
-static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
+static void test_hidden_blob_command_returns_undefined_without_renderer_work(
     void)
 {
     uint32_t ram[512] = {0};
     emu_state_t emu;
     virtio_gpu_state_t vgpu;
-    struct virtio_gpu_get_capset_info *request =
-        (struct virtio_gpu_get_capset_info *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
     struct virtio_gpu_ctrl_hdr *response =
         (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x80);
     struct virtq_desc desc0 = {
         .addr = 0x40,
-        .len = sizeof(*request),
+        .len = sizeof(*blob),
         .flags = VIRTIO_DESC_F_NEXT,
         .next = 1,
     };
@@ -674,8 +674,10 @@ static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
     configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
     vgpu_renderer_reset_queues(vgpu.common.generation);
 
-    request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
-    request->capset_index = 0;
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = 77;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->size = 4096;
     memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
     memcpy((uint8_t *) ram + 0x110, &desc1, sizeof(desc1));
     store_u16(ram, 0x200, 0);
@@ -691,43 +693,16 @@ static void test_hidden_virgl_command_returns_undefined_without_renderer_work(
                           memory_order_release);
 
     require_int(
-        "notify hidden capset info",
+        "notify hidden blob create",
         vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
                                       vgpu.common.generation),
         0);
     wait_for_used_idx(ram, 0x302, 1);
 
-    require_u32("hidden capset response", response->type,
-                VIRTIO_GPU_RESP_ERR_UNSPEC);
-    require_u32("hidden capset used id", load_u32(ram, 0x304), 0);
-    require_u32("hidden capset used len", load_u32(ram, 0x308),
-                sizeof(struct virtio_gpu_ctrl_hdr));
-    require_int("hidden command queues no renderer work",
-                vgpu_renderer_pop_request(&queued), false);
-
-    struct virtio_gpu_resource_create_blob *blob =
-        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
-    memset(blob, 0, sizeof(*blob));
-    memset(response, 0, sizeof(*response));
-    desc0.len = sizeof(*blob);
-    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
-    blob->resource_id = 77;
-    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
-    blob->size = 4096;
-    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
-    store_u16(ram, 0x202, 2);
-
-    require_int(
-        "notify hidden blob create",
-        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
-                                      vgpu.common.generation),
-        0);
-    wait_for_used_idx(ram, 0x302, 2);
-
     require_u32("hidden blob response", response->type,
                 VIRTIO_GPU_RESP_ERR_UNSPEC);
-    require_u32("hidden blob used id", load_u32(ram, 0x30c), 0);
-    require_u32("hidden blob used len", load_u32(ram, 0x310),
+    require_u32("hidden blob used id", load_u32(ram, 0x304), 0);
+    require_u32("hidden blob used len", load_u32(ram, 0x308),
                 sizeof(struct virtio_gpu_ctrl_hdr));
     require_int("hidden blob queues no renderer work",
                 vgpu_renderer_pop_request(&queued), false);
@@ -4298,12 +4273,12 @@ static void test_virgl_submit_3d_fenced_request_snapshots_and_defers(void)
     g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
     require_u32("fenced submit 3d is deferred", len,
                 VIRTIO_GPU_RESPONSE_DEFERRED);
-    require_u32("fenced submit 3d writes no immediate response",
-                response->type, 0);
+    require_u32("fenced submit 3d writes no immediate response", response->type,
+                0);
 
     struct vgpu_renderer_request queued = {0};
-    require_int("fenced submit 3d queued",
-                vgpu_renderer_pop_request(&queued), true);
+    require_int("fenced submit 3d queued", vgpu_renderer_pop_request(&queued),
+                true);
     require_u32("fenced submit 3d command type", queued.command_type,
                 VIRTIO_GPU_CMD_SUBMIT_3D);
     struct vgpu_renderer_ctrl_payload *payload = queued.payload;
@@ -4612,7 +4587,8 @@ static void test_vgpu_invalid_actor_notify_counts_einval(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
-static void test_vgpu_virgl_gate_keeps_unsupported_features_hidden(void)
+#if SEMU_HAS(VIRGL)
+static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
 {
     uint32_t ram[64] = {0};
     emu_state_t emu;
@@ -4621,13 +4597,14 @@ static void test_vgpu_virgl_gate_keeps_unsupported_features_hidden(void)
 
     init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
 
-    require_u64("VirGL feature hidden",
-                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
-    require_u64("context-init feature hidden",
-                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_u64("VirGL feature visible",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL,
+                VIRTIO_GPU_F_VIRGL);
+    require_u64("context-init feature visible",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT,
+                VIRTIO_GPU_F_CONTEXT_INIT);
     require_u64("resource-blob feature hidden",
                 vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
-#if SEMU_HAS(VIRGL)
     require_u32("host-visible SHM configured", vgpu.common.has_shm_region, 1);
     require_u32("host-visible SHM id", vgpu.common.shm_region.id,
                 VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
@@ -4635,18 +4612,15 @@ static void test_vgpu_virgl_gate_keeps_unsupported_features_hidden(void)
                 SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
     require_u64("host-visible SHM length", vgpu.common.shm_region.length,
                 SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
-#else
-    require_u32("no host-visible SHM without VirGL", vgpu.common.has_shm_region,
-                0);
-#endif
     virtio_gpu_set_num_capsets(&vgpu, 5);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
-    require_u32("no capsets without renderer backend", num_capsets, 0);
+    require_u32("classic virgl capsets visible", num_capsets, 5);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
+#endif
 
 static void test_deferred_ctrl_completion_revalidates_generations(void)
 {
@@ -5291,10 +5265,12 @@ int main(void)
     test_vgpu_actor_failure_marks_device_reset_needed();
     test_vgpu_failed_actor_notify_counts_eio();
     test_vgpu_invalid_actor_notify_counts_einval();
-    test_vgpu_virgl_gate_keeps_unsupported_features_hidden();
+#if SEMU_HAS(VIRGL)
+    test_vgpu_virgl_demo_gate_exposes_classic_3d_features();
+#endif
     test_deferred_ctrl_completion_revalidates_generations();
 #if SEMU_HAS(VIRGL)
-    test_hidden_virgl_command_returns_undefined_without_renderer_work();
+    test_hidden_blob_command_returns_undefined_without_renderer_work();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
     test_virgl_resource_create_blob_handler_tracks_pending_resource();

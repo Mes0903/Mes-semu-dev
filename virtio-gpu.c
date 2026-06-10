@@ -86,11 +86,10 @@ static void virtio_gpu_init_display_counters(
 static bool virtio_gpu_virgl_runtime_ready(void)
 {
 #if SEMU_HAS(VIRGL)
-    /* The build gate exists, but guest-visible VirGL/blob remains disabled
-     * until the renderer backend, GL owner handoff, fences, reset, and capsets
-     * are all wired in this actor/common-transport branch.
+    /* Demo branch: expose classic VirGL only. Blob/resource-blob commands stay
+     * hidden until hostmem exposure and the formal feature gate are completed.
      */
-    return false;
+    return true;
 #else
     return false;
 #endif
@@ -100,10 +99,8 @@ static uint64_t virtio_gpu_device_features(void)
 {
     uint64_t features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1;
 
-    if (virtio_gpu_virgl_runtime_ready()) {
-        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
-                    VIRTIO_GPU_F_CONTEXT_INIT;
-    }
+    if (virtio_gpu_virgl_runtime_ready())
+        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT;
 
     return features;
 }
@@ -3370,14 +3367,25 @@ static int virtio_gpu_chain_to_descs(const struct virtq_chain *chain,
     return 0;
 }
 
+static bool virtio_gpu_command_requires_blob(uint32_t type)
+{
+    switch (type) {
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool virtio_gpu_command_requires_virgl(uint32_t type)
 {
     switch (type) {
     case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
     case VIRTIO_GPU_CMD_GET_CAPSET:
     case VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID:
-    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
-    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
     case VIRTIO_GPU_CMD_CTX_CREATE:
     case VIRTIO_GPU_CMD_CTX_DESTROY:
     case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
@@ -3386,8 +3394,6 @@ static bool virtio_gpu_command_requires_virgl(uint32_t type)
     case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
     case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
     case VIRTIO_GPU_CMD_SUBMIT_3D:
-    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
-    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
         return true;
     default:
         return false;
@@ -3424,8 +3430,9 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         return -1;
     }
 
-    if (virtio_gpu_command_requires_virgl(header->type) &&
-        !virtio_gpu_virgl_runtime_ready()) {
+    if (virtio_gpu_command_requires_blob(header->type) ||
+        (virtio_gpu_command_requires_virgl(header->type) &&
+         !virtio_gpu_virgl_runtime_ready())) {
         virtio_gpu_cmd_undefined_handler(vgpu, vq_desc, plen);
         return *plen == 0 ? -1 : 0;
     }
