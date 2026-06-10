@@ -115,6 +115,12 @@ int virgl_renderer_resource_attach_iov(int res_handle,
 void virgl_renderer_resource_detach_iov(int res_handle,
                                         struct iovec **iov,
                                         int *num_iovs);
+int virgl_renderer_resource_map(uint32_t res_handle,
+                                void **map,
+                                uint64_t *out_size);
+int virgl_renderer_resource_unmap(uint32_t res_handle);
+int virgl_renderer_resource_get_map_info(uint32_t res_handle,
+                                         uint32_t *map_info);
 void virgl_renderer_resource_unref(uint32_t res_handle);
 int virgl_renderer_transfer_read_iov(uint32_t handle,
                                      uint32_t ctx_id,

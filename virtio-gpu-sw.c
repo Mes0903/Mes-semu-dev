@@ -1893,8 +1893,13 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .transfer_from_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .submit_3d = VIRTIO_GPU_CMD_UNDEF,
 #endif
+#if SEMU_HAS(VIRGL)
+    .resource_map_blob = virtio_gpu_virgl_resource_map_blob_handler,
+    .resource_unmap_blob = virtio_gpu_virgl_resource_unmap_blob_handler,
+#else
     .resource_map_blob = VIRTIO_GPU_CMD_UNDEF,
     .resource_unmap_blob = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .update_cursor = vgpu_sw_cmd_update_cursor_handler,
     .move_cursor = vgpu_sw_cmd_move_cursor_handler,
 };

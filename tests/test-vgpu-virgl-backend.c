@@ -67,6 +67,18 @@ static struct iovec *fake_attached_iov;
 static int fake_attached_iov_count;
 static struct iovec *fake_last_detached_iov;
 static int fake_last_resource_detach_iov_count;
+static int fake_resource_map_count;
+static uint32_t fake_last_resource_map_handle;
+static void *fake_resource_map_ptr = (void *) (uintptr_t) 0x12340000;
+static uint64_t fake_resource_map_size = 0x2000;
+static int fake_resource_map_result;
+static int fake_resource_unmap_count;
+static uint32_t fake_last_resource_unmap_handle;
+static int fake_resource_unmap_result;
+static int fake_resource_get_map_info_count;
+static uint32_t fake_last_resource_get_map_info_handle;
+static uint32_t fake_resource_get_map_info = VIRTIO_GPU_MAP_CACHE_WC;
+static int fake_resource_get_map_info_result;
 static int fake_resource_unref_count;
 static uint32_t fake_last_resource_unref_handle;
 static int fake_transfer_write_iov_count;
@@ -263,6 +275,36 @@ void virgl_renderer_resource_detach_iov(int res_handle,
     fake_attached_iov_count = 0;
 }
 
+int virgl_renderer_resource_map(uint32_t res_handle, void **map, uint64_t *size)
+{
+    fake_resource_map_count++;
+    fake_last_resource_map_handle = res_handle;
+    if (fake_resource_map_result == 0) {
+        if (map)
+            *map = fake_resource_map_ptr;
+        if (size)
+            *size = fake_resource_map_size;
+    }
+    return fake_resource_map_result;
+}
+
+int virgl_renderer_resource_unmap(uint32_t res_handle)
+{
+    fake_resource_unmap_count++;
+    fake_last_resource_unmap_handle = res_handle;
+    return fake_resource_unmap_result;
+}
+
+int virgl_renderer_resource_get_map_info(uint32_t res_handle,
+                                         uint32_t *map_info)
+{
+    fake_resource_get_map_info_count++;
+    fake_last_resource_get_map_info_handle = res_handle;
+    if (fake_resource_get_map_info_result == 0 && map_info)
+        *map_info = fake_resource_get_map_info;
+    return fake_resource_get_map_info_result;
+}
+
 void virgl_renderer_resource_unref(uint32_t res_handle)
 {
     fake_resource_unref_count++;
@@ -432,6 +474,18 @@ static void reset_test_state(uint64_t generation)
     fake_attached_iov_count = 0;
     fake_last_detached_iov = NULL;
     fake_last_resource_detach_iov_count = 0;
+    fake_resource_map_count = 0;
+    fake_last_resource_map_handle = 0;
+    fake_resource_map_ptr = (void *) (uintptr_t) 0x12340000;
+    fake_resource_map_size = 0x2000;
+    fake_resource_map_result = 0;
+    fake_resource_unmap_count = 0;
+    fake_last_resource_unmap_handle = 0;
+    fake_resource_unmap_result = 0;
+    fake_resource_get_map_info_count = 0;
+    fake_last_resource_get_map_info_handle = 0;
+    fake_resource_get_map_info = VIRTIO_GPU_MAP_CACHE_WC;
+    fake_resource_get_map_info_result = 0;
     fake_resource_unref_count = 0;
     fake_last_resource_unref_handle = 0;
     fake_transfer_write_iov_count = 0;
@@ -1037,6 +1091,325 @@ static void test_ctrl_request_executes_resource_create_blob_completion(void)
     CHECK(completion.virgl_resource.resource_generation == 0x789abc);
     CHECK(fake_resource_create_blob_count == 2);
     CHECK(fake_resource_unref_count == 0);
+}
+
+static void test_ctrl_request_maps_and_unmaps_blob_resources(void)
+{
+    reset_test_state(136);
+
+    struct vgpu_renderer_ctrl_payload map_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+                .flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX,
+                .fence_id = UINT64_C(0x0102030405060708),
+                .ctx_id = 7,
+                .ring_idx = 3},
+        .cmd.resource_map_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+                        .flags = VIRTIO_GPU_FLAG_FENCE |
+                                 VIRTIO_GPU_FLAG_INFO_RING_IDX,
+                        .fence_id = UINT64_C(0x0102030405060708),
+                        .ctx_id = 7,
+                        .ring_idx = 3},
+                .resource_id = 404,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_resp_map_info),
+        .response_type = VIRTIO_GPU_RESP_OK_MAP_INFO,
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 136},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+        .payload = &map_payload,
+        .payload_size = sizeof(map_payload),
+    };
+    struct vgpu_renderer_completion completion = {0};
+
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+    CHECK(fake_resource_map_count == 0);
+
+    struct vgpu_renderer_ctrl_payload create_3d = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+        .cmd.resource_create_3d =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D},
+                .resource_id = 190,
+                .target = 2,
+                .format = 3,
+                .bind = 4,
+                .width = 64,
+                .height = 64,
+                .depth = 1,
+                .array_size = 1,
+                .nr_samples = 1,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    request.payload = &create_3d;
+    request.payload_size = sizeof(create_3d);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    map_payload.cmd.resource_map_blob.resource_id = 190;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_resource_map_count == 0);
+
+    struct vgpu_renderer_ctrl_payload create_blob = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, .ctx_id = 8},
+        .cmd.resource_create_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+                        .ctx_id = 8},
+                .resource_id = 191,
+                .blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D,
+                .blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                .size = 4096,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    map_payload.cmd.resource_map_blob.resource_id = 191;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    CHECK(completion.response_size == sizeof(struct virtio_gpu_resp_map_info));
+    struct virtio_gpu_resp_map_info *map_response = completion.response;
+    CHECK(map_response != NULL);
+    CHECK(map_response->hdr.type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    CHECK(map_response->hdr.flags ==
+          (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX));
+    CHECK(map_response->hdr.fence_id == UINT64_C(0x0102030405060708));
+    CHECK(map_response->hdr.ctx_id == 7);
+    CHECK(map_response->hdr.ring_idx == 3);
+    CHECK(map_response->map_info == VIRTIO_GPU_MAP_CACHE_WC);
+    completion.release_response(completion.response);
+    CHECK(fake_resource_map_count == 1);
+    CHECK(fake_last_resource_map_handle == 191);
+    CHECK(fake_resource_get_map_info_count == 1);
+    CHECK(fake_last_resource_get_map_info_handle == 191);
+
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_resource_map_count == 1);
+
+    struct vgpu_renderer_ctrl_payload unmap_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB},
+        .cmd.resource_unmap_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB},
+                .resource_id = 191,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    request.payload = &unmap_payload;
+    request.payload_size = sizeof(unmap_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(fake_resource_unmap_count == 1);
+    CHECK(fake_last_resource_unmap_handle == 191);
+
+    unmap_payload.cmd.resource_unmap_blob.resource_id = 404;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+
+    unmap_payload.cmd.resource_unmap_blob.resource_id = 190;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_resource_unmap_count == 1);
+
+    create_blob.cmd.resource_create_blob.resource_id = 192;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    map_payload.cmd.resource_map_blob.resource_id = 192;
+    map_payload.response_capacity = sizeof(struct virtio_gpu_ctrl_hdr);
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_resource_map_count == 1);
+    CHECK(fake_resource_get_map_info_count == 1);
+    map_payload.response_capacity = sizeof(struct virtio_gpu_resp_map_info);
+
+    create_blob.cmd.resource_create_blob.resource_id = 193;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    fake_resource_map_result = -1;
+    map_payload.cmd.resource_map_blob.resource_id = 193;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_resource_map_count == 2);
+    CHECK(fake_last_resource_map_handle == 193);
+    CHECK(fake_resource_get_map_info_count == 1);
+    fake_resource_map_result = 0;
+
+    create_blob.cmd.resource_create_blob.resource_id = 194;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    int unmaps_before = fake_resource_unmap_count;
+    fake_resource_get_map_info_result = -1;
+    map_payload.cmd.resource_map_blob.resource_id = 194;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_resource_map_count == 3);
+    CHECK(fake_resource_get_map_info_count == 2);
+    CHECK(fake_resource_unmap_count == unmaps_before + 1);
+    CHECK(fake_last_resource_unmap_handle == 194);
+    fake_resource_get_map_info_result = 0;
+
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    CHECK(fake_resource_map_count == 4);
+    CHECK(fake_resource_get_map_info_count == 3);
+    completion.release_response(completion.response);
+
+    unmap_payload.cmd.resource_unmap_blob.resource_id = 194;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    request.payload = &unmap_payload;
+    request.payload_size = sizeof(unmap_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(fake_resource_unmap_count == unmaps_before + 2);
+    CHECK(fake_last_resource_unmap_handle == 194);
+
+    create_blob.cmd.resource_create_blob.resource_id = 195;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    map_payload.cmd.resource_map_blob.resource_id = 195;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    completion.release_response(completion.response);
+
+    unmaps_before = fake_resource_unmap_count;
+    int unrefs_before = fake_resource_unref_count;
+    struct vgpu_renderer_ctrl_payload unref_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNREF},
+        .cmd.resource_unref =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNREF},
+                .resource_id = 195,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    request.payload = &unref_payload;
+    request.payload_size = sizeof(unref_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(fake_resource_unmap_count == unmaps_before + 1);
+    CHECK(fake_last_resource_unmap_handle == 195);
+    CHECK(fake_resource_unref_count == unrefs_before + 1);
+    CHECK(fake_last_resource_unref_handle == 195);
+
+    create_blob.cmd.resource_create_blob.resource_id = 196;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    map_payload.cmd.resource_map_blob.resource_id = 196;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    completion.release_response(completion.response);
+
+    unmaps_before = fake_resource_unmap_count;
+    fake_resource_unmap_result = -1;
+    unmap_payload.cmd.resource_unmap_blob.resource_id = 196;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    request.payload = &unmap_payload;
+    request.payload_size = sizeof(unmap_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_resource_unmap_count == unmaps_before + 1);
+    CHECK(fake_last_resource_unmap_handle == 196);
+    fake_resource_unmap_result = 0;
+
+    int maps_before = fake_resource_map_count;
+    map_payload.cmd.resource_map_blob.resource_id = 196;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_UNSPEC);
+    CHECK(fake_resource_map_count == maps_before);
+
+    unmaps_before = fake_resource_unmap_count;
+    int resets_before = fake_reset_count;
+    vgpu_virgl_reset_renderer();
+    CHECK(fake_resource_unmap_count == unmaps_before + 1);
+    CHECK(fake_last_resource_unmap_handle == 196);
+    CHECK(fake_reset_count == resets_before + 1);
 }
 
 static void test_ctrl_request_resource_create_3d_failure_rolls_back_frontend(
@@ -2078,6 +2451,7 @@ int main(void)
     test_ctrl_request_executes_context_create_destroy();
     test_ctrl_request_executes_resource_create_3d_completion();
     test_ctrl_request_executes_resource_create_blob_completion();
+    test_ctrl_request_maps_and_unmaps_blob_resources();
     test_ctrl_request_resource_create_3d_failure_rolls_back_frontend();
     test_ctrl_request_records_set_scanout_gl_payload_completion();
     test_ctrl_request_records_set_scanout_blob_gl_payload_completion();

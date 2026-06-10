@@ -412,6 +412,7 @@ struct virtio_gpu_virgl_resource_state {
     uint32_t resource_id;
     uint64_t generation;
     bool unref_pending;
+    bool blob_resource;
     bool backing_attached;
     bool backing_attach_pending;
     bool backing_detach_pending;
@@ -501,6 +502,7 @@ void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id)
 }
 
 static int virtio_gpu_virgl_reserve_resource(uint32_t resource_id,
+                                             bool blob_resource,
                                              uint64_t *generation)
 {
     struct virtio_gpu_virgl_resource_state *res;
@@ -536,6 +538,7 @@ static int virtio_gpu_virgl_reserve_resource(uint32_t resource_id,
 
     res->resource_id = resource_id;
     res->generation = virtio_gpu_virgl_next_resource_generation;
+    res->blob_resource = blob_resource;
     res->next = virtio_gpu_virgl_resources;
     virtio_gpu_virgl_resources = res;
     if (generation)
@@ -732,6 +735,35 @@ static int virtio_gpu_virgl_begin_transfer_3d(uint32_t resource_id,
     }
     if (!res->backing_attached || res->backing_attach_pending ||
         res->backing_detach_pending) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        return -EALREADY;
+    }
+
+    if (generation)
+        *generation = res->generation;
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+    return 0;
+}
+
+static int virtio_gpu_virgl_begin_blob_command(uint32_t resource_id,
+                                               uint64_t *generation)
+{
+    struct virtio_gpu_virgl_resource_state *res;
+    int ret = pthread_mutex_lock(&virtio_gpu_virgl_resources_lock);
+
+    if (ret != 0)
+        return -ret;
+
+    res = virtio_gpu_virgl_find_live_resource_locked(resource_id);
+    if (!res) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        return -ENOENT;
+    }
+    if (!res->blob_resource) {
+        pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+        return -EINVAL;
+    }
+    if (res->backing_attach_pending || res->backing_detach_pending) {
         pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
         return -EALREADY;
     }
@@ -1199,6 +1231,12 @@ static void virtio_gpu_copy_renderer_ctrl_cmd(
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
         memcpy(&payload->cmd.resource_create_blob, request, request_size);
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+        memcpy(&payload->cmd.resource_map_blob, request, request_size);
+        break;
+    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+        memcpy(&payload->cmd.resource_unmap_blob, request, request_size);
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
         memcpy(&payload->cmd.resource_create_3d, request, request_size);
         break;
@@ -1481,8 +1519,8 @@ void virtio_gpu_virgl_resource_create_3d_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    int reserve_ret = virtio_gpu_virgl_reserve_resource(snapshot.resource_id,
-                                                        &resource_generation);
+    int reserve_ret = virtio_gpu_virgl_reserve_resource(
+        snapshot.resource_id, false, &resource_generation);
     if (reserve_ret == -EEXIST) {
         *plen = virtio_gpu_write_ctrl_response(
             vgpu, &snapshot.hdr, response_desc,
@@ -1661,8 +1699,8 @@ void virtio_gpu_virgl_resource_create_blob_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    int reserve_ret = virtio_gpu_virgl_reserve_resource(snapshot.resource_id,
-                                                        &resource_generation);
+    int reserve_ret = virtio_gpu_virgl_reserve_resource(
+        snapshot.resource_id, true, &resource_generation);
     if (reserve_ret == -EEXIST) {
         free(iov);
         *plen = virtio_gpu_write_ctrl_response(
@@ -1743,6 +1781,123 @@ void virtio_gpu_virgl_resource_unref_handler(virtio_gpu_state_t *vgpu,
                                                  resource_generation);
 }
 
+void virtio_gpu_virgl_resource_map_blob_handler(virtio_gpu_state_t *vgpu,
+                                                struct virtq_desc *vq_desc,
+                                                uint32_t *plen)
+{
+    const struct virtio_gpu_resource_map_blob *request = virtio_gpu_get_request(
+        vgpu, vq_desc, sizeof(struct virtio_gpu_resource_map_blob));
+    const struct virtq_desc *response_desc;
+    uint64_t resource_generation = 0;
+    int ret;
+
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_resource_map_blob snapshot = *request;
+    response_desc = virtio_gpu_get_response_desc(
+        vq_desc, sizeof(struct virtio_gpu_resp_map_info));
+    if (!response_desc) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    ret = virtio_gpu_virgl_begin_blob_command(snapshot.resource_id,
+                                              &resource_generation);
+    if (ret == -ENOENT) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret == -EINVAL) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret != 0) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    snapshot.hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    virtio_gpu_submit_renderer_ctrl(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_resp_map_info),
+        VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_RESP_OK_MAP_INFO,
+        resource_generation, plen);
+}
+
+void virtio_gpu_virgl_resource_unmap_blob_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen)
+{
+    const struct virtio_gpu_resource_unmap_blob *request =
+        virtio_gpu_get_request(vgpu, vq_desc,
+                               sizeof(struct virtio_gpu_resource_unmap_blob));
+    const struct virtq_desc *response_desc;
+    uint64_t resource_generation = 0;
+    int ret;
+
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_resource_unmap_blob snapshot = *request;
+    response_desc = virtio_gpu_get_response_desc(
+        vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
+    if (!response_desc) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    ret = virtio_gpu_virgl_begin_blob_command(snapshot.resource_id,
+                                              &resource_generation);
+    if (ret == -ENOENT) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret == -EINVAL) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret != 0) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    snapshot.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    virtio_gpu_submit_renderer_ctrl(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+        VIRTIO_GPU_RESP_OK_NODATA, resource_generation, plen);
+}
 
 static size_t virtio_gpu_readable_desc_bytes(struct virtq_desc *vq_desc,
                                              size_t first_desc)

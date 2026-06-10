@@ -42,7 +42,11 @@ static uint64_t debug_last_context_fence;
 
 struct vgpu_virgl_renderer_resource {
     uint32_t resource_id;
+    bool blob_resource;
     bool backing_attached;
+    bool mapped;
+    void *map_ptr;
+    uint64_t map_size;
     struct vgpu_virgl_renderer_resource *next;
 };
 
@@ -81,19 +85,30 @@ static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
 
 static void vgpu_virgl_detach_iov(uint32_t resource_id);
 
+static void vgpu_virgl_release_renderer_resource(
+    struct vgpu_virgl_renderer_resource *res)
+{
+    if (!res)
+        return;
+    if (res->mapped)
+        (void) virgl_renderer_resource_unmap(res->resource_id);
+    if (res->backing_attached)
+        vgpu_virgl_detach_iov(res->resource_id);
+    free(res);
+}
+
 static void vgpu_virgl_clear_renderer_resources(void)
 {
     while (vgpu_virgl_renderer_resources) {
         struct vgpu_virgl_renderer_resource *res =
             vgpu_virgl_renderer_resources;
         vgpu_virgl_renderer_resources = res->next;
-        if (res->backing_attached)
-            vgpu_virgl_detach_iov(res->resource_id);
-        free(res);
+        vgpu_virgl_release_renderer_resource(res);
     }
 }
 
-static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id)
+static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id,
+                                                bool blob_resource)
 {
     struct vgpu_virgl_renderer_resource *res = calloc(1, sizeof(*res));
 
@@ -101,6 +116,7 @@ static bool vgpu_virgl_insert_renderer_resource(uint32_t resource_id)
         return false;
 
     res->resource_id = resource_id;
+    res->blob_resource = blob_resource;
     res->next = vgpu_virgl_renderer_resources;
     vgpu_virgl_renderer_resources = res;
     return true;
@@ -139,7 +155,7 @@ static bool vgpu_virgl_remove_renderer_resource(uint32_t resource_id)
 
         if (res->resource_id == resource_id) {
             *cursor = res->next;
-            free(res);
+            vgpu_virgl_release_renderer_resource(res);
             return true;
         }
         cursor = &res->next;
@@ -768,7 +784,7 @@ static void vgpu_virgl_execute_ctrl_request(
             response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
             break;
         }
-        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id)) {
+        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id, true)) {
             virgl_renderer_resource_unref(cmd->resource_id);
             response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
             break;
@@ -798,7 +814,7 @@ static void vgpu_virgl_execute_ctrl_request(
             response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
             break;
         }
-        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id)) {
+        if (!vgpu_virgl_insert_renderer_resource(cmd->resource_id, false)) {
             virgl_renderer_resource_unref(cmd->resource_id);
             response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
             break;
@@ -860,6 +876,94 @@ static void vgpu_virgl_execute_ctrl_request(
     case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
         response_type = vgpu_virgl_record_renderer_scanout_blob(payload);
         break;
+    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: {
+        const struct virtio_gpu_resource_map_blob *cmd =
+            &payload->cmd.resource_map_blob;
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_find_renderer_resource(cmd->resource_id);
+        void *map_ptr = NULL;
+        uint64_t map_size = 0;
+        uint32_t map_info = 0;
+
+        if (!res) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+        if (!res->blob_resource) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        if (res->mapped) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        if (payload->response_capacity <
+            sizeof(struct virtio_gpu_resp_map_info)) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        if (virgl_renderer_resource_map(cmd->resource_id, &map_ptr,
+                                        &map_size) != 0) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        if (virgl_renderer_resource_get_map_info(cmd->resource_id, &map_info) !=
+            0) {
+            (void) virgl_renderer_resource_unmap(cmd->resource_id);
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+
+        struct virtio_gpu_resp_map_info *out = calloc(1, sizeof(*out));
+        if (!out) {
+            (void) virgl_renderer_resource_unmap(cmd->resource_id);
+            response_type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            break;
+        }
+        out->hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
+        out->hdr.flags = cmd->hdr.flags & (VIRTIO_GPU_FLAG_FENCE |
+                                           VIRTIO_GPU_FLAG_INFO_RING_IDX);
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE)
+            out->hdr.fence_id = cmd->hdr.fence_id;
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)
+            out->hdr.ring_idx = cmd->hdr.ring_idx;
+        out->hdr.ctx_id = cmd->hdr.ctx_id;
+        out->map_info = map_info;
+
+        res->mapped = true;
+        res->map_ptr = map_ptr;
+        res->map_size = map_size;
+        response = out;
+        response_size = sizeof(*out);
+        response_type = VIRTIO_GPU_RESP_OK_MAP_INFO;
+        break;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: {
+        const struct virtio_gpu_resource_unmap_blob *cmd =
+            &payload->cmd.resource_unmap_blob;
+        struct vgpu_virgl_renderer_resource *res =
+            vgpu_virgl_find_renderer_resource(cmd->resource_id);
+
+        if (!res) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            break;
+        }
+        if (!res->blob_resource) {
+            response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        if (res->mapped) {
+            if (virgl_renderer_resource_unmap(cmd->resource_id) != 0) {
+                response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+                break;
+            }
+            res->mapped = false;
+            res->map_ptr = NULL;
+            res->map_size = 0;
+        }
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    }
     case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
         const struct virtio_gpu_res_unref *cmd = &payload->cmd.resource_unref;
         struct vgpu_virgl_renderer_resource *res =
@@ -870,8 +974,6 @@ static void vgpu_virgl_execute_ctrl_request(
             break;
         }
 
-        if (res->backing_attached)
-            vgpu_virgl_detach_iov(cmd->resource_id);
         vgpu_virgl_clear_renderer_resource_scanouts(cmd->resource_id);
         (void) vgpu_virgl_remove_renderer_resource(cmd->resource_id);
         virgl_renderer_resource_unref(cmd->resource_id);

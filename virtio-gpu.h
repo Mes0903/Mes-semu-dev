@@ -236,6 +236,19 @@ PACKED(struct virtio_gpu_resource_create_blob {
     uint64_t size;
 });
 
+PACKED(struct virtio_gpu_resource_map_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+    uint64_t offset;
+});
+
+PACKED(struct virtio_gpu_resource_unmap_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+});
+
 PACKED(struct virtio_gpu_set_scanout_blob {
     struct virtio_gpu_ctrl_hdr hdr;
     struct virtio_gpu_rect r;
@@ -256,6 +269,12 @@ PACKED(struct virtio_gpu_set_scanout_blob {
 #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 0x0001
 #define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE 0x0002
 #define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+
+#define VIRTIO_GPU_MAP_CACHE_MASK 0x0f
+#define VIRTIO_GPU_MAP_CACHE_NONE 0x00
+#define VIRTIO_GPU_MAP_CACHE_CACHED 0x01
+#define VIRTIO_GPU_MAP_CACHE_UNCACHED 0x02
+#define VIRTIO_GPU_MAP_CACHE_WC 0x03
 
 PACKED(struct virtio_gpu_ctx_resource {
     struct virtio_gpu_ctrl_hdr hdr;
@@ -333,6 +352,8 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_RESP_OK_CAPSET_INFO,
     VIRTIO_GPU_RESP_OK_CAPSET,
     VIRTIO_GPU_RESP_OK_EDID,
+    VIRTIO_GPU_RESP_OK_RESOURCE_UUID,
+    VIRTIO_GPU_RESP_OK_MAP_INFO,
 
     /* Error responses */
     VIRTIO_GPU_RESP_ERR_UNSPEC = 0x1200,
@@ -528,6 +549,12 @@ void virtio_gpu_virgl_transfer_from_host_3d_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_submit_3d_handler(virtio_gpu_state_t *vgpu,
                                         struct virtq_desc *vq_desc,
                                         uint32_t *plen);
+void virtio_gpu_virgl_resource_map_blob_handler(virtio_gpu_state_t *vgpu,
+                                                struct virtq_desc *vq_desc,
+                                                uint32_t *plen);
+void virtio_gpu_virgl_resource_unmap_blob_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
 bool virtio_gpu_virgl_resource_id_exists(uint32_t resource_id);
 void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id);
 void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id);
