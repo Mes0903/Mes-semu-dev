@@ -146,6 +146,13 @@ static void require_ptr(const char *name, const void *got, const void *want)
 }
 
 static uint32_t renderer_release_response_count;
+static uint32_t renderer_release_payload_count;
+
+static void renderer_release_payload(void *payload)
+{
+    renderer_release_payload_count++;
+    free(payload);
+}
 
 static void renderer_release_response(void *response)
 {
@@ -5183,6 +5190,94 @@ static void test_vgpu_destroy_stops_started_actor_and_is_idempotent(void)
     pthread_mutex_destroy(&emu.plic_lock);
 }
 
+#if SEMU_HAS(VIRGL)
+static void test_vgpu_destroy_shutdowns_renderer_queue(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu = {0};
+    virtio_gpu_state_t vgpu;
+    uint64_t generation;
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .payload_size = 1,
+        .release_payload = renderer_release_payload,
+    };
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .response_size = sizeof(struct virtio_gpu_ctrl_hdr),
+        .release_response = renderer_release_response,
+    };
+
+    emu.ram = ram;
+    ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
+    require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
+
+    virtio_gpu_init(&vgpu, &emu);
+    generation = vgpu.common.generation;
+
+    renderer_release_payload_count = 0;
+    renderer_release_response_count = 0;
+    request.token.generation = generation;
+    request.payload = malloc(1);
+    completion.token.generation = generation;
+    completion.response = calloc(1, sizeof(struct virtio_gpu_ctrl_hdr));
+    require_false("request payload allocated", request.payload == NULL);
+    require_false("completion response allocated", completion.response == NULL);
+
+    require_int("queue pending renderer request",
+                vgpu_renderer_submit(&request), true);
+    require_int("queue pending renderer completion",
+                vgpu_renderer_complete(&completion), true);
+
+    virtio_gpu_destroy(&vgpu);
+
+    require_u32("destroy released pending renderer request",
+                renderer_release_payload_count, 1);
+    require_u32("destroy released pending renderer completion",
+                renderer_release_response_count, 1);
+
+    struct vgpu_renderer_request late_request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = generation},
+    };
+    require_int("destroyed renderer rejects request",
+                vgpu_renderer_submit(&late_request), false);
+    require_int("destroyed renderer has no request to pop",
+                vgpu_renderer_pop_request(&late_request), false);
+
+    struct vgpu_renderer_completion late_completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = generation},
+        .response = calloc(1, sizeof(struct virtio_gpu_ctrl_hdr)),
+        .response_size = sizeof(struct virtio_gpu_ctrl_hdr),
+        .release_response = renderer_release_response,
+    };
+    require_false("late completion response allocated",
+                  late_completion.response == NULL);
+    require_int("destroyed renderer rejects completion",
+                vgpu_renderer_complete(&late_completion), false);
+    require_int("destroyed renderer has no completion to pop",
+                vgpu_renderer_pop_completion(&late_completion), false);
+    require_u32("destroy released rejected completion response",
+                renderer_release_response_count, 2);
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    require_false("destroyed renderer unavailable", stats.available);
+    require_u32("destroyed renderer request depth", stats.request_depth, 0);
+    require_u32("destroyed renderer completion depth", stats.completion_depth,
+                0);
+
+    virtio_gpu_destroy(&vgpu);
+    require_u32("idempotent destroy releases no extra request",
+                renderer_release_payload_count, 1);
+    require_u32("idempotent destroy releases no extra completion",
+                renderer_release_response_count, 2);
+
+    pthread_mutex_destroy(&emu.plic_lock);
+}
+#endif
+
 int main(void)
 {
     test_vgpu_debug_counters_init_and_reset_to_zero();
@@ -5236,5 +5331,8 @@ int main(void)
 #endif
     test_vgpu_destroy_releases_common_without_actor();
     test_vgpu_destroy_stops_started_actor_and_is_idempotent();
+#if SEMU_HAS(VIRGL)
+    test_vgpu_destroy_shutdowns_renderer_queue();
+#endif
     return 0;
 }

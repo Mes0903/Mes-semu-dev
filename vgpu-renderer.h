@@ -135,6 +135,7 @@ struct vgpu_renderer_debug_stats {
     uint32_t completion_head;
     uint32_t completion_tail;
     uint32_t completion_depth;
+    bool available;
     bool resetting;
     uint64_t requests_submitted;
     uint64_t requests_dropped;
@@ -165,7 +166,12 @@ bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request);
  */
 bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion);
 bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion);
+/* Init/reset make the queues available for a generation. Shutdown drains
+ * queued ownership hooks and leaves the queues unavailable until reopened.
+ */
+void vgpu_renderer_init_queues(uint64_t generation);
 void vgpu_renderer_reset_queues(uint64_t generation);
+void vgpu_renderer_shutdown_queues(void);
 void vgpu_renderer_debug_note_execute_begin(
     const struct vgpu_renderer_request *request);
 void vgpu_renderer_debug_note_execute_end(void);

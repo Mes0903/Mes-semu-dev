@@ -3973,11 +3973,14 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         exit(EXIT_FAILURE);
     }
 #if SEMU_HAS(VIRGL)
-    vgpu_renderer_reset_queues(vgpu->common.generation);
+    vgpu_renderer_init_queues(vgpu->common.generation);
 #endif
 
     if (virtio_actor_init(&vgpu->actor, &virtio_gpu_actor_ops, vgpu,
                           ARRAY_SIZE(queue_max_sizes)) < 0) {
+#if SEMU_HAS(VIRGL)
+        vgpu_renderer_shutdown_queues();
+#endif
         virtio_device_common_destroy(&vgpu->common);
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -4005,7 +4008,7 @@ void virtio_gpu_destroy(virtio_gpu_state_t *vgpu)
         g_virtio_gpu_backend.reset(vgpu);
 #if SEMU_HAS(VIRGL)
     virtio_gpu_virgl_clear_resources();
-    vgpu_renderer_reset_queues(vgpu->common.generation);
+    vgpu_renderer_shutdown_queues();
 #endif
 
     virtio_device_common_destroy(&vgpu->common);

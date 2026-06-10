@@ -23,6 +23,10 @@ static bool submit_during_reset_result;
 static bool complete_during_reset_result;
 static bool pop_request_during_reset_result;
 static bool pop_completion_during_reset_result;
+static bool submit_after_shutdown_result;
+static bool complete_after_shutdown_result;
+static bool pop_request_after_shutdown_result;
+static bool pop_completion_after_shutdown_result;
 static bool pop_completion_during_frontend_wake_result;
 static struct vgpu_renderer_completion pop_completion_during_frontend_wake;
 static pthread_t concurrent_reset_thread;
@@ -38,6 +42,10 @@ static void reset_test_counters(void)
     complete_during_reset_result = true;
     pop_request_during_reset_result = true;
     pop_completion_during_reset_result = true;
+    submit_after_shutdown_result = true;
+    complete_after_shutdown_result = true;
+    pop_request_after_shutdown_result = true;
+    pop_completion_after_shutdown_result = true;
     pop_completion_during_frontend_wake_result = false;
     pop_completion_during_frontend_wake = (struct vgpu_renderer_completion) {0};
     concurrent_reset_thread_started = false;
@@ -321,6 +329,119 @@ static void test_reset_releases_queued_entries_and_rejects_reentrant_work(void)
     CHECK(stats.completion_depth == 0);
 }
 
+static void test_shutdown_releases_queued_entries_and_rejects_work(void)
+{
+    reset_test_counters();
+    vgpu_renderer_reset_queues(12);
+
+    struct vgpu_renderer_request request = test_request(42);
+    request.release_payload = release_payload_and_reenter;
+    CHECK(vgpu_renderer_submit(&request));
+
+    struct vgpu_renderer_completion completion = test_completion(43, 12);
+    completion.release_response = release_response_and_reenter;
+    CHECK(vgpu_renderer_complete(&completion));
+
+    vgpu_renderer_shutdown_queues();
+    vgpu_renderer_shutdown_queues();
+
+    CHECK(released_payload_count == 1);
+    CHECK(released_response_count == 1);
+    CHECK(!submit_during_reset_result);
+    CHECK(!complete_during_reset_result);
+    CHECK(!pop_request_during_reset_result);
+    CHECK(!pop_completion_during_reset_result);
+
+    struct vgpu_renderer_request late_request = test_request(44);
+    submit_after_shutdown_result = vgpu_renderer_submit(&late_request);
+    pop_request_after_shutdown_result =
+        vgpu_renderer_pop_request(&late_request);
+
+    struct vgpu_renderer_completion late_completion = test_completion(45, 12);
+    late_completion.release_response = release_response;
+    complete_after_shutdown_result =
+        vgpu_renderer_complete(&late_completion);
+    pop_completion_after_shutdown_result =
+        vgpu_renderer_pop_completion(&late_completion);
+
+    CHECK(!submit_after_shutdown_result);
+    CHECK(!complete_after_shutdown_result);
+    CHECK(!pop_request_after_shutdown_result);
+    CHECK(!pop_completion_after_shutdown_result);
+    CHECK(released_response_count == 2);
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(!stats.available);
+    CHECK(stats.request_depth == 0);
+    CHECK(stats.completion_depth == 0);
+}
+
+static void test_init_reopens_queues_after_shutdown(void)
+{
+    reset_test_counters();
+    vgpu_renderer_reset_queues(13);
+    vgpu_renderer_shutdown_queues();
+
+    struct vgpu_renderer_request closed = test_request(46);
+    CHECK(!vgpu_renderer_submit(&closed));
+
+    vgpu_renderer_init_queues(14);
+
+    struct vgpu_renderer_request request = test_request(47);
+    request.token.generation = 14;
+    CHECK(vgpu_renderer_submit(&request));
+
+    struct vgpu_renderer_request out_request;
+    CHECK(vgpu_renderer_pop_request(&out_request));
+    CHECK(out_request.token.id == 47);
+    CHECK(!vgpu_renderer_pop_request(&out_request));
+
+    struct vgpu_renderer_completion completion = test_completion(48, 14);
+    CHECK(vgpu_renderer_complete(&completion));
+
+    struct vgpu_renderer_completion out_completion;
+    CHECK(vgpu_renderer_pop_completion(&out_completion));
+    CHECK(out_completion.token.id == 48);
+    CHECK(!vgpu_renderer_pop_completion(&out_completion));
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(stats.available);
+    CHECK(stats.active_generation == 14);
+    CHECK(stats.request_depth == 0);
+    CHECK(stats.completion_depth == 0);
+}
+
+static void test_shutdown_rejects_inflight_completion(void)
+{
+    reset_test_counters();
+    vgpu_renderer_reset_queues(15);
+
+    struct vgpu_renderer_request request = test_request(49);
+    CHECK(vgpu_renderer_submit(&request));
+
+    struct vgpu_renderer_request inflight;
+    CHECK(vgpu_renderer_pop_request(&inflight));
+    CHECK(inflight.token.id == 49);
+
+    vgpu_renderer_shutdown_queues();
+
+    struct vgpu_renderer_completion completion = test_completion(50, 15);
+    completion.release_response = release_response;
+    CHECK(!vgpu_renderer_complete(&completion));
+    CHECK(released_response_count == 1);
+
+    struct vgpu_renderer_completion out_completion;
+    CHECK(!vgpu_renderer_pop_completion(&out_completion));
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    CHECK(!stats.available);
+    CHECK(stats.request_depth == 0);
+    CHECK(stats.completion_depth == 0);
+}
+
 static void release_payload_and_reset(void *payload)
 {
     (void) payload;
@@ -429,6 +550,9 @@ int main(void)
     test_full_request_queue_rejects_newest();
     test_full_completion_queue_releases_newest_response();
     test_reset_releases_queued_entries_and_rejects_reentrant_work();
+    test_shutdown_releases_queued_entries_and_rejects_work();
+    test_init_reopens_queues_after_shutdown();
+    test_shutdown_rejects_inflight_completion();
     test_reentrant_reset_does_not_reopen_gate_early();
     test_concurrent_reset_waits_for_active_reset();
     test_debug_snapshot_tracks_queue_progress();
