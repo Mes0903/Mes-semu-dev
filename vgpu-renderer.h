@@ -66,6 +66,7 @@ struct vgpu_renderer_ctrl_payload {
         struct virtio_gpu_res_attach_backing resource_attach_backing;
         struct virtio_gpu_res_detach_backing resource_detach_backing;
         struct virtio_gpu_set_scanout set_scanout;
+        struct virtio_gpu_set_scanout_blob set_scanout_blob;
         struct virtio_gpu_resource_create_blob resource_create_blob;
         struct virtio_gpu_resource_create_3d resource_create_3d;
         struct virtio_gpu_transfer_host_3d transfer_3d;

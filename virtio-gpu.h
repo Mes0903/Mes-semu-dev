@@ -236,6 +236,19 @@ PACKED(struct virtio_gpu_resource_create_blob {
     uint64_t size;
 });
 
+PACKED(struct virtio_gpu_set_scanout_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t scanout_id;
+    uint32_t resource_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t padding;
+    uint32_t strides[4];
+    uint32_t offsets[4];
+});
+
 #define VIRTIO_GPU_BLOB_MEM_GUEST 0x0001
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 0x0002
 #define VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST 0x0003
@@ -503,6 +516,9 @@ void virtio_gpu_virgl_resource_detach_backing_handler(
 void virtio_gpu_virgl_set_scanout_handler(virtio_gpu_state_t *vgpu,
                                           struct virtq_desc *vq_desc,
                                           uint32_t *plen);
+void virtio_gpu_virgl_set_scanout_blob_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen);
 void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
                                                   struct virtq_desc *vq_desc,
                                                   uint32_t *plen);

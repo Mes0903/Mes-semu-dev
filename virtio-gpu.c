@@ -769,6 +769,31 @@ void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id)
     pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
 }
 
+static void virtio_gpu_virgl_clear_scanout(virtio_gpu_state_t *vgpu,
+                                           uint32_t scanout_id)
+{
+    if (!vgpu || !vgpu->priv || scanout_id >= PRIV(vgpu)->num_scanouts ||
+        scanout_id >= VIRTIO_GPU_MAX_SCANOUTS)
+        return;
+
+    if (pthread_mutex_lock(&virtio_gpu_virgl_resources_lock) != 0)
+        return;
+
+    virtio_gpu_virgl_advance_scanout_generation_locked(scanout_id);
+    virtio_gpu_virgl_clear_scanout_owner_locked(scanout_id);
+
+    struct virtio_gpu_scanout_info *scanout = &PRIV(vgpu)->scanouts[scanout_id];
+    scanout->primary_resource_id = 0;
+    scanout->src_x = 0;
+    scanout->src_y = 0;
+    scanout->src_w = 0;
+    scanout->src_h = 0;
+    scanout->primary_dirty = (struct vgpu_scanout_dirty_state) {0};
+    vgpu_display_publish_primary_clear(scanout_id);
+
+    pthread_mutex_unlock(&virtio_gpu_virgl_resources_lock);
+}
+
 static int virtio_gpu_virgl_begin_set_scanout(uint32_t resource_id,
                                               uint32_t scanout_id,
                                               uint64_t *resource_generation,
@@ -1167,6 +1192,9 @@ static void virtio_gpu_copy_renderer_ctrl_cmd(
         break;
     case VIRTIO_GPU_CMD_SET_SCANOUT:
         memcpy(&payload->cmd.set_scanout, request, request_size);
+        break;
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        memcpy(&payload->cmd.set_scanout_blob, request, request_size);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
         memcpy(&payload->cmd.resource_create_blob, request, request_size);
@@ -2121,6 +2149,170 @@ void virtio_gpu_virgl_set_scanout_handler(virtio_gpu_state_t *vgpu,
     virtio_gpu_submit_renderer_ctrl_with_iov(
         vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
         sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_SET_SCANOUT,
+        VIRTIO_GPU_RESP_OK_NODATA, resource_generation, scanout_generation,
+        &scanout_snapshot, NULL, 0, NULL, 0, plen);
+    if (*plen != VIRTIO_GPU_RESPONSE_DEFERRED)
+        virtio_gpu_virgl_cancel_set_scanout(snapshot.scanout_id,
+                                            scanout_generation);
+}
+
+static bool virtio_gpu_virgl_blob_format_is_4bpp(uint32_t format)
+{
+    switch (format) {
+    case VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM:
+    case VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM:
+    case VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM:
+    case VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM:
+    case VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM:
+    case VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM:
+    case VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM:
+    case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_gpu_virgl_blob_scanout_rect_valid(
+    const struct virtio_gpu_set_scanout_blob *request)
+{
+    if (!request)
+        return false;
+    if (request->width == 0 || request->height == 0 || request->r.width == 0 ||
+        request->r.height == 0)
+        return false;
+    if (request->r.x >= request->width || request->r.y >= request->height ||
+        request->r.width > request->width - request->r.x ||
+        request->r.height > request->height - request->r.y)
+        return false;
+    if (!virtio_gpu_virgl_blob_format_is_4bpp(request->format))
+        return false;
+    if (request->strides[0] == 0)
+        return false;
+
+    uint64_t row_bytes = ((uint64_t) request->r.x + request->r.width) * 4U;
+    if (row_bytes > request->strides[0])
+        return false;
+
+    uint64_t row_y = request->r.y;
+    uint64_t stride = request->strides[0];
+    uint64_t offset = request->offsets[0];
+    uint64_t x_bytes = (uint64_t) request->r.x * 4U;
+    uint64_t width_bytes = (uint64_t) request->r.width * 4U;
+    if (row_y != 0 && stride > (UINT64_MAX - offset) / row_y)
+        return false;
+    uint64_t row_base = offset + row_y * stride;
+    if (UINT64_MAX - row_base < x_bytes)
+        return false;
+    uint64_t row_start = row_base + x_bytes;
+
+    uint64_t additional_rows = request->r.height - 1U;
+    if (additional_rows != 0 &&
+        stride > (UINT64_MAX - row_start) / additional_rows)
+        return false;
+    uint64_t last_row = row_start + additional_rows * stride;
+    if (UINT64_MAX - last_row < width_bytes)
+        return false;
+    return true;
+}
+
+void virtio_gpu_virgl_set_scanout_blob_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen)
+{
+    const struct virtio_gpu_set_scanout_blob *request = virtio_gpu_get_request(
+        vgpu, vq_desc, sizeof(struct virtio_gpu_set_scanout_blob));
+    const struct virtq_desc *response_desc;
+    struct virtio_gpu_scanout_info *scanout;
+    struct virtio_gpu_scanout_info scanout_snapshot;
+    uint64_t resource_generation = 0;
+    uint64_t scanout_generation = 0;
+    int ret;
+
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_set_scanout_blob snapshot = *request;
+    response_desc = virtio_gpu_get_response_desc(
+        vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
+    if (!response_desc) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    scanout = virtio_gpu_virgl_get_scanout(vgpu, snapshot.scanout_id);
+    if (!scanout) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    if (snapshot.resource_id == 0) {
+        virtio_gpu_virgl_clear_scanout(vgpu, snapshot.scanout_id);
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_OK_NODATA);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    if (!virtio_gpu_virgl_blob_scanout_rect_valid(&snapshot)) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    struct virtio_gpu_rect scanout_rect = snapshot.r;
+    if (!virtio_gpu_virgl_scanout_rect_valid(scanout, &scanout_rect)) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    ret = virtio_gpu_virgl_begin_set_scanout(
+        snapshot.resource_id, snapshot.scanout_id, &resource_generation,
+        &scanout_generation);
+    if (ret == -ENOENT) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+    if (ret != 0) {
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
+    scanout_snapshot = *scanout;
+    scanout_snapshot.primary_resource_id = snapshot.resource_id;
+    scanout_snapshot.src_x = snapshot.r.x;
+    scanout_snapshot.src_y = snapshot.r.y;
+    scanout_snapshot.src_w = snapshot.r.width;
+    scanout_snapshot.src_h = snapshot.r.height;
+    scanout_snapshot.primary_dirty = (struct vgpu_scanout_dirty_state) {0};
+    snapshot.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+
+    virtio_gpu_submit_renderer_ctrl_with_iov(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
         VIRTIO_GPU_RESP_OK_NODATA, resource_generation, scanout_generation,
         &scanout_snapshot, NULL, 0, NULL, 0, plen);
     if (*plen != VIRTIO_GPU_RESPONSE_DEFERRED)

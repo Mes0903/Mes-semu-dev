@@ -1864,10 +1864,11 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
 #if SEMU_HAS(VIRGL)
     .resource_create_blob = virtio_gpu_virgl_resource_create_blob_handler,
+    .set_scanout_blob = virtio_gpu_virgl_set_scanout_blob_handler,
 #else
     .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
-#endif
     .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
+#endif
 #if SEMU_HAS(VIRGL)
     .ctx_create = virtio_gpu_virgl_ctx_create_handler,
     .ctx_destroy = virtio_gpu_virgl_ctx_destroy_handler,
