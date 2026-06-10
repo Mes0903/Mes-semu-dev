@@ -18,10 +18,12 @@
 #include "virtio.h"
 #include "virtq.h"
 
+#define VIRTIO_NET_F_MRG_RXBUF (UINT64_C(1) << 15)
 #define VIRTIO_NET_F_VERSION_1 (UINT64_C(1) << 32)
 
 #define VNET_QUEUE_NUM_MAX 1024
-#define VNET_HEADER_LEN 10
+#define VNET_LEGACY_HEADER_LEN 10
+#define VNET_V1_HEADER_LEN 12
 #define VNET_PACKET_MAX SLIRP_PKT_MAX
 
 enum { VNET_QUEUE_RX = 0, VNET_QUEUE_TX = 1, VNET_QUEUE_COUNT = 2 };
@@ -45,6 +47,7 @@ PACKED(struct virtio_net_config {
 struct virtio_net_priv {
     struct virtio_net_config config;
     bool peer_owned;
+    atomic_uint header_len;
 };
 
 #define PRIV(vnet) (&((struct virtio_net_priv *) (vnet)->priv)->config)
@@ -53,6 +56,25 @@ struct virtio_net_priv {
 static inline unsigned virtio_net_status_load(virtio_net_state_t *vnet)
 {
     return atomic_load_explicit(&vnet->common.status, memory_order_acquire);
+}
+
+static unsigned virtio_net_features_header_len(uint64_t features)
+{
+    if (features & (VIRTIO_NET_F_VERSION_1 | VIRTIO_NET_F_MRG_RXBUF))
+        return VNET_V1_HEADER_LEN;
+    return VNET_LEGACY_HEADER_LEN;
+}
+
+static unsigned virtio_net_header_len(virtio_net_state_t *vnet)
+{
+    struct virtio_net_priv *priv = vnet ? VNET_PRIV(vnet) : NULL;
+    unsigned header_len;
+
+    if (!priv)
+        return VNET_LEGACY_HEADER_LEN;
+
+    header_len = atomic_load_explicit(&priv->header_len, memory_order_acquire);
+    return header_len ? header_len : VNET_LEGACY_HEADER_LEN;
 }
 
 static void virtio_net_set_queue_fd_ready(virtio_net_state_t *vnet,
@@ -354,11 +376,11 @@ static int virtio_net_tx_build_iovs(virtio_net_state_t *vnet,
                                     struct iovec *iovs,
                                     size_t *iov_count)
 {
-    guest_size_t skip = VNET_HEADER_LEN;
+    guest_size_t skip = virtio_net_header_len(vnet);
     size_t out = 0;
 
     if (!virtio_net_iovs_have_bytes(chain->readable, chain->readable_count,
-                                    VNET_HEADER_LEN))
+                                    skip))
         return -EINVAL;
 
     for (size_t i = 0; i < chain->readable_count; i++) {
@@ -517,16 +539,19 @@ static int virtio_net_process_rx_chain(virtio_net_state_t *vnet,
                                        const struct virtq_chain *chain,
                                        uint32_t *used_len)
 {
-    uint8_t header[VNET_HEADER_LEN] = {0};
+    uint8_t header[VNET_V1_HEADER_LEN] = {0};
     uint8_t packet[VNET_PACKET_MAX];
+    unsigned header_len = virtio_net_header_len(vnet);
     ssize_t packet_len = 0;
     int ret;
 
     *used_len = 0;
     if (chain->readable_count != 0 || chain->writable_count == 0)
         return -EINVAL;
+    if (header_len > sizeof(header))
+        return -EINVAL;
     if (!virtio_net_iovs_have_bytes(chain->writable, chain->writable_count,
-                                    VNET_HEADER_LEN))
+                                    header_len))
         return -EINVAL;
 
     ret = virtio_net_host_read(vnet, packet, sizeof(packet), &packet_len);
@@ -535,18 +560,18 @@ static int virtio_net_process_rx_chain(virtio_net_state_t *vnet,
     if (packet_len == 0)
         return -EAGAIN;
     if (!virtio_net_iovs_have_bytes(chain->writable, chain->writable_count,
-                                    VNET_HEADER_LEN +
+                                    (guest_size_t) header_len +
                                         (guest_size_t) packet_len))
         return -ENOSPC;
 
     if (!virtio_net_write_iovs(vnet, chain->writable, chain->writable_count, 0,
-                               header, sizeof(header)) ||
+                               header, header_len) ||
         !virtio_net_write_iovs(vnet, chain->writable, chain->writable_count,
-                               sizeof(header), packet,
+                               header_len, packet,
                                (guest_size_t) packet_len))
         return -EFAULT;
 
-    *used_len = (uint32_t) (sizeof(header) + (size_t) packet_len);
+    *used_len = (uint32_t) ((size_t) header_len + (size_t) packet_len);
     return 0;
 }
 
@@ -556,15 +581,18 @@ static int virtio_net_process_tx_chain(virtio_net_state_t *vnet,
 {
     struct iovec host_iovs[VNET_QUEUE_NUM_MAX];
     size_t host_iov_count = ARRAY_SIZE(host_iovs);
-    uint8_t header[VNET_HEADER_LEN];
+    uint8_t header[VNET_V1_HEADER_LEN];
+    unsigned header_len = virtio_net_header_len(vnet);
     ssize_t written = 0;
     int ret;
 
     *used_len = 0;
     if (chain->writable_count != 0 || chain->readable_count == 0)
         return -EINVAL;
+    if (header_len > sizeof(header))
+        return -EINVAL;
     if (!virtio_net_read_iovs(vnet, chain->readable, chain->readable_count, 0,
-                              header, sizeof(header)))
+                              header, header_len))
         return -EFAULT;
 
     ret = virtio_net_tx_build_iovs(vnet, chain, host_iovs, &host_iov_count);
@@ -733,10 +761,14 @@ static int virtio_net_activate(void *opaque,
     virtio_net_state_t *vnet = opaque;
     int ret;
 
-    (void) ctx;
-
     if (!vnet || !vnet->actor_initialized)
         return -EINVAL;
+
+    if (vnet->priv && ctx && ctx->common)
+        atomic_store_explicit(&VNET_PRIV(vnet)->header_len,
+                              virtio_net_features_header_len(
+                                  ctx->common->driver_features),
+                              memory_order_release);
 
     ret = virtio_actor_start(&vnet->actor);
     if (ret < 0 && ret != -EALREADY)
@@ -776,6 +808,9 @@ static int virtio_net_reset(void *opaque,
 
     virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, false);
     virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, false);
+    if (vnet->priv)
+        atomic_store_explicit(&VNET_PRIV(vnet)->header_len,
+                              VNET_LEGACY_HEADER_LEN, memory_order_release);
     return 0;
 }
 
@@ -1493,6 +1528,7 @@ bool virtio_net_init(virtio_net_state_t *vnet,
     priv->config.status = 1;
     priv->config.max_virtqueue_pairs = 1;
     priv->config.mtu = 1500;
+    atomic_init(&priv->header_len, VNET_LEGACY_HEADER_LEN);
     vnet->priv = priv;
 
     common_config = (struct virtio_device_common_config) {

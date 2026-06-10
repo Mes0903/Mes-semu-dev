@@ -549,17 +549,24 @@ static ssize_t event_loop_find_fd(const struct semu_event_loop *loop, int fd)
     return -1;
 }
 
-static void publish_tx_packet(const char *payload)
+static void publish_tx_bytes(const uint8_t *payload, size_t payload_len)
 {
-    uint8_t header[VNET_HEADER_LEN] = {0};
+    uint8_t header[VNET_V1_HEADER_LEN] = {0};
+    unsigned header_len = virtio_net_header_len(&emu.vnet);
 
-    dma_write(HEADER_ADDR, header, sizeof(header));
-    dma_write(DATA_ADDR, payload, strlen(payload));
-    write_desc(TX_DESC_ADDR, 0, HEADER_ADDR, sizeof(header),
-               VIRTIO_DESC_F_NEXT, 1);
-    write_desc(TX_DESC_ADDR, 1, DATA_ADDR, (uint32_t) strlen(payload), 0, 0);
+    require_bool("test tx header len fits", header_len <= sizeof(header), true);
+    dma_write(HEADER_ADDR, header, header_len);
+    dma_write(DATA_ADDR, payload, payload_len);
+    write_desc(TX_DESC_ADDR, 0, HEADER_ADDR, header_len, VIRTIO_DESC_F_NEXT,
+               1);
+    write_desc(TX_DESC_ADDR, 1, DATA_ADDR, (uint32_t) payload_len, 0, 0);
     write16(TX_AVAIL_ADDR + 4, 0);
     write16(TX_AVAIL_ADDR + 2, 1);
+}
+
+static void publish_tx_packet(const char *payload)
+{
+    publish_tx_bytes((const uint8_t *) payload, strlen(payload));
 }
 
 static void publish_rx_buffer(uint32_t len)
@@ -715,6 +722,39 @@ static void test_init_without_peer_is_transport_safe(void)
                 virtio_net_status_load(&emu.vnet) &
                     VIRTIO_STATUS__DEVICE_NEEDS_RESET,
                 0);
+}
+
+static void test_v1_tx_header_preserves_ethernet_frame(void)
+{
+    static const uint8_t arp_request[] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x16, 0x55, 0xe3, 0x36, 0x31, 0x9b,
+        0x08, 0x06,
+        0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+        0x16, 0x55, 0xe3, 0x36, 0x31, 0x9b,
+        0x0a, 0x00, 0x02, 0x0f,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0a, 0x00, 0x02, 0x02,
+    };
+    uint8_t observed[sizeof(arp_request)] = {0};
+    ssize_t got;
+    int ret;
+
+    configure_net();
+    require_int("v1 negotiated header len",
+                (int) virtio_net_header_len(&emu.vnet), VNET_V1_HEADER_LEN);
+    publish_tx_bytes(arp_request, sizeof(arp_request));
+
+    ret = virtio_net_actor_drain_queue(&emu.vnet, &emu.vnet.actor, VNET_QUEUE_TX,
+                                       virtio_actor_generation(&emu.vnet.actor));
+    require_int("v1 tx drain return", ret, 0);
+    require_bool("v1 tx used published", wait_for_used_idx(1), true);
+
+    got = read(user_net.host_to_guest_channel[SLIRP_READ_SIDE], observed,
+               sizeof(observed));
+    require_int("v1 tx observed len", (int) got, (int) sizeof(arp_request));
+    require_int("v1 tx ethernet frame preserved",
+                memcmp(observed, arp_request, sizeof(arp_request)), 0);
 }
 
 static void test_queue_notify_returns_before_net_backend_work(void)
@@ -1084,7 +1124,9 @@ static void test_user_internal_rx_event_drives_rx_actor_work(void)
     const char payload[] = "rxpkt";
 
     configure_net();
-    publish_rx_buffer(VNET_HEADER_LEN + sizeof(payload) - 1);
+    unsigned header_len = virtio_net_header_len(&emu.vnet);
+
+    publish_rx_buffer(header_len + sizeof(payload) - 1);
     require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
     require_int("net event sync",
                 virtio_net_event_sync(&emu.vnet, &loop,
@@ -1104,7 +1146,7 @@ static void test_user_internal_rx_event_drives_rx_actor_work(void)
                  true);
     require_u32("rx used id", read32(RX_USED_ADDR + 4), 0);
     require_u32("rx used len", read32(RX_USED_ADDR + 8),
-                VNET_HEADER_LEN + sizeof(payload) - 1);
+                header_len + sizeof(payload) - 1);
 
     semu_event_loop_destroy(&loop);
 }
@@ -1200,6 +1242,9 @@ static void test_net_reset_resync_does_not_restore_fd_readiness(void)
 int main(void)
 {
     test_init_without_peer_is_transport_safe();
+    destroy_net_fixture();
+
+    test_v1_tx_header_preserves_ethernet_frame();
     destroy_net_fixture();
 
     test_queue_notify_returns_before_net_backend_work();
