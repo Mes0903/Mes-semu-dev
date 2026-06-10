@@ -5143,6 +5143,31 @@ static void test_vgpu_virgl_disable_after_activation_keeps_blob_visible(void)
     require_u32("active SHM base low", mmio_value,
                 (uint32_t) SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
 
+    struct vgpu_renderer_debug_stats renderer_stats;
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_int("active disable keeps renderer queue available",
+                renderer_stats.available, true);
+    require_u64("active disable keeps renderer generation",
+                renderer_stats.active_generation, vgpu.common.generation);
+
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = vgpu.common.generation},
+    };
+    require_int("active disable accepts renderer request",
+                vgpu_renderer_submit(&request), true);
+    require_int("active disable pops renderer request",
+                vgpu_renderer_pop_request(&request), true);
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = vgpu.common.generation},
+    };
+    require_int("active disable accepts renderer completion",
+                vgpu_renderer_complete(&completion), true);
+    require_int("active disable pops renderer completion",
+                vgpu_renderer_pop_completion(&completion), true);
+
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 #endif

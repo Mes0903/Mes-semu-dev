@@ -373,6 +373,7 @@ static void test_shutdown_releases_queued_entries_and_rejects_work(void)
     struct vgpu_renderer_debug_stats stats;
     vgpu_renderer_debug_snapshot(&stats);
     CHECK(!stats.available);
+    CHECK(stats.active_generation == 0);
     CHECK(stats.request_depth == 0);
     CHECK(stats.completion_depth == 0);
 }
