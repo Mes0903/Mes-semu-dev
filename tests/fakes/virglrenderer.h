@@ -147,4 +147,5 @@ int virgl_renderer_transfer_write_iov(uint32_t handle,
                                       struct iovec *iov,
                                       unsigned int iovec_cnt);
 int virgl_renderer_submit_cmd(void *buffer, int ctx_id, int ndw);
+void virgl_renderer_force_ctx_0(void);
 void virgl_renderer_reset(void);

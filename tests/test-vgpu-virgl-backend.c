@@ -34,6 +34,7 @@ static uint32_t fake_last_context_fence_ring_idx;
 static uint64_t fake_last_context_fence_id;
 static int fake_context_create_fence_result;
 static int fake_poll_count;
+static int fake_force_ctx0_count;
 static int fake_reset_count;
 static int fake_get_cap_set_count;
 static int fake_fill_caps_count;
@@ -152,6 +153,11 @@ int virgl_renderer_init(void *cookie,
 void virgl_renderer_poll(void)
 {
     fake_poll_count++;
+}
+
+void virgl_renderer_force_ctx_0(void)
+{
+    fake_force_ctx0_count++;
 }
 
 int virgl_renderer_create_fence(int client_fence_id, uint32_t ctx_id)
@@ -478,6 +484,7 @@ static void reset_test_state(uint64_t generation)
     fake_last_context_fence_id = 0;
     fake_context_create_fence_result = 0;
     fake_poll_count = 0;
+    fake_force_ctx0_count = 0;
     fake_reset_count = 0;
     fake_get_cap_set_count = 0;
     fake_fill_caps_count = 0;
@@ -714,6 +721,7 @@ static void test_ctx0_fence_completion_preserves_guest_id_and_generation(void)
     CHECK(fake_create_fence_count == 1);
     CHECK(fake_last_create_fence_id == 1);
     CHECK(fake_last_create_fence_ctx_id == 0);
+    CHECK(fake_force_ctx0_count == 1);
     CHECK(wake_renderer_count == 1);
 
     fake_callbacks.write_fence(fake_init_cookie, 1);
@@ -749,9 +757,10 @@ static void test_context_fence_completion_preserves_stream_metadata(void)
     CHECK(stats.poll_requests_submitted == before.poll_requests_submitted + 1);
     CHECK(fake_context_create_fence_count == 1);
     CHECK(fake_last_context_fence_ctx_id == 42);
-    CHECK(fake_last_context_fence_flags == 0);
+    CHECK(fake_last_context_fence_flags == VIRGL_RENDERER_FENCE_FLAG_MERGEABLE);
     CHECK(fake_last_context_fence_ring_idx == 5);
     CHECK(fake_last_context_fence_id == 1);
+    CHECK(fake_force_ctx0_count == 0);
 
     fake_callbacks.write_context_fence(fake_init_cookie, 42, 5, 1);
 
@@ -2670,6 +2679,7 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
     CHECK(fake_last_submit_cmd_words[0] == 0x01020304);
     CHECK(fake_last_submit_cmd_words[1] == 0x11121314);
     CHECK(fake_last_submit_cmd_words[2] == 0x21222324);
+    CHECK(fake_force_ctx0_count == 1);
 
     fake_submit_cmd_result = -1;
     command_stream[0] = 0xaabbccdd;
@@ -2699,11 +2709,13 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
     submit_payload.hdr.fence_id = UINT64_C(0xf00d00000000abcd);
     submit_payload.hdr.ctx_id = 0;
     submit_payload.cmd.submit_3d.hdr = submit_payload.hdr;
+    int force_ctx0_before_fence = fake_force_ctx0_count;
     vgpu_virgl_execute_renderer_request(&request);
     CHECK(!vgpu_renderer_pop_completion(&completion));
     CHECK(fake_submit_cmd_count == 3);
     CHECK(fake_create_fence_count == 1);
     CHECK(fake_last_create_fence_ctx_id == 0);
+    CHECK(fake_force_ctx0_count == force_ctx0_before_fence + 2);
     CHECK(virgl_stats().pending_fences == 1);
 
     fake_callbacks.write_fence(fake_init_cookie, fake_last_create_fence_id);
@@ -2728,12 +2740,15 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
     submit_payload.cmd.submit_3d.hdr = submit_payload.hdr;
     submit_payload.ctrl_completion.desc_head = 16;
     submit_payload.response_desc.addr = 0xc0;
+    force_ctx0_before_fence = fake_force_ctx0_count;
     vgpu_virgl_execute_renderer_request(&request);
     CHECK(!vgpu_renderer_pop_completion(&completion));
     CHECK(fake_submit_cmd_count == 4);
     CHECK(fake_context_create_fence_count == 1);
     CHECK(fake_last_context_fence_ctx_id == 0);
+    CHECK(fake_last_context_fence_flags == VIRGL_RENDERER_FENCE_FLAG_MERGEABLE);
     CHECK(fake_last_context_fence_ring_idx == 6);
+    CHECK(fake_force_ctx0_count == force_ctx0_before_fence + 1);
     CHECK(virgl_stats().pending_fences == 1);
 
     fake_callbacks.write_context_fence(fake_init_cookie, 0, 6,

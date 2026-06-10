@@ -849,6 +849,12 @@ static void vgpu_virgl_execute_ctrl_request(
     void *response = NULL;
     size_t response_size = 0;
 
+    /* SDL presentation can detach the real current GL context behind
+     * virglrenderer's cached current_ctx/current_hw_ctx. Reset to ctx0 before
+     * every renderer command so virglrenderer performs the needed switch.
+     */
+    virgl_renderer_force_ctx_0();
+
     switch (request->command_type) {
     case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
         const struct virtio_gpu_get_capset_info *cmd =
@@ -1379,9 +1385,11 @@ static bool vgpu_virgl_submit_fence_internal(
         return false;
 
     if (context_fence) {
-        ret = virgl_renderer_context_create_fence(ctx_id, 0, ring_idx,
-                                                  renderer_fence_id);
+        ret = virgl_renderer_context_create_fence(
+            ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE, ring_idx,
+            renderer_fence_id);
     } else {
+        virgl_renderer_force_ctx_0();
         ret = virgl_renderer_create_fence((int) renderer_fence_id, 0);
     }
 
