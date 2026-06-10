@@ -4256,6 +4256,68 @@ static void test_virgl_submit_3d_snapshots_command_buffer_and_defers(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+
+static void test_virgl_submit_3d_fenced_request_snapshots_and_defers(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_cmd_submit *submit =
+        (struct virtio_gpu_cmd_submit *) ((uint8_t *) ram + 0x40);
+    uint32_t *inline_word = (uint32_t *) ((uint8_t *) submit + sizeof(*submit));
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x120);
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x7c;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 71);
+
+    submit->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    submit->hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
+    submit->hdr.fence_id = UINT64_C(0x1020304050607080);
+    submit->hdr.ctx_id = 91;
+    submit->hdr.ring_idx = 6;
+    submit->size = sizeof(uint32_t);
+    *inline_word = 0x51525354;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*submit) + sizeof(*inline_word);
+    desc[1].addr = 0x120;
+    desc[1].len = sizeof(*response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
+    require_u32("fenced submit 3d is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_u32("fenced submit 3d writes no immediate response",
+                response->type, 0);
+
+    struct vgpu_renderer_request queued = {0};
+    require_int("fenced submit 3d queued",
+                vgpu_renderer_pop_request(&queued), true);
+    require_u32("fenced submit 3d command type", queued.command_type,
+                VIRTIO_GPU_CMD_SUBMIT_3D);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    require_u32("fenced submit 3d flags snapshot",
+                payload->cmd.submit_3d.hdr.flags,
+                VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX);
+    require_u64("fenced submit 3d fence id snapshot",
+                payload->cmd.submit_3d.hdr.fence_id,
+                UINT64_C(0x1020304050607080));
+    require_u32("fenced submit 3d ctx snapshot",
+                payload->cmd.submit_3d.hdr.ctx_id, 91);
+    require_u32("fenced submit 3d ring snapshot",
+                payload->cmd.submit_3d.hdr.ring_idx, 6);
+    require_u32("fenced submit 3d word snapshot",
+                ((uint32_t *) payload->submit_data)[0], 0x51525354);
+    require_u32("fenced submit 3d desc head",
+                payload->ctrl_completion.desc_head, 71);
+    queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_submit_3d_rejects_invalid_or_late_payload(void)
 {
     uint32_t ram[512] = {0};
@@ -4318,18 +4380,6 @@ static void test_virgl_submit_3d_rejects_invalid_or_late_payload(void)
                 vgpu_renderer_pop_request(&queued), false);
 
     submit->num_in_fences = 0;
-    submit->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
-    response->type = 0;
-    len = 0;
-    g_virtio_gpu_backend.submit_3d(&vgpu, desc, &len);
-    require_u32("fenced submit 3d response len", len,
-                sizeof(struct virtio_gpu_ctrl_hdr));
-    require_u32("fenced submit 3d response", response->type,
-                VIRTIO_GPU_RESP_ERR_UNSPEC);
-    require_int("fenced submit 3d queues no renderer work",
-                vgpu_renderer_pop_request(&queued), false);
-
-    submit->hdr.flags = 0;
     desc[0].len = sizeof(*submit);
     submit->size = sizeof(uint32_t);
     *late_word = 0x44444444;
@@ -5161,6 +5211,7 @@ int main(void)
     test_virgl_resource_attach_rejects_malformed_backing_list();
     test_virgl_context_handlers_submit_ctrl_skeletons();
     test_virgl_submit_3d_snapshots_command_buffer_and_defers();
+    test_virgl_submit_3d_fenced_request_snapshots_and_defers();
     test_virgl_submit_3d_rejects_invalid_or_late_payload();
     test_renderer_completion_drain_writes_response_and_used_ring();
     test_renderer_gl_scanout_response_fault_does_not_publish();
