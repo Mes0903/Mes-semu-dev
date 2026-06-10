@@ -69,6 +69,12 @@
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
 static bool virtio_gpu_instance_initialized;
+static const struct virtio_device_shm_region
+    virtio_gpu_host_visible_shm_region = {
+        .id = VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+        .base = SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE,
+        .length = SEMU_PLATFORM_VGPU_HOSTMEM_SIZE,
+};
 
 static void virtio_gpu_init_display_counters(
     struct virtio_gpu_sw_display_counter_storage *counters)
@@ -87,7 +93,8 @@ static void virtio_gpu_init_display_counters(
 static bool virtio_gpu_virgl_runtime_ready(const virtio_gpu_state_t *vgpu)
 {
 #if SEMU_HAS(VIRGL)
-    return vgpu && vgpu->virgl_runtime_enabled;
+    return vgpu && atomic_load_explicit(&vgpu->virgl_runtime_enabled,
+                                        memory_order_acquire);
 #else
     (void) vgpu;
     return false;
@@ -99,9 +106,28 @@ static uint64_t virtio_gpu_device_features(const virtio_gpu_state_t *vgpu)
     uint64_t features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1;
 
     if (virtio_gpu_virgl_runtime_ready(vgpu))
-        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT;
+        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT |
+                    VIRTIO_GPU_F_RESOURCE_BLOB;
 
     return features;
+}
+
+static bool virtio_gpu_blob_runtime_ready(virtio_gpu_state_t *vgpu)
+{
+    bool ready;
+
+    if (!virtio_gpu_virgl_runtime_ready(vgpu) || !vgpu->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vgpu->common.transport_lock);
+    ready =
+        (vgpu->common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB) != 0 &&
+        vgpu->common.has_shm_region &&
+        vgpu->common.shm_region.id == VIRTIO_GPU_SHM_ID_HOST_VISIBLE &&
+        vgpu->common.shm_region.base == SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE &&
+        vgpu->common.shm_region.length == SEMU_PLATFORM_VGPU_HOSTMEM_SIZE;
+    pthread_mutex_unlock(&vgpu->common.transport_lock);
+    return ready;
 }
 
 static void virtio_gpu_init_actor_debug_counters(
@@ -266,12 +292,38 @@ void virtio_gpu_disable_virgl_runtime(virtio_gpu_state_t *vgpu)
         return;
 
 #if SEMU_HAS(VIRGL)
-    vgpu->virgl_runtime_enabled = false;
-    if (vgpu->priv)
-        PRIV(vgpu)->num_capsets = 0;
+    bool can_disable = true;
 
     if (vgpu->common.initialized) {
+        if (vgpu->actor_initialized) {
+            pthread_mutex_lock(&vgpu->actor.lock);
+            can_disable = vgpu->actor.state == VIRTIO_ACTOR_CREATED &&
+                          !vgpu->actor.thread_started &&
+                          !vgpu->actor.inside_backend_mutation;
+            pthread_mutex_unlock(&vgpu->actor.lock);
+        }
+
+        pthread_mutex_lock(&vgpu->common.backend_lock);
         pthread_mutex_lock(&vgpu->common.transport_lock);
+        can_disable = can_disable && !vgpu->common.activated &&
+                      !vgpu->common.reset_in_progress &&
+                      atomic_load_explicit(&vgpu->common.status,
+                                           memory_order_acquire) == 0;
+        if (!can_disable) {
+            pthread_mutex_unlock(&vgpu->common.transport_lock);
+            pthread_mutex_unlock(&vgpu->common.backend_lock);
+            fprintf(stderr,
+                    VIRTIO_GPU_LOG_PREFIX
+                    "%s(): refusing to disable VirGL after device "
+                    "activation started\n",
+                    __func__);
+            return;
+        }
+
+        atomic_store_explicit(&vgpu->virgl_runtime_enabled, false,
+                              memory_order_release);
+        if (vgpu->priv)
+            PRIV(vgpu)->num_capsets = 0;
         vgpu->common.device_features &=
             ~(VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
               VIRTIO_GPU_F_CONTEXT_INIT);
@@ -279,6 +331,12 @@ void virtio_gpu_disable_virgl_runtime(virtio_gpu_state_t *vgpu)
         vgpu->common.shm_region = (struct virtio_device_shm_region) {0};
         vgpu->common.config_generation++;
         pthread_mutex_unlock(&vgpu->common.transport_lock);
+        pthread_mutex_unlock(&vgpu->common.backend_lock);
+    } else {
+        atomic_store_explicit(&vgpu->virgl_runtime_enabled, false,
+                              memory_order_release);
+        if (vgpu->priv)
+            PRIV(vgpu)->num_capsets = 0;
     }
 
     vgpu_renderer_shutdown_queues();
@@ -3873,7 +3931,8 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         return -1;
     }
 
-    if (virtio_gpu_command_requires_blob(header->type) ||
+    if ((virtio_gpu_command_requires_blob(header->type) &&
+         !virtio_gpu_blob_runtime_ready(vgpu)) ||
         (virtio_gpu_command_requires_virgl(header->type) &&
          !virtio_gpu_virgl_runtime_ready(vgpu))) {
         virtio_gpu_cmd_undefined_handler(vgpu, vq_desc, plen);
@@ -4395,7 +4454,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu,
     vgpu->ram = emu->ram;
     vgpu->priv = &virtio_gpu_data;
 #if SEMU_HAS(VIRGL)
-    vgpu->virgl_runtime_enabled = enable_virgl_runtime;
+    atomic_init(&vgpu->virgl_runtime_enabled, enable_virgl_runtime);
 #else
     (void) enable_virgl_runtime;
 #endif
@@ -4417,6 +4476,9 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu,
         .num_queues = ARRAY_SIZE(queue_max_sizes),
         .ops = &virtio_gpu_ops,
         .opaque = vgpu,
+        .shm_region = virtio_gpu_virgl_runtime_ready(vgpu)
+                          ? &virtio_gpu_host_visible_shm_region
+                          : NULL,
     };
 
     if (virtio_device_common_init(&vgpu->common, &config) < 0) {

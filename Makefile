@@ -422,7 +422,7 @@ test-vgpu-deferred-drain:
 .PHONY: test-vgpu-virgl-gate
 test-vgpu-virgl-gate:
 	$(Q)bash tests/test-vgpu-virgl-make-gate.sh
-	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c vgpu-display.c vgpu-rect.c vgpu-renderer.c -Wl,--gc-sections -o /tmp/test-vgpu-virgl-gate $(HOST_TEST_LDLIBS)
+	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=1 -D SEMU_FEATURE_VIRGL=1 tests/test-vgpu-error-policy.c virtio-gpu.c virtio-gpu-sw.c virtio-actor.c virtio-mmio.c virtio-irq.c virtq.c ram_access.c irq-source.c plic.c vm-lifecycle.c semu-event.c lock-order.c vgpu-display.c vgpu-rect.c vgpu-renderer.c -Wl,--gc-sections -o /tmp/test-vgpu-virgl-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-vgpu-virgl-gate
 
 .PHONY: test-vgpu-renderer

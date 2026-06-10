@@ -338,7 +338,7 @@ typedef struct {
     struct virtio_gpu_ctrl_dispatch_context ctrl_dispatch;
     uint64_t actor_drain_generation;
     bool actor_initialized;
-    bool virgl_runtime_enabled;
+    atomic_bool virgl_runtime_enabled;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */

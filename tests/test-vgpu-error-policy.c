@@ -16,10 +16,12 @@
 #if SEMU_HAS(VIRGL)
 #include "vgpu-renderer.h"
 #endif
+#include "virtio-mmio.h"
 #include "virtio.h"
 
 void semu_wake_interruptible_harts(emu_state_t *emu UNUSED) {}
 
+#define REG(reg) ((uint32_t) VIRTIO_##reg << 2)
 #define REQUIRE_ATOMIC_U64_COUNTER(expr)                                 \
     _Static_assert(_Generic(&(expr), _Atomic uint64_t *: 1, default: 0), \
                    #expr " must be _Atomic uint64_t")
@@ -337,6 +339,25 @@ static void wait_for_used_idx(const uint32_t *ram,
     fprintf(stderr, "used idx at 0x%x did not reach %u\n", used_idx_addr, want);
     exit(1);
 }
+
+#if SEMU_HAS(VIRGL)
+static void wait_for_renderer_request(struct vgpu_renderer_request *request)
+{
+    const struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000,
+    };
+
+    for (int i = 0; i < 1000; i++) {
+        if (vgpu_renderer_pop_request(request))
+            return;
+        nanosleep(&delay, NULL);
+    }
+
+    fprintf(stderr, "renderer request did not arrive\n");
+    exit(1);
+}
+#endif
 
 static uint64_t load_u64(const uint32_t *ram, uint32_t addr)
 {
@@ -679,7 +700,7 @@ static void test_hidden_blob_command_returns_undefined_without_renderer_work(
     };
     struct vgpu_renderer_request queued = {0};
 
-    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    init_vgpu_test_state_with_virgl(&emu, &vgpu, ram, sizeof(ram), false);
     configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
     vgpu_renderer_reset_queues(vgpu.common.generation);
 
@@ -715,6 +736,67 @@ static void test_hidden_blob_command_returns_undefined_without_renderer_work(
                 sizeof(struct virtio_gpu_ctrl_hdr));
     require_int("hidden blob queues no renderer work",
                 vgpu_renderer_pop_request(&queued), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_runtime_ready_blob_command_reaches_renderer_gate(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x80);
+    struct virtq_desc desc0 = {
+        .addr = 0x40,
+        .len = sizeof(*blob),
+        .flags = VIRTIO_DESC_F_NEXT,
+        .next = 1,
+    };
+    struct virtq_desc desc1 = {
+        .addr = 0x80,
+        .len = sizeof(*response),
+        .flags = VIRTIO_DESC_F_WRITE,
+    };
+    struct vgpu_renderer_request queued = {0};
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+    vgpu_renderer_reset_queues(vgpu.common.generation);
+
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = 78;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->size = 4096;
+    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
+    memcpy((uint8_t *) ram + 0x110, &desc1, sizeof(desc1));
+    store_u16(ram, 0x200, 0);
+    store_u16(ram, 0x202, 1);
+    store_u16(ram, 0x204, 0);
+    store_u16(ram, 0x302, 0);
+
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    require_int("start actor", virtio_actor_start(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    require_int(
+        "notify runtime-ready blob create",
+        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
+                                      vgpu.common.generation),
+        0);
+    wait_for_renderer_request(&queued);
+
+    require_u32("runtime-ready blob queues command", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
+    require_u32("runtime-ready blob remains deferred", load_u16(ram, 0x302), 0);
+    require_u32("runtime-ready blob response untouched", response->type, 0);
+    queued.release_payload(queued.payload);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
@@ -4889,6 +4971,7 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
     emu_state_t emu;
     virtio_gpu_state_t vgpu;
     uint32_t num_capsets;
+    uint32_t mmio_value;
 
     init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
 
@@ -4898,9 +4981,40 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
     require_u64("context-init feature visible",
                 vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT,
                 VIRTIO_GPU_F_CONTEXT_INIT);
-    require_u64("resource-blob feature hidden",
-                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
-    require_false("host-visible SHM hidden", vgpu.common.has_shm_region);
+    require_u64("resource-blob feature visible",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB,
+                VIRTIO_GPU_F_RESOURCE_BLOB);
+    require_u32("host-visible SHM exposed", vgpu.common.has_shm_region, true);
+    require_u32("host-visible SHM id", vgpu.common.shm_region.id,
+                VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
+    require_u64("host-visible SHM base", vgpu.common.shm_region.base,
+                SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
+    require_u64("host-visible SHM length", vgpu.common.shm_region.length,
+                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+    require_int("select host-visible SHM",
+                virtio_mmio_write(&vgpu.common, REG(SHMSel), 4,
+                                  VIRTIO_GPU_SHM_ID_HOST_VISIBLE),
+                0);
+    require_int("read SHM len low",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenLow), 4, &mmio_value),
+                0);
+    require_u32("MMIO SHM len low", mmio_value,
+                (uint32_t) SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+    require_int("read SHM len high",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenHigh), 4, &mmio_value),
+                0);
+    require_u32("MMIO SHM len high", mmio_value,
+                (uint32_t) (SEMU_PLATFORM_VGPU_HOSTMEM_SIZE >> 32));
+    require_int("read SHM base low",
+                virtio_mmio_read(&vgpu.common, REG(SHMBaseLow), 4, &mmio_value),
+                0);
+    require_u32("MMIO SHM base low", mmio_value,
+                (uint32_t) SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
+    require_int(
+        "read SHM base high",
+        virtio_mmio_read(&vgpu.common, REG(SHMBaseHigh), 4, &mmio_value), 0);
+    require_u32("MMIO SHM base high", mmio_value,
+                (uint32_t) (SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE >> 32));
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
@@ -4921,6 +5035,22 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
                 vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
     require_false("fallback host-visible SHM hidden",
                   vgpu.common.has_shm_region);
+    require_int("read fallback SHM len low",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenLow), 4, &mmio_value),
+                0);
+    require_u32("fallback MMIO SHM len low", mmio_value, UINT32_MAX);
+    require_int("read fallback SHM len high",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenHigh), 4, &mmio_value),
+                0);
+    require_u32("fallback MMIO SHM len high", mmio_value, UINT32_MAX);
+    require_int("read fallback SHM base low",
+                virtio_mmio_read(&vgpu.common, REG(SHMBaseLow), 4, &mmio_value),
+                0);
+    require_u32("fallback MMIO SHM base low", mmio_value, UINT32_MAX);
+    require_int(
+        "read fallback SHM base high",
+        virtio_mmio_read(&vgpu.common, REG(SHMBaseHigh), 4, &mmio_value), 0);
+    require_u32("fallback MMIO SHM base high", mmio_value, UINT32_MAX);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
@@ -4942,6 +5072,18 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
                 vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
     require_false("headless host-visible SHM hidden",
                   vgpu.common.has_shm_region);
+    require_int("select headless host-visible SHM",
+                virtio_mmio_write(&vgpu.common, REG(SHMSel), 4,
+                                  VIRTIO_GPU_SHM_ID_HOST_VISIBLE),
+                0);
+    require_int("read headless SHM len low",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenLow), 4, &mmio_value),
+                0);
+    require_u32("headless MMIO SHM len low", mmio_value, UINT32_MAX);
+    require_int("read headless SHM base low",
+                virtio_mmio_read(&vgpu.common, REG(SHMBaseLow), 4, &mmio_value),
+                0);
+    require_u32("headless MMIO SHM base low", mmio_value, UINT32_MAX);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
@@ -4956,6 +5098,50 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
     vgpu_renderer_debug_snapshot(&renderer_stats);
     require_false("headless renderer queue unavailable",
                   renderer_stats.available);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_vgpu_virgl_disable_after_activation_keeps_blob_visible(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    uint32_t mmio_value;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+
+    require_int("start active actor", virtio_actor_start(&vgpu.actor), 0);
+    require_int("configure active actor",
+                virtio_actor_enter_configuring(&vgpu.actor), 0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    virtio_gpu_disable_virgl_runtime(&vgpu);
+
+    require_u64("active disable keeps VirGL feature",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL,
+                VIRTIO_GPU_F_VIRGL);
+    require_u64("active disable keeps resource-blob feature",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB,
+                VIRTIO_GPU_F_RESOURCE_BLOB);
+    require_false("active disable keeps host-visible SHM",
+                  !vgpu.common.has_shm_region);
+    require_int("select active host-visible SHM",
+                virtio_mmio_write(&vgpu.common, REG(SHMSel), 4,
+                                  VIRTIO_GPU_SHM_ID_HOST_VISIBLE),
+                0);
+    require_int("read active SHM len low",
+                virtio_mmio_read(&vgpu.common, REG(SHMLenLow), 4, &mmio_value),
+                0);
+    require_u32("active SHM len low", mmio_value,
+                (uint32_t) SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+    require_int("read active SHM base low",
+                virtio_mmio_read(&vgpu.common, REG(SHMBaseLow), 4, &mmio_value),
+                0);
+    require_u32("active SHM base low", mmio_value,
+                (uint32_t) SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
@@ -5607,10 +5793,12 @@ int main(void)
     test_vgpu_invalid_actor_notify_counts_einval();
 #if SEMU_HAS(VIRGL)
     test_vgpu_virgl_demo_gate_exposes_classic_3d_features();
+    test_vgpu_virgl_disable_after_activation_keeps_blob_visible();
 #endif
     test_deferred_ctrl_completion_revalidates_generations();
 #if SEMU_HAS(VIRGL)
     test_hidden_blob_command_returns_undefined_without_renderer_work();
+    test_runtime_ready_blob_command_reaches_renderer_gate();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
     test_virgl_resource_create_blob_handler_tracks_pending_resource();
