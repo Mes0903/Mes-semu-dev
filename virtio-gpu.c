@@ -492,6 +492,36 @@ uint32_t virtio_gpu_write_ctrl_response(
 }
 
 #if SEMU_HAS(VIRGL)
+static uint32_t virtio_gpu_write_capset_info_response(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_ctrl_hdr *request,
+    const struct virtq_desc *response_desc,
+    uint32_t capset_id,
+    uint32_t max_version,
+    uint32_t max_size)
+{
+    if (response_desc->len < sizeof(struct virtio_gpu_resp_capset_info))
+        return 0;
+
+    struct virtio_gpu_resp_capset_info *response = virtio_gpu_mem_guest_to_host(
+        vgpu, response_desc->addr,
+        sizeof(struct virtio_gpu_resp_capset_info));
+    if (!response)
+        return 0;
+
+    memset(response, 0, sizeof(*response));
+    response->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+    if (request->flags & VIRTIO_GPU_FLAG_FENCE) {
+        response->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        response->hdr.fence_id = request->fence_id;
+    }
+    response->capset_id = capset_id;
+    response->capset_max_version = max_version;
+    response->capset_max_size = max_size;
+
+    return sizeof(*response);
+}
+
 struct virtio_gpu_virgl_resource_state {
     uint32_t resource_id;
     uint64_t generation;
@@ -1637,6 +1667,22 @@ void virtio_gpu_virgl_get_capset_info_handler(virtio_gpu_state_t *vgpu,
     }
 
     struct virtio_gpu_get_capset_info snapshot = *request;
+    if (snapshot.capset_index >= VIRTIO_GPU_CLASSIC_VIRGL_CAPSET_COUNT) {
+        const struct virtq_desc *response_desc = virtio_gpu_get_response_desc(
+            vq_desc, sizeof(struct virtio_gpu_resp_capset_info));
+        if (!response_desc) {
+            virtio_gpu_set_fail(vgpu);
+            *plen = 0;
+            return;
+        }
+
+        *plen = virtio_gpu_write_capset_info_response(
+            vgpu, &snapshot.hdr, response_desc, 0, 0, 0);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
     virtio_gpu_submit_renderer_ctrl(vgpu, vq_desc, &snapshot.hdr,
                                     sizeof(snapshot),
                                     sizeof(struct virtio_gpu_resp_capset_info),
@@ -1657,6 +1703,23 @@ void virtio_gpu_virgl_get_capset_handler(virtio_gpu_state_t *vgpu,
     }
 
     struct virtio_gpu_get_capset snapshot = *request;
+    if (snapshot.capset_id != VIRTIO_GPU_CAPSET_VIRGL) {
+        const struct virtq_desc *response_desc = virtio_gpu_get_response_desc(
+            vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
+        if (!response_desc) {
+            virtio_gpu_set_fail(vgpu);
+            *plen = 0;
+            return;
+        }
+
+        *plen = virtio_gpu_write_ctrl_response(
+            vgpu, &snapshot.hdr, response_desc,
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        if (!*plen)
+            virtio_gpu_set_fail(vgpu);
+        return;
+    }
+
     virtio_gpu_submit_renderer_ctrl(
         vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
         sizeof(struct virtio_gpu_resp_capset), VIRTIO_GPU_CMD_GET_CAPSET,

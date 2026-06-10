@@ -585,7 +585,7 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
     request->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     request->hdr.fence_id = UINT64_C(0x1234);
-    request->capset_index = 3;
+    request->capset_index = 0;
     desc[0].addr = 0x40;
     desc[0].len = sizeof(*request);
     desc[1].addr = 0x100;
@@ -618,7 +618,7 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
                 VIRTIO_GPU_CMD_GET_CAPSET_INFO);
     require_u64("snapshot fence id", payload->hdr.fence_id, UINT64_C(0x1234));
     require_u32("snapshot capset index",
-                payload->cmd.get_capset_info.capset_index, 3);
+                payload->cmd.get_capset_info.capset_index, 0);
     require_u32("response capacity", payload->response_capacity,
                 sizeof(struct virtio_gpu_resp_capset_info));
     require_u32("completion queue", payload->ctrl_completion.queue_index,
@@ -673,6 +673,84 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     require_u32("capset response desc addr", payload->response_desc.addr,
                 0x180);
     queued.release_payload(queued.payload);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_virgl_unsupported_capset_requests_skip_renderer_queue(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_get_capset_info *info =
+        (struct virtio_gpu_get_capset_info *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_resp_capset_info *info_response =
+        (struct virtio_gpu_resp_capset_info *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_get_capset *capset =
+        (struct virtio_gpu_get_capset *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctrl_hdr *capset_response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    struct vgpu_renderer_request queued = {0};
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x91;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 19);
+
+    info->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    info->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    info->hdr.fence_id = UINT64_C(0x1919);
+    info->capset_index = 1;
+    desc[0].addr = 0x40;
+    desc[0].len = sizeof(*info);
+    desc[1].addr = 0x100;
+    desc[1].len = sizeof(*info_response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.get_capset_info(&vgpu, desc, &len);
+
+    require_u32("unsupported capset info response len", len,
+                sizeof(*info_response));
+    require_u32("unsupported capset info response", info_response->hdr.type,
+                VIRTIO_GPU_RESP_OK_CAPSET_INFO);
+    require_u32("unsupported capset info echoes fence",
+                info_response->hdr.flags, VIRTIO_GPU_FLAG_FENCE);
+    require_u64("unsupported capset info fence id",
+                info_response->hdr.fence_id, UINT64_C(0x1919));
+    require_u32("unsupported capset info id", info_response->capset_id, 0);
+    require_u32("unsupported capset info version",
+                info_response->capset_max_version, 0);
+    require_u32("unsupported capset info size",
+                info_response->capset_max_size, 0);
+    require_int("unsupported capset info queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
+
+    memset(desc, 0, sizeof(desc));
+    len = 0;
+    capset->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    capset->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    capset->hdr.fence_id = UINT64_C(0x2929);
+    capset->capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
+    capset->capset_version = 1;
+    desc[0].addr = 0x140;
+    desc[0].len = sizeof(*capset);
+    desc[1].addr = 0x180;
+    desc[1].len = sizeof(*capset_response);
+    desc[1].flags = VIRTIO_DESC_F_WRITE;
+
+    g_virtio_gpu_backend.get_capset(&vgpu, desc, &len);
+
+    require_u32("unsupported capset response len", len,
+                sizeof(*capset_response));
+    require_u32("unsupported capset response", capset_response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_u32("unsupported capset echoes fence", capset_response->flags,
+                VIRTIO_GPU_FLAG_FENCE);
+    require_u64("unsupported capset fence id", capset_response->fence_id,
+                UINT64_C(0x2929));
+    require_int("unsupported capset queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
@@ -5825,6 +5903,7 @@ int main(void)
     test_hidden_blob_command_returns_undefined_without_renderer_work();
     test_runtime_ready_blob_command_reaches_renderer_gate();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
+    test_virgl_unsupported_capset_requests_skip_renderer_queue();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
     test_virgl_resource_create_blob_handler_tracks_pending_resource();
     test_virgl_resource_map_unmap_blob_frontend_policy();
