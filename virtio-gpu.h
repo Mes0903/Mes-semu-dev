@@ -550,6 +550,12 @@ void virtio_gpu_virgl_set_scanout_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_set_scanout_blob_handler(virtio_gpu_state_t *vgpu,
                                                struct virtq_desc *vq_desc,
                                                uint32_t *plen);
+void virtio_gpu_virgl_resource_flush_handler(virtio_gpu_state_t *vgpu,
+                                             struct virtq_desc *vq_desc,
+                                             uint32_t *plen);
+void virtio_gpu_virgl_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
 void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
                                                   struct virtq_desc *vq_desc,
                                                   uint32_t *plen);

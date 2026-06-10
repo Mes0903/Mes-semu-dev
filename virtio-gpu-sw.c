@@ -1077,6 +1077,12 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
+#if SEMU_HAS(VIRGL)
+        if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+            virtio_gpu_virgl_resource_flush_handler(vgpu, vq_desc, plen);
+            return;
+        }
+#endif
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, request->resource_id);
         *plen = virtio_gpu_write_ctrl_response(
@@ -1271,6 +1277,12 @@ static void vgpu_sw_cmd_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, req->resource_id);
     if (!res_2d) {
+#if SEMU_HAS(VIRGL)
+        if (virtio_gpu_virgl_resource_id_exists(req->resource_id)) {
+            virtio_gpu_virgl_transfer_to_host_2d_handler(vgpu, vq_desc, plen);
+            return;
+        }
+#endif
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, req->resource_id);
         *plen = virtio_gpu_write_ctrl_response(
