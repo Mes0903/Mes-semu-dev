@@ -28,6 +28,8 @@ static bool test_ram_dma_read(const ram_dma_t *dma,
 #define USED_ADDR(q) (0x200 + (guest_paddr_t) (q) * QUEUE_STRIDE)
 #define CTRL_PREPARE_REQ_ADDR 0x1000
 #define CTRL_PREPARE_RESP_ADDR 0x1040
+#define CTRL_START_REQ_ADDR 0x1080
+#define CTRL_START_RESP_ADDR 0x10c0
 
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static emu_state_t emu;
@@ -35,8 +37,10 @@ static unsigned wake_count;
 static unsigned fake_initialize_count;
 static unsigned fake_terminate_count;
 static unsigned fake_open_count;
+static unsigned fake_start_count;
 static unsigned fake_stop_count;
 static unsigned fake_close_count;
+static PaError fake_start_error;
 static bool fake_stop_saw_buffer;
 static bool fake_close_saw_buffer;
 static bool fake_terminate_saw_unclosed_stream;
@@ -229,7 +233,8 @@ PaError Pa_OpenStream(PaStream **stream,
 PaError Pa_StartStream(PaStream *stream)
 {
     (void) stream;
-    return paNoError;
+    fake_start_count++;
+    return fake_start_error;
 }
 
 PaError Pa_StopStream(PaStream *stream)
@@ -286,6 +291,28 @@ static void write16(guest_paddr_t addr, uint16_t value)
     dma_write(addr, &value, sizeof(value));
 }
 
+static void dma_read(guest_paddr_t addr, void *buf, guest_size_t len)
+{
+    require_bool("dma read", ram_dma_read(&emu.ram_dma, addr, buf, len),
+                 true);
+}
+
+static uint16_t read16(guest_paddr_t addr)
+{
+    uint16_t value;
+
+    dma_read(addr, &value, sizeof(value));
+    return value;
+}
+
+static uint32_t read32(guest_paddr_t addr)
+{
+    uint32_t value;
+
+    dma_read(addr, &value, sizeof(value));
+    return value;
+}
+
 static void write_desc(guest_paddr_t table,
                        uint16_t index,
                        guest_paddr_t addr,
@@ -312,8 +339,10 @@ static void configure_snd_fixture(void)
     fake_initialize_count = 0;
     fake_terminate_count = 0;
     fake_open_count = 0;
+    fake_start_count = 0;
     fake_stop_count = 0;
     fake_close_count = 0;
+    fake_start_error = paNoError;
     fake_stop_saw_buffer = false;
     fake_close_saw_buffer = false;
     fake_terminate_saw_unclosed_stream = false;
@@ -430,6 +459,108 @@ static void async_snd_call_join(struct async_snd_call *call)
     require_int("async join", pthread_join(call->thread, NULL), 0);
 }
 
+
+static bool wait_for_ctrl_used_idx(uint16_t expected, unsigned timeout_ms)
+{
+    struct timespec deadline = deadline_after_ms(timeout_ms);
+
+    for (;;) {
+        struct timespec now;
+        struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = 1000000L,
+        };
+
+        if (read16(USED_ADDR(VSND_QUEUE_CTRL) + 2) == expected)
+            return true;
+
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec &&
+             now.tv_nsec >= deadline.tv_nsec))
+            return false;
+        nanosleep(&pause, NULL);
+    }
+}
+
+static uint32_t submit_control_request(const char *name,
+                                       const void *request,
+                                       guest_size_t request_len,
+                                       guest_paddr_t req_addr,
+                                       guest_paddr_t resp_addr)
+{
+    virtio_snd_hdr_t response = {
+        .code = 0xffffffffU,
+    };
+    uint16_t avail_idx = read16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 2);
+    uint16_t used_idx = read16(USED_ADDR(VSND_QUEUE_CTRL) + 2);
+    uint16_t head = (uint16_t) ((avail_idx % (QUEUE_SIZE / 2)) * 2);
+    guest_paddr_t used_elem = USED_ADDR(VSND_QUEUE_CTRL) + 4 +
+                              (guest_paddr_t) (used_idx % QUEUE_SIZE) * 8;
+
+    dma_write(req_addr, request, request_len);
+    dma_write(resp_addr, &response, sizeof(response));
+    write_desc(DESC_ADDR(VSND_QUEUE_CTRL), head, req_addr,
+               (uint32_t) request_len, VIRTIO_DESC_F_NEXT, head + 1);
+    write_desc(DESC_ADDR(VSND_QUEUE_CTRL), head + 1, resp_addr,
+               sizeof(response), VIRTIO_DESC_F_WRITE, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 4 +
+                (guest_paddr_t) (avail_idx % QUEUE_SIZE) * sizeof(uint16_t),
+            head);
+    write16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 2, avail_idx + 1);
+
+    mmio_write(REG(QueueNotify), VSND_QUEUE_CTRL);
+
+    require_bool(name, wait_for_ctrl_used_idx(used_idx + 1, 1000), true);
+    require_u32("control used id", read32(used_elem), head);
+    require_u32("control used len", read32(used_elem + 4),
+                sizeof(virtio_snd_hdr_t));
+    dma_read(resp_addr, &response, sizeof(response));
+    return response.code;
+}
+
+static void submit_prepare_then_failed_start(void)
+{
+    virtio_snd_prop_t *props = &vsnd_props[0];
+    virtio_snd_pcm_hdr_t prepare = {
+        .hdr.code = VIRTIO_SND_R_PCM_PREPARE,
+        .stream_id = 0,
+    };
+    virtio_snd_pcm_hdr_t start = {
+        .hdr.code = VIRTIO_SND_R_PCM_START,
+        .stream_id = 0,
+    };
+    uint32_t status;
+
+    status = submit_control_request("PCM_PREPARE completion", &prepare,
+                                    sizeof(prepare), CTRL_PREPARE_REQ_ADDR,
+                                    CTRL_PREPARE_RESP_ADDR);
+    require_u32("PCM_PREPARE status", status, VIRTIO_SND_S_OK);
+    require_int("Pa_OpenStream called", (int) fake_open_count, 1);
+    require_bool("prepared stream opened", props->pa_stream != NULL, true);
+    require_u32("state after prepare", props->pp.hdr.hdr.code,
+                VIRTIO_SND_R_PCM_PREPARE);
+    require_bool("prepare IRQ published", virtio_snd_irq_pending(&emu.vsnd),
+                 true);
+
+    virtio_irq_ack(&emu.vsnd.common.irq, VIRTIO_INT__USED_RING);
+    require_bool("IRQ acked before START", virtio_snd_irq_pending(&emu.vsnd),
+                 false);
+
+    fake_start_error = -1;
+    status = submit_control_request("PCM_START failure completion", &start,
+                                    sizeof(start), CTRL_START_REQ_ADDR,
+                                    CTRL_START_RESP_ADDR);
+    require_u32("PCM_START failure status", status, VIRTIO_SND_S_IO_ERR);
+    require_int("Pa_StartStream called", (int) fake_start_count, 1);
+    require_bool("failed START IRQ published", virtio_snd_irq_pending(&emu.vsnd),
+                 true);
+    require_u32("failed START leaves stream prepared", props->pp.hdr.hdr.code,
+                VIRTIO_SND_R_PCM_PREPARE);
+    require_bool("failed START keeps stream handle", props->pa_stream != NULL,
+                 true);
+}
+
 static void publish_pcm_prepare_request(void)
 {
     virtio_snd_pcm_hdr_t request = {
@@ -491,6 +622,44 @@ static void test_queue_notify_wakes_actor_without_draining_on_caller(void)
     require_int("notify join", pthread_join(call.thread, NULL), 0);
     async_snd_call_destroy(&call);
     destroy_snd_fixture();
+}
+
+
+static void test_pcm_start_failure_completes_without_started_state(void)
+{
+    configure_snd_fixture();
+    configure_all_snd_queues();
+
+    submit_prepare_then_failed_start();
+
+    destroy_snd_fixture();
+    require_int("failed START destroy closes stream", (int) fake_close_count,
+                1);
+    require_int("failed START destroy does not stop", (int) fake_stop_count,
+                0);
+    require_bool("failed START destroy leaves no unclosed stream",
+                 fake_terminate_saw_unclosed_stream, false);
+}
+
+static void test_pcm_start_failure_reset_closes_prepared_stream(void)
+{
+    virtio_snd_prop_t *props = &vsnd_props[0];
+
+    configure_snd_fixture();
+    configure_all_snd_queues();
+
+    submit_prepare_then_failed_start();
+
+    require_int("common reset after failed START",
+                virtio_device_common_reset(&emu.vsnd.common), 0);
+    require_int("failed START reset closes stream", (int) fake_close_count, 1);
+    require_int("failed START reset does not stop", (int) fake_stop_count, 0);
+    require_bool("failed START reset clears stream", props->pa_stream == NULL,
+                 true);
+
+    destroy_snd_fixture();
+    require_bool("failed START reset/destroy leaves no unclosed stream",
+                 fake_terminate_saw_unclosed_stream, false);
 }
 
 static void test_reset_closes_callbacks_before_freeing_buffers(void)
@@ -600,6 +769,8 @@ int main(void)
 {
     test_common_init_and_config();
     test_queue_notify_wakes_actor_without_draining_on_caller();
+    test_pcm_start_failure_completes_without_started_state();
+    test_pcm_start_failure_reset_closes_prepared_stream();
     test_reset_closes_callbacks_before_freeing_buffers();
     test_reset_closes_stream_opened_by_inflight_actor();
     test_destroy_closes_stream_opened_by_inflight_actor();

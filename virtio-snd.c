@@ -794,12 +794,13 @@ static int virtio_snd_process_control_chain(virtio_snd_state_t *vsnd,
             status = VIRTIO_SND_S_IO_ERR;
             break;
         }
-        props->pp.hdr.hdr.code = VIRTIO_SND_R_PCM_START;
         err = Pa_StartStream(props->pa_stream);
         if (err != paNoError) {
             fprintf(stderr, "virtio-snd: Pa_StartStream: %s\n",
                     Pa_GetErrorText(err));
             status = VIRTIO_SND_S_IO_ERR;
+        } else {
+            props->pp.hdr.hdr.code = VIRTIO_SND_R_PCM_START;
         }
         break;
     }
