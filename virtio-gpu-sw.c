@@ -1194,10 +1194,14 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
-        /* RESOURCE_FLUSH is guest-driven dirtyfb traffic and may be issued at
-         * frame cadence. Preserve the invalid-resource response without
-         * flooding the demo console.
-         */
+#if SEMU_HAS(VIRGL)
+        if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+            virtio_gpu_virgl_resource_flush_handler(vgpu, vq_desc, plen);
+            return;
+        }
+#endif
+        fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
+                __func__, request->resource_id);
         *plen = virtio_gpu_write_ctrl_response(
             vgpu, &request->hdr, response_desc,
             VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
