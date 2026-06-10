@@ -65,6 +65,33 @@ static struct vgpu_display_payload *alloc_display_payload(const char *name)
     return payload;
 }
 
+static uint32_t fill_display_queue_with_plane_frames(bool include_cursor_frames)
+{
+    uint32_t queued = 0;
+
+    for (;;) {
+        struct vgpu_display_payload *payload =
+            alloc_display_payload("display pressure payload alloc");
+        enum vgpu_display_publish_result result;
+
+        if (!include_cursor_frames || (queued & 1U) == 0)
+            result = vgpu_display_publish_primary_set(0, payload);
+        else
+            result = vgpu_display_publish_cursor_set(0, payload, 1, 2, 3, 4);
+
+        if (result == VGPU_DISPLAY_PUBLISH_OK) {
+            queued++;
+            continue;
+        }
+
+        require_publish_result("display pressure queue full", result,
+                               VGPU_DISPLAY_PUBLISH_QUEUE_FULL);
+        free(payload);
+        require_true("display pressure queued frames", queued > 0);
+        return queued;
+    }
+}
+
 static void require_rect(const char *name,
                          struct vgpu_dirty_rect got,
                          uint32_t x,
@@ -377,6 +404,59 @@ static void test_gl_payload_metadata_survives_display_queue(void)
     vgpu_display_release_cmd(&cmd);
 }
 
+static void test_reliable_clears_survive_full_display_frame_queue(void)
+{
+    struct vgpu_display_cmd cmd;
+    uint32_t primary_generation = vgpu_display_primary_generation(0);
+    uint32_t queued = fill_display_queue_with_plane_frames(true);
+
+    require_publish_result("primary clear published while queue full",
+                           vgpu_display_publish_primary_clear(0),
+                           VGPU_DISPLAY_PUBLISH_OK);
+    require_publish_result("cursor clear published while queue full",
+                           vgpu_display_publish_cursor_clear(0),
+                           VGPU_DISPLAY_PUBLISH_OK);
+
+    require_true("primary clear popped before stale frames",
+                 vgpu_display_pop_cmd(&cmd));
+    require_u32("primary clear command type", cmd.type,
+                VGPU_DISPLAY_CMD_PRIMARY_CLEAR);
+    require_u32("primary clear generation", cmd.generation,
+                primary_generation + 1U);
+
+    require_true("cursor clear popped before stale frames",
+                 vgpu_display_pop_cmd(&cmd));
+    require_u32("cursor clear command type", cmd.type,
+                VGPU_DISPLAY_CMD_CURSOR_CLEAR);
+
+    vgpu_display_free_calls = 0;
+    vgpu_display_count_free = true;
+    require_false("stale full-queue frames drained after reliable clears",
+                  vgpu_display_pop_cmd(&cmd));
+    vgpu_display_count_free = false;
+    require_u32("stale full-queue frame payloads released",
+                vgpu_display_free_calls, queued);
+}
+
+static void test_reconfigure_generation_survives_full_display_frame_queue(void)
+{
+    struct vgpu_display_cmd cmd;
+    uint32_t primary_generation = vgpu_display_primary_generation(0);
+    uint32_t queued = fill_display_queue_with_plane_frames(false);
+
+    require_u32("primary generation advances while queue full",
+                vgpu_display_advance_primary_generation(0),
+                primary_generation + 1U);
+
+    vgpu_display_free_calls = 0;
+    vgpu_display_count_free = true;
+    require_false("stale full-queue frames drained after reconfigure",
+                  vgpu_display_pop_cmd(&cmd));
+    vgpu_display_count_free = false;
+    require_u32("reconfigure-stale frame payloads released",
+                vgpu_display_free_calls, queued);
+}
+
 static void test_display_shutdown_after_producer_stopped_drains_payloads(void)
 {
     struct vgpu_display_payload *primary =
@@ -430,6 +510,8 @@ int main(void)
     test_primary_clear_requires_published_clear();
     test_lifecycle_publish_result_classification();
     test_gl_payload_metadata_survives_display_queue();
+    test_reliable_clears_survive_full_display_frame_queue();
+    test_reconfigure_generation_survives_full_display_frame_queue();
     test_display_shutdown_after_producer_stopped_drains_payloads();
     return 0;
 }
