@@ -1088,6 +1088,70 @@ static void test_lookup_open_read_release_valid_file(void)
     remove_shared_file_tree(shared_dir, "file.txt");
 }
 
+static void test_read_host_pread_failure_returns_ebadf_without_reset(void)
+{
+    struct vfs_resp_header header;
+    struct fuse_entry_out entry_out;
+    struct fuse_open_out open_out;
+    virtio_fs_handle_entry *handle;
+    char dir_template[] = "/tmp/semu-vfs-test-XXXXXX";
+    char *shared_dir = NULL;
+    const uint16_t queue = 1;
+    const guest_paddr_t read_used_elem =
+        USED_ADDR(queue) + 4 + (guest_paddr_t) (2 % QUEUE_SIZE) * 8;
+
+    create_shared_file(dir_template, "file.txt", TEST_FILE_CONTENT,
+                       &shared_dir);
+    setup_fixture_with_dir(shared_dir);
+
+    publish_lookup_request(queue, 0x2101, 1, "file.txt", strlen("file.txt"));
+    submit_queue_head(queue, 0, 0);
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    dma_read(ENTRY_OUT_ADDR, &entry_out, sizeof(entry_out));
+    require_int("pread failure lookup file error", header.out.error, 0);
+    require_bool("pread failure lookup file nodeid", entry_out.nodeid != 0,
+                 true);
+    ack_used_irq();
+
+    publish_open_request(queue, 0x2102, entry_out.nodeid);
+    submit_queue_head(queue, 1, 0);
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    dma_read(OPEN_OUT_ADDR, &open_out, sizeof(open_out));
+    require_int("pread failure open file error", header.out.error, 0);
+    require_bool("pread failure open handle id", open_out.fh != 0, true);
+    ack_used_irq();
+
+    handle =
+        virtio_fs_find_handle(&emu.vfs, open_out.fh, VIRTIO_FS_HANDLE_FILE);
+    require_bool("pread failure host handle found", handle != NULL, true);
+    require_int("pread failure close host fd", close(handle->fd), 0);
+    handle->fd = -1;
+
+    publish_read_request(queue, 0x2103, entry_out.nodeid, open_out.fh,
+                         strlen(TEST_FILE_CONTENT));
+    submit_queue_head(queue, 2, 0);
+
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    require_u16("pread failure used idx", read16(USED_ADDR(queue) + 2), 3);
+    require_u32("pread failure used id", read32(read_used_elem), 0);
+    require_u32("pread failure used len", read32(read_used_elem + 4),
+                sizeof(struct fuse_out_header));
+    require_u32("pread failure response len", header.out.len,
+                sizeof(struct fuse_out_header));
+    require_int("pread failure response error", header.out.error, -EBADF);
+    require_u32("pread failure irq status", mmio_read(REG(InterruptStatus)),
+                VIRTIO_INT__USED_RING);
+    require_bool("pread failure irq line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), true);
+    require_u32("pread failure needs-reset remains clear",
+                mmio_read(REG(Status)) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+    ack_used_irq();
+
+    teardown_fixture();
+    remove_shared_file_tree(shared_dir, "file.txt");
+}
+
 static void test_invalid_releasedir_handle_returns_ebadf(void)
 {
     struct vfs_resp_header header;
@@ -1267,6 +1331,7 @@ int main(void)
     test_lookup_rejects_path_escape_name();
     test_lookup_rejects_embedded_nul_name();
     test_lookup_open_read_release_valid_file();
+    test_read_host_pread_failure_returns_ebadf_without_reset();
     test_invalid_read_handle_returns_ebadf();
     test_invalid_releasedir_handle_returns_ebadf();
     test_invalid_queue_notify_sets_needs_reset();
