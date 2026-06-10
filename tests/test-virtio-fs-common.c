@@ -13,14 +13,20 @@
 #include "../ram_access.h"
 #include "../riscv_private.h"
 
+static bool test_ram_dma_read(const ram_dma_t *dma,
+                              guest_paddr_t addr,
+                              void *buf,
+                              guest_size_t len);
 static bool test_ram_dma_write(ram_dma_t *dma,
                                guest_paddr_t addr,
                                const void *buf,
                                guest_size_t len);
 
+#define ram_dma_read test_ram_dma_read
 #define ram_dma_write test_ram_dma_write
 #include "../virtio-fs.c"
 #undef ram_dma_write
+#undef ram_dma_read
 
 #define REG(reg) ((uint32_t) VIRTIO_##reg << 2)
 #define TEST_RAM_SIZE 16384
@@ -47,6 +53,8 @@ static bool test_ram_dma_write(ram_dma_t *dma,
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static emu_state_t emu;
 static unsigned wake_count;
+static struct virtio_device_common *reset_start_on_avail_read_common;
+static guest_paddr_t reset_start_on_avail_read_addr;
 
 struct dma_gate {
     pthread_mutex_t lock;
@@ -75,6 +83,25 @@ static void dma_gate_block_if_enabled(struct dma_gate *gate,
             pthread_cond_wait(&gate->cond, &gate->lock);
     }
     pthread_mutex_unlock(&gate->lock);
+}
+
+static bool test_ram_dma_read(const ram_dma_t *dma,
+                              guest_paddr_t addr,
+                              void *buf,
+                              guest_size_t len)
+{
+    if (reset_start_on_avail_read_common &&
+        addr == reset_start_on_avail_read_addr && len == sizeof(uint16_t)) {
+        struct virtio_device_common *common = reset_start_on_avail_read_common;
+
+        reset_start_on_avail_read_common = NULL;
+        pthread_mutex_lock(&common->transport_lock);
+        common->generation++;
+        common->reset_in_progress = true;
+        pthread_mutex_unlock(&common->transport_lock);
+    }
+
+    return ram_dma_read(dma, addr, buf, len);
 }
 
 static bool test_ram_dma_write(ram_dma_t *dma,
@@ -315,6 +342,8 @@ static void setup_fixture_with_dir(const char *shared_dir)
                 semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
     require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
     wake_count = 0;
+    reset_start_on_avail_read_common = NULL;
+    reset_start_on_avail_read_addr = 0;
 
     require_bool("virtio fs init",
                  virtio_fs_init(&emu.vfs, &emu, "myfs", (char *) shared_dir),
@@ -358,6 +387,8 @@ static void setup_fixture_with_two_ready_queues(const char *shared_dir)
                 semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
     require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
     wake_count = 0;
+    reset_start_on_avail_read_common = NULL;
+    reset_start_on_avail_read_addr = 0;
 
     require_bool("virtio fs init",
                  virtio_fs_init(&emu.vfs, &emu, "myfs", (char *) shared_dir),
@@ -383,6 +414,8 @@ static void setup_fixture_with_two_ready_queues(const char *shared_dir)
 
 static void teardown_fixture(void)
 {
+    reset_start_on_avail_read_common = NULL;
+    reset_start_on_avail_read_addr = 0;
     virtio_fs_destroy(&emu.vfs);
     pthread_mutex_destroy(&emu.plic_lock);
     semu_vm_lifecycle_destroy(&emu.lifecycle);
@@ -1132,6 +1165,34 @@ static void test_reset_cancels_stale_pending_actor_completion(void)
     teardown_fixture();
 }
 
+static void test_common_reset_start_cancels_stale_avail_failure(void)
+{
+    int ret;
+    const uint16_t queue = 1;
+
+    setup_fixture();
+    write16(AVAIL_ADDR(queue) + 2, QUEUE_SIZE + 1);
+
+    reset_start_on_avail_read_common = &emu.vfs.common;
+    reset_start_on_avail_read_addr = AVAIL_ADDR(queue) + 2;
+    ret = virtio_fs_actor_drain_queue(&emu.vfs, &emu.vfs.actor, queue,
+                                      virtio_actor_generation(&emu.vfs.actor));
+
+    require_int("common reset stale avail drain return", ret, 0);
+    require_bool("common reset stale avail hook consumed",
+                 reset_start_on_avail_read_common == NULL, true);
+    require_u32("common reset stale avail interrupt remains clear",
+                virtio_irq_read_status(&emu.vfs.common.irq), 0);
+    require_bool("common reset stale avail irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), false);
+    require_u32("common reset stale avail needs-reset remains clear",
+                virtio_fs_status_load(&emu.vfs) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+
+    teardown_fixture();
+}
+
 static void test_stop_cancels_stale_pending_actor_completion(void)
 {
     struct async_fs_call notify;
@@ -1210,6 +1271,7 @@ int main(void)
     test_invalid_releasedir_handle_returns_ebadf();
     test_invalid_queue_notify_sets_needs_reset();
     test_reset_cancels_stale_pending_actor_completion();
+    test_common_reset_start_cancels_stale_avail_failure();
     test_stop_cancels_stale_pending_actor_completion();
     test_malformed_avail_sets_needs_reset_and_conf_change_irq();
     return 0;
