@@ -514,6 +514,15 @@ static void *reset_input_thread(void *opaque)
     return NULL;
 }
 
+static void *stop_input_thread(void *opaque)
+{
+    struct async_input_call *call = opaque;
+    int ret = virtio_actor_stop(&call->vinput->actor);
+
+    async_input_call_finish(call, ret);
+    return NULL;
+}
+
 static void async_input_call_start_notify(struct async_input_call *call)
 {
     require_int("notify thread create",
@@ -525,6 +534,13 @@ static void async_input_call_start_reset(struct async_input_call *call)
 {
     require_int("reset thread create",
                 pthread_create(&call->thread, NULL, reset_input_thread, call),
+                0);
+}
+
+static void async_input_call_start_stop(struct async_input_call *call)
+{
+    require_int("stop thread create",
+                pthread_create(&call->thread, NULL, stop_input_thread, call),
                 0);
 }
 
@@ -733,6 +749,51 @@ static void test_reset_cancels_stale_host_event_completion(void)
     async_input_call_destroy(&reset);
 }
 
+static void test_stop_cancels_stale_host_event_completion(void)
+{
+    struct vinput_cmd key = {
+        .type = VINPUT_CMD_KEYBOARD_KEY,
+        .u.keyboard_key = {
+            .key = SEMU_KEY_A,
+            .value = 1,
+        },
+    };
+    struct async_input_call stop;
+
+    configure_input_fixture();
+    publish_kbd_eventq_buffers(2);
+    require_bool("push key before stop", vinput_push_cmd(VINPUT_KEYBOARD_ID, &key),
+                 true);
+    dma_gate_enable(&input_dma_write_gate, KBD_EVENT_BUF0,
+                    sizeof(struct virtio_input_event));
+    virtio_input_drain_host_events();
+    require_bool("actor entered eventq write before stop",
+                 dma_gate_wait_entered(&input_dma_write_gate, 1000), true);
+
+    async_input_call_init(&stop, &emu.vkeyboard, VIRTIO_INPUT_EVENTQ);
+    async_input_call_start_stop(&stop);
+    require_bool("stop advanced actor to stopping",
+                 wait_for_input_actor_state(&emu.vkeyboard,
+                                            VIRTIO_ACTOR_STOPPING),
+                 true);
+    require_bool("stop waits for blocked backend write",
+                 async_input_call_wait_done(&stop, 200), false);
+
+    dma_gate_release(&input_dma_write_gate);
+    async_input_call_join(&stop);
+    require_int("stop return", stop.ret, 0);
+    require_bool("stale pending clears after stop",
+                 wait_for_input_actor_pending_mask(&emu.vkeyboard, 0), true);
+    require_u16("stop stale used idx remains clear",
+                read16(KBD_USED_ADDR + 2), 0);
+    require_u32("stop stale interrupt remains clear",
+                input_mmio_read(&emu.vkeyboard, REG(InterruptStatus)), 0);
+    require_bool("stop stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VINPUT_KEYBOARD), false);
+
+    async_input_call_destroy(&stop);
+}
+
 static void test_per_device_wake_bookkeeping_survives_reset_race(void)
 {
     struct vinput_cmd key = {
@@ -818,6 +879,9 @@ int main(void)
     destroy_input_fixture();
 
     test_reset_cancels_stale_host_event_completion();
+    destroy_input_fixture();
+
+    test_stop_cancels_stale_host_event_completion();
     destroy_input_fixture();
 
     test_per_device_wake_bookkeeping_survives_reset_race();
