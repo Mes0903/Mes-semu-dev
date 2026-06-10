@@ -36,6 +36,38 @@ export VGPU3D_GLXINFO_SLEEP="${VGPU3D_GLXINFO_SLEEP:-1}"
 export VGPU3D_XORG_RETRIES="${VGPU3D_XORG_RETRIES:-${DEFAULT_XORG_RETRIES}}"
 export VGPU3D_XORG_SLEEP="${VGPU3D_XORG_SLEEP:-1}"
 export VGPU3D_GLXGEARS_SECONDS="${VGPU3D_GLXGEARS_SECONDS:-${DEFAULT_GLXGEARS_SECONDS}}"
+export VGPU3D_GLXGEARS_RUNS="${VGPU3D_GLXGEARS_RUNS:-1}"
+export VGPU3D_XORG_RESTARTS="${VGPU3D_XORG_RESTARTS:-0}"
+export VGPU3D_STRESS_GLXGEARS_SECONDS="${VGPU3D_STRESS_GLXGEARS_SECONDS:-${VGPU3D_GLXGEARS_SECONDS}}"
+
+case "${VGPU3D_GLXGEARS_RUNS}" in
+    ''|*[!0-9]*)
+        print_error "FAIL: VGPU3D_GLXGEARS_RUNS must be a positive integer"
+        exit 1
+        ;;
+esac
+if (( VGPU3D_GLXGEARS_RUNS < 1 )); then
+    print_error "FAIL: VGPU3D_GLXGEARS_RUNS must be a positive integer"
+    exit 1
+fi
+
+case "${VGPU3D_XORG_RESTARTS}" in
+    ''|*[!0-9]*)
+        print_error "FAIL: VGPU3D_XORG_RESTARTS must be a non-negative integer"
+        exit 1
+        ;;
+esac
+
+case "${VGPU3D_STRESS_GLXGEARS_SECONDS}" in
+    ''|*[!0-9]*)
+        print_error "FAIL: VGPU3D_STRESS_GLXGEARS_SECONDS must be a positive integer"
+        exit 1
+        ;;
+esac
+if (( VGPU3D_STRESS_GLXGEARS_SECONDS < 1 )); then
+    print_error "FAIL: VGPU3D_STRESS_GLXGEARS_SECONDS must be a positive integer"
+    exit 1
+fi
 
 case "${HEADLESS}" in
     0|false|no)
@@ -64,7 +96,7 @@ esac
 cleanup
 trap cleanup EXIT
 
-echo "Running vgpu 3D smoke: ENABLE_VIRGL=${ENABLE_VIRGL} HEADLESS=${HEADLESS} DISKIMG_FILE=${DISKIMG_FILE} NETDEV=${NETDEV} SMP=${SMP} EXECUTOR=${EXECUTOR}"
+echo "Running vgpu 3D smoke: ENABLE_VIRGL=${ENABLE_VIRGL} HEADLESS=${HEADLESS} DISKIMG_FILE=${DISKIMG_FILE} NETDEV=${NETDEV} SMP=${SMP} EXECUTOR=${EXECUTOR} VGPU3D_GLXGEARS_RUNS=${VGPU3D_GLXGEARS_RUNS} VGPU3D_XORG_RESTARTS=${VGPU3D_XORG_RESTARTS} VGPU3D_STRESS_GLXGEARS_SECONDS=${VGPU3D_STRESS_GLXGEARS_SECONDS}"
 
 # Feature toggles are passed through environment variables, which do not
 # participate in make's normal dependency tracking. Force a rebuild here so
@@ -211,28 +243,14 @@ expect {
 }
 
 expect "# " {
-  send "rm -f /tmp/vgpu3d-glxinfo.log; i=0; status=FAIL; while test \u0024i -lt $env(VGPU3D_GLXINFO_RETRIES); do DISPLAY=:0 glxinfo -B >/tmp/vgpu3d-glxinfo.log 2>&1 && { status=OK; break; }; i=\u0024((i + 1)); sleep $env(VGPU3D_GLXINFO_SLEEP); done; head -80 /tmp/vgpu3d-glxinfo.log; printf \"__GLXINFO_RUN_%s__\\n\" \"\u0024status\"\r"
+  send "pass=0; total=\u0024(($env(VGPU3D_XORG_RESTARTS) + 1)); status=OK; while test \u0024pass -lt \u0024total; do if test \u0024pass -gt 0; then echo \"--- restarting Xorg pass \u0024pass ---\"; if test -f /tmp/xorg.pid; then kill \u0024(cat /tmp/xorg.pid) 2>/dev/null || true; fi; if command -v pidof >/dev/null 2>&1; then pids=\u0024(pidof Xorg X 2>/dev/null || true); if test -n \"\u0024pids\"; then kill \u0024pids 2>/dev/null || true; fi; else pids=\u0024(ps | awk '/[X]org|[X] / {print \u00241}' 2>/dev/null || true); if test -n \"\u0024pids\"; then kill \u0024pids 2>/dev/null || true; fi; fi; sleep 1; rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/xorg.log /tmp/xorg.pid; Xorg :0 -noreset -nolisten tcp >/tmp/xorg.log 2>&1 & echo \u0024! >/tmp/xorg.pid; i=0; ready=FAIL; while test \u0024i -lt $env(VGPU3D_XORG_RETRIES); do if test -S /tmp/.X11-unix/X0; then ready=READY; break; fi; sleep $env(VGPU3D_XORG_SLEEP); i=\u0024((i + 1)); done; if test \"\u0024ready\" != READY; then echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; status=XORG; break; fi; fi; run=1; while test \u0024run -le $env(VGPU3D_GLXGEARS_RUNS); do echo \"--- glxinfo pass \u0024pass run \u0024run ---\"; rm -f /tmp/vgpu3d-glxinfo.log; i=0; glxinfo_status=FAIL; while test \u0024i -lt $env(VGPU3D_GLXINFO_RETRIES); do DISPLAY=:0 glxinfo -B >/tmp/vgpu3d-glxinfo.log 2>&1 && { glxinfo_status=OK; break; }; i=\u0024((i + 1)); sleep $env(VGPU3D_GLXINFO_SLEEP); done; head -80 /tmp/vgpu3d-glxinfo.log; if test \"\u0024glxinfo_status\" != OK || ! grep -Eiq 'OpenGL renderer string:.*virgl|Device:.*virgl|virgl' /tmp/vgpu3d-glxinfo.log; then echo '--- forced virgl loader diagnostic ---'; DISPLAY=:0 LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B >/tmp/vgpu3d-glxinfo-virtio.log 2>&1 || true; head -120 /tmp/vgpu3d-glxinfo-virtio.log; echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; echo '--- dmesg virgl tail ---'; dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true; status=GLXINFO; break; fi; echo \"--- glxgears pass \u0024pass run \u0024run ---\"; rm -f /tmp/vgpu3d-glxgears.log; if command -v timeout >/dev/null 2>&1; then DISPLAY=:0 timeout ${env(VGPU3D_STRESS_GLXGEARS_SECONDS)}s glxgears >/tmp/vgpu3d-glxgears.log 2>&1; rc=\u0024?; else DISPLAY=:0 glxgears >/tmp/vgpu3d-glxgears.log 2>&1 & pid=\u0024!; sleep $env(VGPU3D_STRESS_GLXGEARS_SECONDS); kill \u0024pid 2>/dev/null || true; wait \u0024pid 2>/dev/null || true; rc=124; fi; head -40 /tmp/vgpu3d-glxgears.log; if ! { test \"\u0024rc\" -eq 0 || test \"\u0024rc\" -eq 124; } || ! grep -Eiq 'Running synchronized|frames in|GL_RENDERER|virgl' /tmp/vgpu3d-glxgears.log; then echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; echo '--- dmesg virgl tail ---'; dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true; status=GLXGEARS; break; fi; run=\u0024((run + 1)); done; if test \"\u0024status\" != OK; then break; fi; pass=\u0024((pass + 1)); done; printf \"__VGPU3D_REPEAT_%s__\\n\" \"\u0024status\"\r"
 } timeout { exit 7 }
 expect {
-  -exact "__GLXINFO_RUN_OK__" {}
-  -exact "__GLXINFO_RUN_FAIL__" { exit 7 }
+  -exact "__VGPU3D_REPEAT_OK__" {}
+  -exact "__VGPU3D_REPEAT_XORG__" { exit 6 }
+  -exact "__VGPU3D_REPEAT_GLXINFO__" { exit 7 }
+  -exact "__VGPU3D_REPEAT_GLXGEARS__" { exit 8 }
   timeout { exit 7 }
-}
-
-expect "# " { send "if grep -Eiq 'OpenGL renderer string:.*virgl|Device:.*virgl|virgl' /tmp/vgpu3d-glxinfo.log; then status=OK; else status=BAD; echo '--- forced virgl loader diagnostic ---'; DISPLAY=:0 LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B >/tmp/vgpu3d-glxinfo-virtio.log 2>&1 || true; head -120 /tmp/vgpu3d-glxinfo-virtio.log; echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; fi; printf \"__GLXINFO_RENDERER_%s__\\n\" \"\$status\"\r" } timeout { exit 7 }
-expect {
-  -exact "__GLXINFO_RENDERER_OK__" {}
-  -exact "__GLXINFO_RENDERER_BAD__" { exit 7 }
-  timeout { exit 7 }
-}
-
-expect "# " {
-  send "rm -f /tmp/vgpu3d-glxgears.log; if command -v timeout >/dev/null 2>&1; then DISPLAY=:0 timeout ${env(VGPU3D_GLXGEARS_SECONDS)}s glxgears >/tmp/vgpu3d-glxgears.log 2>&1; rc=\u0024?; else DISPLAY=:0 glxgears >/tmp/vgpu3d-glxgears.log 2>&1 & pid=\u0024!; sleep $env(VGPU3D_GLXGEARS_SECONDS); kill \u0024pid 2>/dev/null || true; wait \u0024pid 2>/dev/null || true; rc=124; fi; head -40 /tmp/vgpu3d-glxgears.log; if { test \"\u0024rc\" -eq 0 || test \"\u0024rc\" -eq 124; } && grep -Eiq 'Running synchronized|frames in|GL_RENDERER|virgl' /tmp/vgpu3d-glxgears.log; then status=OK; else status=FAIL; fi; printf \"__GLXGEARS_%s__\\n\" \"\u0024status\"\r"
-} timeout { exit 8 }
-expect {
-  -exact "__GLXGEARS_OK__" {}
-  -exact "__GLXGEARS_FAIL__" { exit 8 }
-  timeout { exit 8 }
 }
 DONE
 
