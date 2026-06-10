@@ -1553,7 +1553,10 @@ static void test_config_and_unimplemented_common_registers(void)
                 UINT32_MAX);
     require_u32("missing SHM len high", read_reg(&common, REG(SHMLenHigh)),
                 UINT32_MAX);
-    require_u32("SHM base high", read_reg(&common, REG(SHMBaseHigh)), 0);
+    require_u32("missing SHM base low", read_reg(&common, REG(SHMBaseLow)),
+                UINT32_MAX);
+    require_u32("missing SHM base high", read_reg(&common, REG(SHMBaseHigh)),
+                UINT32_MAX);
     require_u32("QueueReset read", read_reg(&common, REG(QueueReset)), 0);
     write_reg(&common, REG(QueueReset), 1);
     require_int("read-only identity write",
@@ -1561,6 +1564,69 @@ static void test_config_and_unimplemented_common_registers(void)
 
     virtio_device_common_destroy(&common);
     destroy_test_emu(&emu);
+}
+
+static void test_configured_shm_region_registers(void)
+{
+    struct virtio_device_common common;
+    struct backend_state backend;
+    const uint16_t queue_max_sizes[] = {8};
+    const struct virtio_device_shm_region shm_region = {
+        .id = 0x12,
+        .base = UINT64_C(0x12300000f8123000),
+        .length = UINT64_C(0x0000000123456789),
+    };
+    struct virtio_device_common_config config = {
+        .dma = &dma,
+        .irq_source = SEMU_IRQ_SOURCE_COUNT,
+        .device_id = 16,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .ops = &backend_ops,
+        .opaque = &backend,
+        .shm_region = &shm_region,
+    };
+
+    init_ram();
+    memset(&backend, 0, sizeof(backend));
+    require_int("common init", virtio_device_common_init(&common, &config), 0);
+
+    require_u32("default SHM sel", read_reg(&common, REG(SHMSel)), 0);
+    require_u32("unselected SHM len low", read_reg(&common, REG(SHMLenLow)),
+                UINT32_MAX);
+    require_u32("unselected SHM len high", read_reg(&common, REG(SHMLenHigh)),
+                UINT32_MAX);
+    require_u32("unselected SHM base low", read_reg(&common, REG(SHMBaseLow)),
+                UINT32_MAX);
+    require_u32("unselected SHM base high", read_reg(&common, REG(SHMBaseHigh)),
+                UINT32_MAX);
+
+    write_reg(&common, REG(SHMSel), shm_region.id);
+    require_u32("selected SHM sel", read_reg(&common, REG(SHMSel)),
+                shm_region.id);
+    require_u32("selected SHM len low", read_reg(&common, REG(SHMLenLow)),
+                (uint32_t) shm_region.length);
+    require_u32("selected SHM len high", read_reg(&common, REG(SHMLenHigh)),
+                (uint32_t) (shm_region.length >> 32));
+    require_u32("selected SHM base low", read_reg(&common, REG(SHMBaseLow)),
+                (uint32_t) shm_region.base);
+    require_u32("selected SHM base high", read_reg(&common, REG(SHMBaseHigh)),
+                (uint32_t) (shm_region.base >> 32));
+
+    write_reg(&common, REG(SHMSel), shm_region.id + 1);
+    require_u32("unknown SHM sel", read_reg(&common, REG(SHMSel)),
+                shm_region.id + 1);
+    require_u32("unknown SHM len low", read_reg(&common, REG(SHMLenLow)),
+                UINT32_MAX);
+    require_u32("unknown SHM len high", read_reg(&common, REG(SHMLenHigh)),
+                UINT32_MAX);
+    require_u32("unknown SHM base low", read_reg(&common, REG(SHMBaseLow)),
+                UINT32_MAX);
+    require_u32("unknown SHM base high", read_reg(&common, REG(SHMBaseHigh)),
+                UINT32_MAX);
+
+    virtio_device_common_destroy(&common);
 }
 
 static void test_requested_irq_init_failure_is_reported(void)
@@ -1626,6 +1692,7 @@ int main(void)
     test_reset_prepare_waits_without_common_locks();
     test_reset_gate_covers_blocked_backend_reset();
     test_config_and_unimplemented_common_registers();
+    test_configured_shm_region_registers();
     test_requested_irq_init_failure_is_reported();
 
     return 0;

@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "device.h"
+#include "platform.h"
 #include "vgpu-display.h"
 #include "virtio-gpu.h"
 #if SEMU_HAS(VIRGL)
@@ -4617,6 +4618,20 @@ static void test_vgpu_virgl_gate_keeps_unsupported_features_hidden(void)
                 vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
     require_u64("context-init feature hidden",
                 vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_u64("resource-blob feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
+#if SEMU_HAS(VIRGL)
+    require_u32("host-visible SHM configured", vgpu.common.has_shm_region, 1);
+    require_u32("host-visible SHM id", vgpu.common.shm_region.id,
+                VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
+    require_u64("host-visible SHM base", vgpu.common.shm_region.base,
+                SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
+    require_u64("host-visible SHM length", vgpu.common.shm_region.length,
+                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+#else
+    require_u32("no host-visible SHM without VirGL", vgpu.common.has_shm_region,
+                0);
+#endif
     virtio_gpu_set_num_capsets(&vgpu, 5);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),

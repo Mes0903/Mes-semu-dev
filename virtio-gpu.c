@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "device.h"
+#include "platform.h"
 #include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
@@ -85,9 +86,9 @@ static void virtio_gpu_init_display_counters(
 static bool virtio_gpu_virgl_runtime_ready(void)
 {
 #if SEMU_HAS(VIRGL)
-    /* The build gate exists, but guest-visible VirGL remains disabled until
-     * the renderer backend, GL owner handoff, fences, reset, and capsets are
-     * all wired in this actor/common-transport branch.
+    /* The build gate exists, but guest-visible VirGL/blob remains disabled
+     * until the renderer backend, GL owner handoff, fences, reset, and capsets
+     * are all wired in this actor/common-transport branch.
      */
     return false;
 #else
@@ -99,8 +100,10 @@ static uint64_t virtio_gpu_device_features(void)
 {
     uint64_t features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1;
 
-    if (virtio_gpu_virgl_runtime_ready())
-        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT;
+    if (virtio_gpu_virgl_runtime_ready()) {
+        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
+                    VIRTIO_GPU_F_CONTEXT_INIT;
+    }
 
     return features;
 }
@@ -3922,6 +3925,13 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         [VIRTIO_GPU_CURSORQ] = VIRTIO_GPU_QUEUE_NUM_MAX,
     };
     struct virtio_device_common_config config;
+#if SEMU_HAS(VIRGL)
+    const struct virtio_device_shm_region host_visible_shm = {
+        .id = VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+        .base = SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE,
+        .length = SEMU_PLATFORM_VGPU_HOSTMEM_SIZE,
+    };
+#endif
 
     if (virtio_gpu_instance_initialized) {
         fprintf(stderr,
@@ -3950,6 +3960,9 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         .num_queues = ARRAY_SIZE(queue_max_sizes),
         .ops = &virtio_gpu_ops,
         .opaque = vgpu,
+#if SEMU_HAS(VIRGL)
+        .shm_region = &host_visible_shm,
+#endif
     };
 
     if (virtio_device_common_init(&vgpu->common, &config) < 0) {

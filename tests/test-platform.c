@@ -99,6 +99,12 @@ static const struct expected_device expected_devices[] = {
         .size = SEMU_PLATFORM_MMIO_REGION_SIZE,
         .irq_source = SEMU_PLATFORM_IRQ_VGPU,
     },
+    {
+        .name = "virtio-gpu-hostmem",
+        .base = SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE,
+        .size = SEMU_PLATFORM_VGPU_HOSTMEM_SIZE,
+        .irq_source = SEMU_PLATFORM_IRQ_NONE,
+    },
 };
 
 static void require_true(const char *name, bool got)
@@ -244,6 +250,13 @@ static void test_registered_bus_lookup_matches_slots(void)
     found = semu_mmio_bus_find(&bus, SEMU_PLATFORM_MMIO_VGPU_BASE + 0x10, &off);
     require_region_matches("lookup vgpu", found, &expected_devices[13]);
     require_u64("lookup vgpu offset", off, 0x10);
+
+    found = semu_mmio_bus_find(&bus,
+                               SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE + 0x1234,
+                               &off);
+    require_region_matches("lookup vgpu hostmem", found,
+                           &expected_devices[14]);
+    require_u64("lookup vgpu hostmem offset", off, 0x1234);
 
     found = semu_mmio_bus_find(&bus, SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE, &off);
     require_region_matches("lookup plic window 0", found, &expected_devices[0]);

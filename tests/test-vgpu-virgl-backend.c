@@ -6,6 +6,7 @@
 
 #include <virglrenderer.h>
 
+#include "../platform.h"
 #include "../vgpu-renderer.h"
 #include "../virtio-gpu-virgl.h"
 
@@ -1416,6 +1417,170 @@ static void test_ctrl_request_maps_and_unmaps_blob_resources(void)
     CHECK(fake_reset_count == resets_before + 1);
 }
 
+static void test_blob_hostmem_aperture_bounds_and_access(void)
+{
+    reset_test_state(137);
+
+    uint8_t blob_data[0x2000];
+    for (size_t i = 0; i < sizeof(blob_data); i++)
+        blob_data[i] = (uint8_t) (0x10 + i);
+    fake_resource_map_ptr = blob_data;
+    fake_resource_map_size = sizeof(blob_data);
+
+    struct vgpu_renderer_completion completion = {0};
+    struct vgpu_renderer_ctrl_payload create_blob = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB},
+        .cmd.resource_create_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB},
+                .resource_id = 501,
+                .blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D,
+                .blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                .size = 0x1000,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 137},
+        .command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+        .payload = &create_blob,
+        .payload_size = sizeof(create_blob),
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+
+    struct vgpu_renderer_ctrl_payload map_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB},
+        .cmd.resource_map_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB},
+                .resource_id = 501,
+                .offset = SEMU_PLATFORM_VGPU_HOSTMEM_SIZE - 0x800,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_resp_map_info),
+        .response_type = VIRTIO_GPU_RESP_OK_MAP_INFO,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_resource_map_count == 0);
+
+    map_payload.cmd.resource_map_blob.offset = UINT64_MAX - 0x7ff;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(fake_resource_map_count == 0);
+
+    map_payload.cmd.resource_map_blob.offset = 0x3000;
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    CHECK(fake_resource_map_count == 1);
+    completion.release_response(completion.response);
+
+    uint32_t value = 0;
+    CHECK(!vgpu_virgl_hostmem_read(0x2fff, 1, &value));
+    CHECK(vgpu_virgl_hostmem_read(0x3002, 1, &value));
+    CHECK(value == blob_data[2]);
+    CHECK(vgpu_virgl_hostmem_read(0x3002, 2, &value));
+    CHECK(value == ((uint32_t) blob_data[2] | ((uint32_t) blob_data[3] << 8)));
+    CHECK(vgpu_virgl_hostmem_read(0x3004, 4, &value));
+    CHECK(value ==
+          ((uint32_t) blob_data[4] | ((uint32_t) blob_data[5] << 8) |
+           ((uint32_t) blob_data[6] << 16) | ((uint32_t) blob_data[7] << 24)));
+    CHECK(!vgpu_virgl_hostmem_read(0x3fff, 2, &value));
+    CHECK(!vgpu_virgl_hostmem_read(0x3000, 8, &value));
+
+    CHECK(vgpu_virgl_hostmem_write(0x3008, 1, 0xaa));
+    CHECK(blob_data[8] == 0xaa);
+    CHECK(vgpu_virgl_hostmem_write(0x300a, 2, 0xb1c2));
+    CHECK(blob_data[10] == 0xc2);
+    CHECK(blob_data[11] == 0xb1);
+    CHECK(vgpu_virgl_hostmem_write(0x300c, 4, 0xd1e2f304));
+    CHECK(blob_data[12] == 0x04);
+    CHECK(blob_data[13] == 0xf3);
+    CHECK(blob_data[14] == 0xe2);
+    CHECK(blob_data[15] == 0xd1);
+    CHECK(!vgpu_virgl_hostmem_write(0x3fff, 2, 0x55));
+    CHECK(!vgpu_virgl_hostmem_write(0x3000, 8, 0x55));
+
+    struct vgpu_renderer_ctrl_payload unmap_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB},
+        .cmd.resource_unmap_blob =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB},
+                .resource_id = 501,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    request.payload = &unmap_payload;
+    request.payload_size = sizeof(unmap_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(!vgpu_virgl_hostmem_read(0x3002, 1, &value));
+    CHECK(!vgpu_virgl_hostmem_write(0x3002, 1, 0x11));
+
+    map_payload.cmd.resource_map_blob.offset = 0x4000;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    completion.release_response(completion.response);
+    CHECK(vgpu_virgl_hostmem_read(0x4002, 1, &value));
+
+    struct vgpu_renderer_ctrl_payload unref_payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNREF},
+        .cmd.resource_unref =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_RESOURCE_UNREF},
+                .resource_id = 501,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    request.payload = &unref_payload;
+    request.payload_size = sizeof(unref_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(!vgpu_virgl_hostmem_read(0x4002, 1, &value));
+
+    create_blob.cmd.resource_create_blob.resource_id = 502;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    request.payload = &create_blob;
+    request.payload_size = sizeof(create_blob);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    map_payload.cmd.resource_map_blob.resource_id = 502;
+    map_payload.cmd.resource_map_blob.offset = 0x5000;
+    request.command_type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    request.payload = &map_payload;
+    request.payload_size = sizeof(map_payload);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_MAP_INFO);
+    completion.release_response(completion.response);
+    CHECK(vgpu_virgl_hostmem_read(0x5002, 1, &value));
+
+    vgpu_virgl_reset_renderer();
+    CHECK(!vgpu_virgl_hostmem_read(0x5002, 1, &value));
+}
+
 static void test_ctrl_request_resource_create_3d_failure_rolls_back_frontend(
     void)
 {
@@ -2573,6 +2738,7 @@ int main(void)
     test_ctrl_request_executes_resource_create_3d_completion();
     test_ctrl_request_executes_resource_create_blob_completion();
     test_ctrl_request_maps_and_unmaps_blob_resources();
+    test_blob_hostmem_aperture_bounds_and_access();
     test_ctrl_request_resource_create_3d_failure_rolls_back_frontend();
     test_ctrl_request_records_set_scanout_gl_payload_completion();
     test_ctrl_request_records_set_scanout_blob_gl_payload_completion();

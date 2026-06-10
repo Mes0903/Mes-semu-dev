@@ -61,6 +61,16 @@ static struct virtio_queue_common *virtio_mmio_selected_queue_cfg(
     return &common->queue_cfgs[common->queue_sel];
 }
 
+static const struct virtio_device_shm_region *
+virtio_mmio_selected_shm_region(const struct virtio_device_common *common)
+{
+    if (!common || !common->has_shm_region)
+        return NULL;
+    if (common->shm_sel != common->shm_region.id)
+        return NULL;
+    return &common->shm_region;
+}
+
 static void virtio_mmio_queue_cfg_reset(struct virtio_queue_common *cfg)
 {
     uint16_t max_size = cfg->max_size;
@@ -497,6 +507,13 @@ int virtio_device_common_init(struct virtio_device_common *common,
     if (!common || !config || !config->queue_max_sizes ||
         config->num_queues == 0)
         return -EINVAL;
+    if (config->shm_region) {
+        if (config->shm_region->length == 0)
+            return -EINVAL;
+        if (config->shm_region->base >
+            UINT64_MAX - config->shm_region->length)
+            return -EINVAL;
+    }
 
     memset(common, 0, sizeof(*common));
     common->queues = calloc(config->num_queues, sizeof(*common->queues));
@@ -535,6 +552,10 @@ int virtio_device_common_init(struct virtio_device_common *common,
     common->dma = config->dma;
     common->ops = config->ops;
     common->opaque = config->opaque;
+    if (config->shm_region) {
+        common->shm_region = *config->shm_region;
+        common->has_shm_region = true;
+    }
     atomic_init(&common->status, 0);
     common->generation = 1;
 
@@ -634,6 +655,7 @@ int virtio_device_common_reset(struct virtio_device_common *common)
     common->device_features_sel = 0;
     common->driver_features_sel = 0;
     common->queue_sel = 0;
+    common->shm_sel = 0;
     common->activated = false;
     atomic_store_explicit(&common->status, 0, memory_order_release);
 
@@ -668,6 +690,7 @@ int virtio_mmio_read(struct virtio_device_common *common,
                      uint32_t *value)
 {
     struct virtio_queue_common *cfg;
+    const struct virtio_device_shm_region *shm;
     uint32_t result = 0;
     int ret = 0;
 
@@ -695,6 +718,7 @@ int virtio_mmio_read(struct virtio_device_common *common,
 
     pthread_mutex_lock(&common->transport_lock);
     cfg = virtio_mmio_selected_queue_cfg(common);
+    shm = virtio_mmio_selected_shm_region(common);
 
     switch (byte_offset) {
     case VIRTIO_MMIO_REG(MagicValue):
@@ -763,19 +787,25 @@ int virtio_mmio_read(struct virtio_device_common *common,
         result = common->config_generation;
         break;
     case VIRTIO_MMIO_REG(SHMSel):
-        result = 0;
+        result = common->shm_sel;
         break;
     case VIRTIO_MMIO_REG(SHMLenLow):
+        result = shm ? (uint32_t) shm->length : UINT32_MAX;
+        break;
     case VIRTIO_MMIO_REG(SHMLenHigh):
         /* VirtIO MMIO reports a missing shared-memory region by returning
-         * UINT64_MAX from the length registers. Returning zero describes a
-         * real zero-length region to Linux, which can make drivers fail probe
-         * while reserving host-visible memory.
+         * UINT64_MAX from both length and base registers. Returning zero
+         * describes a real base address to Linux and can make drivers fail
+         * probe while reserving host-visible memory.
          */
-        result = UINT32_MAX;
+        result = shm ? (uint32_t) (shm->length >> 32) : UINT32_MAX;
         break;
     case VIRTIO_MMIO_REG(SHMBaseLow):
+        result = shm ? (uint32_t) shm->base : UINT32_MAX;
+        break;
     case VIRTIO_MMIO_REG(SHMBaseHigh):
+        result = shm ? (uint32_t) (shm->base >> 32) : UINT32_MAX;
+        break;
     case VIRTIO_MMIO_REG(QueueReset):
         result = 0;
         break;
@@ -966,6 +996,8 @@ int virtio_mmio_write(struct virtio_device_common *common,
         }
         break;
     case VIRTIO_MMIO_REG(SHMSel):
+        common->shm_sel = value;
+        break;
     case VIRTIO_MMIO_REG(QueueReset):
         break;
     case VIRTIO_MMIO_REG(MagicValue):
