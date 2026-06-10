@@ -77,6 +77,33 @@ static struct {
     .fd = -1,
 };
 
+struct pread_gate {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool enabled;
+    bool entered;
+    bool release;
+    int fd;
+};
+
+static struct pread_gate fs_pread_gate = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+    .fd = -1,
+};
+
+static void pread_gate_block_if_enabled(struct pread_gate *gate, int fd)
+{
+    pthread_mutex_lock(&gate->lock);
+    if (gate->enabled && fd == gate->fd) {
+        gate->entered = true;
+        pthread_cond_broadcast(&gate->cond);
+        while (!gate->release)
+            pthread_cond_wait(&gate->cond, &gate->lock);
+    }
+    pthread_mutex_unlock(&gate->lock);
+}
+
 static void test_pread_script_clear(void)
 {
     test_pread_script.fd = -1;
@@ -105,6 +132,7 @@ static ssize_t test_virtio_fs_pread(int fd,
         const struct test_pread_op *op =
             &test_pread_script.ops[test_pread_script.call_count++];
 
+        pread_gate_block_if_enabled(&fs_pread_gate, fd);
         if (op->ret < 0) {
             errno = op->err;
             return -1;
@@ -118,6 +146,7 @@ static ssize_t test_virtio_fs_pread(int fd,
         return op->ret;
     }
 
+    pread_gate_block_if_enabled(&fs_pread_gate, fd);
     return pread(fd, buf, count, offset);
 }
 
@@ -232,6 +261,42 @@ static void sleep_one_ms(void)
     };
 
     nanosleep(&ts, NULL);
+}
+
+static void pread_gate_enable(struct pread_gate *gate, int fd)
+{
+    pthread_mutex_lock(&gate->lock);
+    gate->enabled = true;
+    gate->entered = false;
+    gate->release = false;
+    gate->fd = fd;
+    pthread_mutex_unlock(&gate->lock);
+}
+
+static bool pread_gate_wait_entered(struct pread_gate *gate,
+                                    unsigned timeout_ms)
+{
+    struct timespec deadline = deadline_after_ms(timeout_ms);
+    bool entered;
+
+    pthread_mutex_lock(&gate->lock);
+    while (!gate->entered) {
+        int ret = pthread_cond_timedwait(&gate->cond, &gate->lock, &deadline);
+        if (ret == ETIMEDOUT)
+            break;
+    }
+    entered = gate->entered;
+    pthread_mutex_unlock(&gate->lock);
+    return entered;
+}
+
+static void pread_gate_release(struct pread_gate *gate)
+{
+    pthread_mutex_lock(&gate->lock);
+    gate->enabled = false;
+    gate->release = true;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->lock);
 }
 
 static void dma_gate_enable(struct dma_gate *gate,
@@ -1524,6 +1589,89 @@ static void test_stop_cancels_stale_pending_actor_completion(void)
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
+static void run_read_host_pread_cancels_stale_completion(bool stop)
+{
+    struct async_fs_call notify;
+    struct async_fs_call control;
+    struct fuse_entry_out entry_out;
+    struct fuse_open_out open_out;
+    virtio_fs_handle_entry *handle;
+    char payload[] = "blocked-read";
+    const struct test_pread_op ops[] = {
+        {.ret = (ssize_t) strlen(payload), .data = payload},
+    };
+    char dir_template[] = "/tmp/semu-vfs-test-XXXXXX";
+    char *shared_dir = NULL;
+    const uint16_t queue = 1;
+
+    open_shared_test_file(dir_template, &shared_dir, &entry_out, &open_out);
+    handle = virtio_fs_find_handle(&emu.vfs, open_out.fh,
+                                   VIRTIO_FS_HANDLE_FILE);
+    require_bool("blocked pread host handle found", handle != NULL, true);
+    test_pread_script_set(handle->fd, ops, sizeof(ops) / sizeof(ops[0]));
+    pread_gate_enable(&fs_pread_gate, handle->fd);
+
+    publish_read_request(queue, 0x2503, entry_out.nodeid, open_out.fh,
+                         strlen(TEST_FILE_CONTENT));
+    write16(AVAIL_ADDR(queue) + 4 +
+                (guest_paddr_t) (2 % QUEUE_SIZE) * sizeof(uint16_t),
+            0);
+    write16(AVAIL_ADDR(queue) + 2, 3);
+    async_fs_call_init(&notify, &emu.vfs, queue);
+    async_fs_call_start_notify(&notify);
+    require_bool("actor entered host pread before cancellation",
+                 pread_gate_wait_entered(&fs_pread_gate, 1000), true);
+    require_bool("QueueNotify returned with host pread pending",
+                 async_fs_call_wait_done(&notify, 1000), true);
+
+    async_fs_call_init(&control, &emu.vfs, 0);
+    if (stop) {
+        async_fs_call_start_destroy(&control);
+        require_bool("stop advanced actor generation with host pread pending",
+                     wait_for_fs_actor_state(&emu.vfs, VIRTIO_ACTOR_STOPPING),
+                     true);
+    } else {
+        async_fs_call_start_reset(&control);
+        require_bool("reset advanced actor generation with host pread pending",
+                     wait_for_fs_actor_state(&emu.vfs, VIRTIO_ACTOR_RESETTING),
+                     true);
+    }
+
+    pread_gate_release(&fs_pread_gate);
+    async_fs_call_join(&notify);
+    async_fs_call_join(&control);
+    require_int(stop ? "destroy return" : "reset return", control.ret, 0);
+    require_u32("blocked pread calls", test_pread_script.call_count, 1);
+    require_u16("blocked pread stale used idx remains unchanged",
+                read16(USED_ADDR(queue) + 2), 2);
+    if (!stop)
+        require_u32("blocked pread stale interrupt remains clear",
+                    mmio_read(REG(InterruptStatus)), 0);
+    require_bool("blocked pread stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), false);
+
+    test_pread_script_clear();
+    async_fs_call_destroy(&control);
+    async_fs_call_destroy(&notify);
+    if (stop) {
+        pthread_mutex_destroy(&emu.plic_lock);
+        semu_vm_lifecycle_destroy(&emu.lifecycle);
+    } else {
+        teardown_fixture();
+    }
+    remove_shared_file_tree(shared_dir, "file.txt");
+}
+
+static void test_reset_cancels_stale_pending_host_pread_completion(void)
+{
+    run_read_host_pread_cancels_stale_completion(false);
+}
+
+static void test_stop_cancels_stale_pending_host_pread_completion(void)
+{
+    run_read_host_pread_cancels_stale_completion(true);
+}
+
 static void test_malformed_avail_sets_needs_reset_and_conf_change_irq(void)
 {
     int ret;
@@ -1570,6 +1718,8 @@ int main(void)
     test_reset_cancels_stale_pending_actor_completion();
     test_common_reset_start_cancels_stale_avail_failure();
     test_stop_cancels_stale_pending_actor_completion();
+    test_reset_cancels_stale_pending_host_pread_completion();
+    test_stop_cancels_stale_pending_host_pread_completion();
     test_malformed_avail_sets_needs_reset_and_conf_change_irq();
     return 0;
 }
