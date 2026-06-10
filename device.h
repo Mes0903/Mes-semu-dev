@@ -142,7 +142,8 @@ bool virtio_net_event_handle(virtio_net_state_t *vnet,
                              semu_event_token_t token_base);
 void virtio_net_event_poll_fallback(virtio_net_state_t *vnet);
 void virtio_net_event_unregister(virtio_net_state_t *vnet,
-                                 struct semu_event_loop *loop);
+                                 struct semu_event_loop *loop,
+                                 semu_event_token_t token_base);
 
 void virtio_net_recv_from_peer(void *peer);
 

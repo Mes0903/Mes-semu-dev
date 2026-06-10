@@ -50,6 +50,23 @@ static unsigned wake_count;
 static struct virtio_device_common *reset_start_on_avail_read_common;
 static guest_paddr_t reset_start_on_avail_read_addr;
 
+#define FAKE_SLIRP_MAX_DYNAMIC 8
+#define TEST_VNET_DYNAMIC_TOKEN(base) ((base) + 4U)
+
+struct fake_slirp_dynamic_socket {
+    int fd;
+    int events;
+};
+
+static struct fake_slirp_dynamic_socket
+    fake_slirp_dynamic[FAKE_SLIRP_MAX_DYNAMIC];
+static size_t fake_slirp_dynamic_count;
+static int fake_slirp_fill_calls;
+static int fake_slirp_poll_calls;
+static int fake_slirp_last_select_error;
+static int fake_slirp_last_revents[FAKE_SLIRP_MAX_DYNAMIC];
+static size_t fake_slirp_last_revents_count;
+
 struct writev_gate {
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -200,15 +217,74 @@ int net_slirp_read(net_user_options_t *usr)
     return 0;
 }
 
+static short fake_slirp_to_poll_events(int events)
+{
+    short ret = 0;
+
+    if (events & SLIRP_POLL_IN)
+        ret |= POLLIN;
+    if (events & SLIRP_POLL_OUT)
+        ret |= POLLOUT;
+    if (events & SLIRP_POLL_PRI)
+        ret |= POLLPRI;
+    if (events & SLIRP_POLL_ERR)
+        ret |= POLLERR;
+    if (events & SLIRP_POLL_HUP)
+        ret |= POLLHUP;
+    return ret;
+}
+
+static int fake_poll_to_slirp_events(short events)
+{
+    int ret = 0;
+
+    if (events & POLLIN)
+        ret |= SLIRP_POLL_IN;
+    if (events & POLLOUT)
+        ret |= SLIRP_POLL_OUT;
+    if (events & POLLPRI)
+        ret |= SLIRP_POLL_PRI;
+    if (events & POLLERR)
+        ret |= SLIRP_POLL_ERR;
+    if (events & POLLHUP)
+        ret |= SLIRP_POLL_HUP;
+    return ret;
+}
+
+int semu_slirp_add_poll_socket(slirp_os_socket fd, int events, void *opaque)
+{
+    net_user_options_t *usr = opaque;
+
+    if (usr->pfd_len >= usr->pfd_size)
+        return -1;
+
+    int idx = usr->pfd_len++;
+    usr->pfd[idx].fd = (int) fd;
+    usr->pfd[idx].events = fake_slirp_to_poll_events(events);
+    usr->pfd[idx].revents = 0;
+    return idx;
+}
+
+int semu_slirp_get_revents(int idx, void *opaque)
+{
+    net_user_options_t *usr = opaque;
+
+    return fake_poll_to_slirp_events(usr->pfd[idx].revents);
+}
+
 void slirp_pollfds_fill_socket(Slirp *slirp,
                                uint32_t *timeout,
                                SlirpAddPollSocketCb add_poll,
                                void *opaque)
 {
     (void) slirp;
-    (void) timeout;
-    (void) add_poll;
-    (void) opaque;
+
+    fake_slirp_fill_calls++;
+    if (timeout)
+        *timeout = 0;
+    for (size_t i = 0; i < fake_slirp_dynamic_count; i++)
+        (void) add_poll((slirp_os_socket) fake_slirp_dynamic[i].fd,
+                        fake_slirp_dynamic[i].events, opaque);
 }
 
 void slirp_pollfds_poll(Slirp *slirp,
@@ -216,10 +292,43 @@ void slirp_pollfds_poll(Slirp *slirp,
                         SlirpGetREventsCb get_revents,
                         void *opaque)
 {
+    net_user_options_t *usr = opaque;
+
     (void) slirp;
-    (void) select_error;
-    (void) get_revents;
-    (void) opaque;
+
+    fake_slirp_poll_calls++;
+    fake_slirp_last_select_error = select_error;
+    fake_slirp_last_revents_count = 0;
+    if (select_error || !usr || !get_revents)
+        return;
+
+    for (int i = 2; i < usr->pfd_len &&
+                    fake_slirp_last_revents_count < FAKE_SLIRP_MAX_DYNAMIC;
+         i++) {
+        fake_slirp_last_revents[fake_slirp_last_revents_count++] =
+            get_revents(i, opaque);
+    }
+}
+
+static void fake_slirp_reset(void)
+{
+    memset(fake_slirp_dynamic, 0, sizeof(fake_slirp_dynamic));
+    fake_slirp_dynamic_count = 0;
+    fake_slirp_fill_calls = 0;
+    fake_slirp_poll_calls = 0;
+    fake_slirp_last_select_error = 0;
+    memset(fake_slirp_last_revents, 0, sizeof(fake_slirp_last_revents));
+    fake_slirp_last_revents_count = 0;
+}
+
+static void fake_slirp_set_dynamic(size_t index, int fd, int events)
+{
+    require_bool("fake slirp dynamic index valid",
+                 index < FAKE_SLIRP_MAX_DYNAMIC, true);
+    fake_slirp_dynamic[index].fd = fd;
+    fake_slirp_dynamic[index].events = events;
+    if (fake_slirp_dynamic_count <= index)
+        fake_slirp_dynamic_count = index + 1;
 }
 
 static void dma_write(guest_paddr_t addr, const void *src, guest_size_t len)
@@ -313,6 +422,7 @@ static void configure_net_base(void)
     user_net.host_to_guest_channel[1] = -1;
     user_net.guest_to_host_channel[0] = -1;
     user_net.guest_to_host_channel[1] = -1;
+    fake_slirp_reset();
     memset(ram_words, 0, sizeof(ram_words));
     ram_dma_init(&emu.ram_dma, ram_words, TEST_RAM_SIZE, NULL);
     emu.ram = ram_words;
@@ -373,6 +483,19 @@ static void configure_net(void)
     mmio_write(REG(Status), VIRTIO_STATUS__DRIVER_OK);
 }
 
+static void configure_fake_slirp(void)
+{
+    user_net.slirp = (Slirp *) (void *) &user_net;
+    user_net.pfd_size = FAKE_SLIRP_MAX_DYNAMIC + 2;
+    user_net.pfd = calloc((size_t) user_net.pfd_size, sizeof(*user_net.pfd));
+    require_bool("fake slirp pfd allocation", user_net.pfd != NULL, true);
+    user_net.pfd_len = 2;
+    user_net.pfd[0].fd = user_net.guest_to_host_channel[SLIRP_READ_SIDE];
+    user_net.pfd[0].events = POLLIN | POLLHUP;
+    user_net.pfd[1].fd = user_net.host_to_guest_channel[SLIRP_READ_SIDE];
+    user_net.pfd[1].events = POLLIN | POLLHUP;
+}
+
 static void destroy_net_fixture(void)
 {
     if (user_net.host_to_guest_channel[0] >= 0)
@@ -383,6 +506,10 @@ static void destroy_net_fixture(void)
         close(user_net.guest_to_host_channel[0]);
     if (user_net.guest_to_host_channel[1] >= 0)
         close(user_net.guest_to_host_channel[1]);
+    free(user_net.pfd);
+    user_net.pfd = NULL;
+    user_net.pfd_len = 0;
+    user_net.pfd_size = 0;
     virtio_net_destroy(&emu.vnet);
     pthread_mutex_destroy(&emu.plic_lock);
     semu_vm_lifecycle_destroy(&emu.lifecycle);
@@ -713,6 +840,243 @@ static void test_net_event_sync_avoids_ready_tx_writable_subscription(void)
     semu_event_loop_destroy(&loop);
 }
 
+static void test_user_dynamic_slirp_fds_register_with_event_masks(void)
+{
+    struct semu_event_loop loop;
+    int dynamic_in[2] = {-1, -1};
+    int dynamic_out[2] = {-1, -1};
+    ssize_t in_index;
+    ssize_t out_index;
+
+    configure_net();
+    configure_fake_slirp();
+    require_int("dynamic in pipe", pipe(dynamic_in), 0);
+    require_int("dynamic out pipe", pipe(dynamic_out), 0);
+    fake_slirp_set_dynamic(
+        0, dynamic_in[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+    fake_slirp_set_dynamic(1, dynamic_out[1],
+                           SLIRP_POLL_OUT | SLIRP_POLL_ERR);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+
+    in_index = event_loop_find_fd(&loop, dynamic_in[0]);
+    out_index = event_loop_find_fd(&loop, dynamic_out[1]);
+    require_bool("dynamic readable fd registered", in_index >= 0, true);
+    require_bool("dynamic writable fd registered", out_index >= 0, true);
+    require_u32("dynamic readable token", loop.tokens[in_index],
+                TEST_VNET_DYNAMIC_TOKEN(SEMU_EVENT_TOKEN_FIRST_DEVICE));
+    require_u32("dynamic writable token", loop.tokens[out_index],
+                TEST_VNET_DYNAMIC_TOKEN(SEMU_EVENT_TOKEN_FIRST_DEVICE));
+    require_u32("dynamic readable mask", loop.events[in_index],
+                SEMU_EVENT_READABLE | SEMU_EVENT_ERROR);
+    require_u32("dynamic writable mask", loop.events[out_index],
+                SEMU_EVENT_WRITABLE | SEMU_EVENT_ERROR);
+    require_int("slirp fill called during sync", fake_slirp_fill_calls, 1);
+
+    semu_event_loop_destroy(&loop);
+    close(dynamic_in[0]);
+    close(dynamic_in[1]);
+    close(dynamic_out[0]);
+    close(dynamic_out[1]);
+}
+
+static void test_user_dynamic_slirp_resync_removes_stale_and_unregisters(void)
+{
+    struct semu_event_loop loop;
+    int stale[2] = {-1, -1};
+    int kept[2] = {-1, -1};
+    int stale_read_fd;
+
+    configure_net();
+    configure_fake_slirp();
+    require_int("stale dynamic pipe", pipe(stale), 0);
+    require_int("kept dynamic pipe", pipe(kept), 0);
+    fake_slirp_set_dynamic(
+        0, stale[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+    fake_slirp_set_dynamic(
+        1, kept[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("stale dynamic fd initially registered",
+                 event_loop_find_fd(&loop, stale[0]) >= 0, true);
+    require_bool("kept dynamic fd initially registered",
+                 event_loop_find_fd(&loop, kept[0]) >= 0, true);
+
+    stale_read_fd = stale[0];
+    close(stale[0]);
+    stale[0] = -1;
+    fake_slirp_dynamic_count = 0;
+    fake_slirp_set_dynamic(
+        0, kept[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+    require_int("net event resync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("closed stale dynamic fd removed",
+                 event_loop_find_fd(&loop, stale_read_fd) < 0, true);
+    require_bool("kept dynamic fd remains registered",
+                 event_loop_find_fd(&loop, kept[0]) >= 0, true);
+
+    virtio_net_event_unregister(&emu.vnet, &loop,
+                                SEMU_EVENT_TOKEN_FIRST_DEVICE);
+    require_bool("user rx stable fd unregistered",
+                 event_loop_find_fd(
+                     &loop,
+                     user_net.guest_to_host_channel[SLIRP_READ_SIDE]) < 0,
+                 true);
+    require_bool("slirp stable fd unregistered",
+                 event_loop_find_fd(
+                     &loop,
+                     user_net.host_to_guest_channel[SLIRP_READ_SIDE]) < 0,
+                 true);
+    require_bool("dynamic fd unregistered",
+                 event_loop_find_fd(&loop, kept[0]) < 0, true);
+
+    semu_event_loop_destroy(&loop);
+    close(stale[1]);
+    close(kept[0]);
+    close(kept[1]);
+}
+
+static void test_user_dynamic_slirp_resync_removes_closed_current_fd(void)
+{
+    struct semu_event_loop loop;
+    int dynamic[2] = {-1, -1};
+    int dynamic_read_fd;
+
+    configure_net();
+    configure_fake_slirp();
+    require_int("dynamic pipe", pipe(dynamic), 0);
+    fake_slirp_set_dynamic(
+        0, dynamic[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("dynamic fd initially registered",
+                 event_loop_find_fd(&loop, dynamic[0]) >= 0, true);
+
+    dynamic_read_fd = dynamic[0];
+    close(dynamic[0]);
+    dynamic[0] = -1;
+    require_int("net event resync after current dynamic close",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("closed current dynamic fd removed",
+                 event_loop_find_fd(&loop, dynamic_read_fd) < 0, true);
+
+    semu_event_loop_destroy(&loop);
+    close(dynamic[1]);
+}
+
+static void test_user_dynamic_slirp_capacity_falls_back_without_failing(void)
+{
+    struct semu_event_loop loop;
+    int dynamic[2] = {-1, -1};
+    int dummy[SEMU_EVENT_LOOP_MAX_FDS][2];
+    size_t dummy_count = 0;
+
+    for (size_t i = 0; i < SEMU_EVENT_LOOP_MAX_FDS; i++) {
+        dummy[i][0] = -1;
+        dummy[i][1] = -1;
+    }
+
+    configure_net();
+    configure_fake_slirp();
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("initial net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+
+    while (loop.count < SEMU_EVENT_LOOP_MAX_FDS) {
+        require_bool("dummy capacity bound", dummy_count < SEMU_EVENT_LOOP_MAX_FDS,
+                     true);
+        require_int("dummy pipe", pipe(dummy[dummy_count]), 0);
+        require_int("dummy add fd",
+                    semu_event_add_fd(
+                        &loop, dummy[dummy_count][0],
+                        1000U + (semu_event_token_t) dummy_count,
+                        SEMU_EVENT_READABLE),
+                    0);
+        dummy_count++;
+    }
+
+    require_int("dynamic pipe", pipe(dynamic), 0);
+    fake_slirp_set_dynamic(
+        0, dynamic[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+    require_int("net event sync with full loop",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_bool("dynamic fd not registered when loop full",
+                 event_loop_find_fd(&loop, dynamic[0]) < 0, true);
+
+    semu_event_loop_destroy(&loop);
+    close(dynamic[0]);
+    close(dynamic[1]);
+    for (size_t i = 0; i < dummy_count; i++) {
+        close(dummy[i][0]);
+        close(dummy[i][1]);
+    }
+}
+
+static void test_user_dynamic_slirp_event_pumps_revents(void)
+{
+    struct semu_event_loop loop;
+    struct semu_event event = {0};
+    int dynamic[2] = {-1, -1};
+
+    configure_net();
+    configure_fake_slirp();
+    require_int("dynamic pipe", pipe(dynamic), 0);
+    fake_slirp_set_dynamic(
+        0, dynamic[0],
+        SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    require_int("write dynamic byte", (int) write(dynamic[1], "x", 1), 1);
+    require_int("wait dynamic event", semu_event_wait(&loop, &event, 1, 100),
+                1);
+    require_u32("dynamic event token", event.token,
+                TEST_VNET_DYNAMIC_TOKEN(SEMU_EVENT_TOKEN_FIRST_DEVICE));
+    require_bool("dynamic event handled",
+                 virtio_net_event_handle(&emu.vnet, &event,
+                                         SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                 true);
+    require_int("dynamic event pumped slirp", fake_slirp_poll_calls, 1);
+    require_int("dynamic event select_error", fake_slirp_last_select_error, 0);
+    require_int("dynamic event revents count",
+                (int) fake_slirp_last_revents_count, 1);
+    require_bool("dynamic event reported readable revents",
+                 (fake_slirp_last_revents[0] & SLIRP_POLL_IN) != 0, true);
+
+    semu_event_loop_destroy(&loop);
+    close(dynamic[0]);
+    close(dynamic[1]);
+}
+
 static void test_user_internal_rx_event_drives_rx_actor_work(void)
 {
     struct semu_event_loop loop;
@@ -848,6 +1212,21 @@ int main(void)
     destroy_net_fixture();
 
     test_net_event_sync_avoids_ready_tx_writable_subscription();
+    destroy_net_fixture();
+
+    test_user_dynamic_slirp_fds_register_with_event_masks();
+    destroy_net_fixture();
+
+    test_user_dynamic_slirp_resync_removes_stale_and_unregisters();
+    destroy_net_fixture();
+
+    test_user_dynamic_slirp_resync_removes_closed_current_fd();
+    destroy_net_fixture();
+
+    test_user_dynamic_slirp_capacity_falls_back_without_failing();
+    destroy_net_fixture();
+
+    test_user_dynamic_slirp_event_pumps_revents();
     destroy_net_fixture();
 
     test_user_internal_rx_event_drives_rx_actor_work();

@@ -164,6 +164,8 @@ static void test_del_fd_removes_registration(void)
     struct semu_event_loop loop;
     struct semu_event_notifier notifier = {0};
     struct semu_event event = {0};
+    int fds[2] = {-1, -1};
+    int closed_fd;
 
     require_int("loop init", semu_event_loop_init(&loop, "test-loop"), 0);
     require_int("notifier init", semu_event_notifier_init(&notifier), 0);
@@ -176,6 +178,16 @@ static void test_del_fd_removes_registration(void)
     require_int("signal after del", semu_event_notifier_signal(&notifier), 0);
     require_int("wait after del times out",
                 semu_event_wait(&loop, &event, 1, 0), 0);
+
+    require_int("pipe for closed fd deletion", pipe(fds), 0);
+    require_int("add soon-closed fd",
+                semu_event_add_fd(&loop, fds[0], 78, SEMU_EVENT_READABLE), 0);
+    closed_fd = fds[0];
+    close(fds[0]);
+    fds[0] = -1;
+    require_int("del closed registered fd", semu_event_del_fd(&loop, closed_fd),
+                0);
+    close(fds[1]);
 
     semu_event_notifier_destroy(&notifier);
     semu_event_loop_destroy(&loop);

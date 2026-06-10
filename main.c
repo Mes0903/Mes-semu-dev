@@ -2818,7 +2818,8 @@ static void io_unregister_events_threaded(emu_state_t *emu,
 {
 #if SEMU_HAS(VIRTIONET)
     EMU_DEVICE_CALL(emu->vnet_lock,
-                    virtio_net_event_unregister(&emu->vnet, event_loop));
+                    virtio_net_event_unregister(
+                        &emu->vnet, event_loop, SEMU_IO_EVENT_TOKEN_VNET));
 #else
     (void) emu;
     (void) event_loop;

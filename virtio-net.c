@@ -31,7 +31,8 @@ enum {
     VNET_EVENT_USER_RX = 1,
     VNET_EVENT_USER_SLIRP_IN = 2,
     VNET_EVENT_USER_TX = 3,
-    VNET_EVENT_COUNT = 4,
+    VNET_EVENT_USER_DYNAMIC = 4,
+    VNET_EVENT_COUNT = 5,
 };
 
 PACKED(struct virtio_net_config {
@@ -1079,6 +1080,136 @@ static uint32_t virtio_net_tx_event_mask(virtio_net_state_t *vnet)
                : SEMU_EVENT_WRITABLE;
 }
 
+static bool virtio_net_user_slirp_pollfds_available(
+    const net_user_options_t *usr)
+{
+    return usr && usr->slirp && usr->pfd && usr->pfd_size >= 2;
+}
+
+static void virtio_net_user_refresh_dynamic_pollfds(net_user_options_t *usr)
+{
+    uint32_t timeout = 0;
+
+    if (!virtio_net_user_slirp_pollfds_available(usr))
+        return;
+
+    usr->pfd_len = 2;
+    slirp_pollfds_fill_socket(usr->slirp, &timeout,
+                              semu_slirp_add_poll_socket, usr);
+}
+
+static uint32_t virtio_net_poll_events_to_semu(short events)
+{
+    uint32_t mask = 0;
+
+    if (events & (POLLIN | POLLPRI))
+        mask |= SEMU_EVENT_READABLE;
+    if (events & POLLOUT)
+        mask |= SEMU_EVENT_WRITABLE;
+    if (events & (POLLERR | POLLHUP | POLLNVAL))
+        mask |= SEMU_EVENT_ERROR;
+    return mask;
+}
+
+static bool virtio_net_user_dynamic_fd_current(const net_user_options_t *usr,
+                                               int fd)
+{
+    if (!usr || !usr->pfd || fd < 0 || usr->pfd_len <= 2)
+        return false;
+
+    for (int i = 2; i < usr->pfd_len; i++) {
+        if (usr->pfd[i].fd == fd)
+            return true;
+    }
+    return false;
+}
+
+static int virtio_net_event_del_token(struct semu_event_loop *loop,
+                                      semu_event_token_t token)
+{
+    size_t i = 0;
+
+    while (i < loop->count) {
+        int ret;
+
+        if (loop->tokens[i] != token) {
+            i++;
+            continue;
+        }
+
+        ret = virtio_net_event_del_fd(loop, loop->fds[i]);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
+static int virtio_net_event_prune_user_dynamic(
+    struct semu_event_loop *loop,
+    const net_user_options_t *usr,
+    semu_event_token_t token_base)
+{
+    semu_event_token_t token =
+        virtio_net_event_token(token_base, VNET_EVENT_USER_DYNAMIC);
+    size_t i = 0;
+
+    while (i < loop->count) {
+        int ret;
+
+        if (loop->tokens[i] != token ||
+            virtio_net_user_dynamic_fd_current(usr, loop->fds[i])) {
+            i++;
+            continue;
+        }
+
+        ret = virtio_net_event_del_fd(loop, loop->fds[i]);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
+static int virtio_net_event_sync_user_dynamic(
+    struct semu_event_loop *loop,
+    net_user_options_t *usr,
+    semu_event_token_t token_base)
+{
+    semu_event_token_t token =
+        virtio_net_event_token(token_base, VNET_EVENT_USER_DYNAMIC);
+    int ret;
+
+    if (virtio_net_user_slirp_pollfds_available(usr))
+        virtio_net_user_refresh_dynamic_pollfds(usr);
+    else if (usr && usr->pfd && usr->pfd_size >= 2)
+        usr->pfd_len = 2;
+
+    ret = virtio_net_event_prune_user_dynamic(loop, usr, token_base);
+    if (ret < 0)
+        return ret;
+    if (!virtio_net_user_slirp_pollfds_available(usr))
+        return 0;
+
+    for (int i = 2; i < usr->pfd_len; i++) {
+        ret = virtio_net_event_upsert_fd(
+            loop, usr->pfd[i].fd, token,
+            virtio_net_poll_events_to_semu(usr->pfd[i].events));
+        if (ret == -ENOSPC) {
+            /* Dynamic Slirp sockets are opportunistic subscriptions. If the
+             * fixed-capacity event loop is full, keep the VM running and let
+             * the periodic Slirp pump cover the remaining transient sockets.
+             */
+            return 0;
+        }
+        if (ret == -EBADF) {
+            (void) virtio_net_event_del_fd(loop, usr->pfd[i].fd);
+            continue;
+        }
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
 int virtio_net_event_sync(virtio_net_state_t *vnet,
                           struct semu_event_loop *loop,
                           semu_event_token_t token_base)
@@ -1129,10 +1260,14 @@ int virtio_net_event_sync(virtio_net_state_t *vnet,
         if (ret < 0)
             return ret;
 
-        return virtio_net_event_upsert_fd(
+        ret = virtio_net_event_upsert_fd(
             loop, usr->host_to_guest_channel[SLIRP_WRITE_SIDE],
             virtio_net_event_token(token_base, VNET_EVENT_USER_TX),
             virtio_net_tx_event_mask(vnet));
+        if (ret < 0)
+            return ret;
+
+        return virtio_net_event_sync_user_dynamic(loop, usr, token_base);
     }
     default:
         return 0;
@@ -1200,6 +1335,9 @@ bool virtio_net_event_handle(virtio_net_state_t *vnet,
                 virtio_net_notify_if_active(vnet, VNET_QUEUE_TX);
             }
             return true;
+        case VNET_EVENT_USER_DYNAMIC:
+            virtio_net_pump_user_slirp_dynamic(vnet, usr);
+            return true;
         default:
             return false;
         }
@@ -1214,12 +1352,17 @@ void virtio_net_event_poll_fallback(virtio_net_state_t *vnet)
     if (!vnet || !vnet->peer.op || vnet->peer.type != NETDEV_IMPL_user)
         return;
 
+    /* Dynamic Slirp sockets are subscribed through semu_event_loop during sync.
+     * Keep this periodic pump for libslirp timer bookkeeping and socket-list
+     * churn that can occur without a host fd readiness edge.
+     */
     virtio_net_pump_user_slirp_dynamic(
         vnet, (net_user_options_t *) vnet->peer.op);
 }
 
 void virtio_net_event_unregister(virtio_net_state_t *vnet,
-                                 struct semu_event_loop *loop)
+                                 struct semu_event_loop *loop,
+                                 semu_event_token_t token_base)
 {
     if (!vnet || !loop || !vnet->peer.op)
         return;
@@ -1245,6 +1388,9 @@ void virtio_net_event_unregister(virtio_net_state_t *vnet,
             loop, usr->host_to_guest_channel[SLIRP_READ_SIDE]);
         (void) virtio_net_event_del_fd(
             loop, usr->host_to_guest_channel[SLIRP_WRITE_SIDE]);
+        (void) virtio_net_event_del_token(
+            loop,
+            virtio_net_event_token(token_base, VNET_EVENT_USER_DYNAMIC));
         break;
     }
     default:
