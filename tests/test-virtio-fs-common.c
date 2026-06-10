@@ -21,10 +21,16 @@ static bool test_ram_dma_write(ram_dma_t *dma,
                                guest_paddr_t addr,
                                const void *buf,
                                guest_size_t len);
+static ssize_t test_virtio_fs_pread(int fd,
+                                    void *buf,
+                                    size_t count,
+                                    off_t offset);
 
 #define ram_dma_read test_ram_dma_read
 #define ram_dma_write test_ram_dma_write
+#define VIRTIO_FS_PREAD test_virtio_fs_pread
 #include "../virtio-fs.c"
+#undef VIRTIO_FS_PREAD
 #undef ram_dma_write
 #undef ram_dma_read
 
@@ -55,6 +61,65 @@ static emu_state_t emu;
 static unsigned wake_count;
 static struct virtio_device_common *reset_start_on_avail_read_common;
 static guest_paddr_t reset_start_on_avail_read_addr;
+
+struct test_pread_op {
+    ssize_t ret;
+    int err;
+    const void *data;
+};
+
+static struct {
+    int fd;
+    const struct test_pread_op *ops;
+    size_t op_count;
+    size_t call_count;
+} test_pread_script = {
+    .fd = -1,
+};
+
+static void test_pread_script_clear(void)
+{
+    test_pread_script.fd = -1;
+    test_pread_script.ops = NULL;
+    test_pread_script.op_count = 0;
+    test_pread_script.call_count = 0;
+}
+
+static void test_pread_script_set(int fd,
+                                  const struct test_pread_op *ops,
+                                  size_t op_count)
+{
+    test_pread_script.fd = fd;
+    test_pread_script.ops = ops;
+    test_pread_script.op_count = op_count;
+    test_pread_script.call_count = 0;
+}
+
+static ssize_t test_virtio_fs_pread(int fd,
+                                    void *buf,
+                                    size_t count,
+                                    off_t offset)
+{
+    if (fd == test_pread_script.fd &&
+        test_pread_script.call_count < test_pread_script.op_count) {
+        const struct test_pread_op *op =
+            &test_pread_script.ops[test_pread_script.call_count++];
+
+        if (op->ret < 0) {
+            errno = op->err;
+            return -1;
+        }
+        if ((size_t) op->ret > count) {
+            fprintf(stderr, "scripted pread count exceeds request\n");
+            exit(1);
+        }
+        if (op->ret > 0)
+            memcpy(buf, op->data, (size_t) op->ret);
+        return op->ret;
+    }
+
+    return pread(fd, buf, count, offset);
+}
 
 struct dma_gate {
     pthread_mutex_t lock;
@@ -1152,6 +1217,170 @@ static void test_read_host_pread_failure_returns_ebadf_without_reset(void)
     remove_shared_file_tree(shared_dir, "file.txt");
 }
 
+static void open_shared_test_file(char *dir_template,
+                                  char **shared_dir,
+                                  struct fuse_entry_out *entry_out,
+                                  struct fuse_open_out *open_out)
+{
+    struct vfs_resp_header header;
+    const uint16_t queue = 1;
+
+    create_shared_file(dir_template, "file.txt", TEST_FILE_CONTENT,
+                       shared_dir);
+    setup_fixture_with_dir(*shared_dir);
+
+    publish_lookup_request(queue, 0x2201, 1, "file.txt", strlen("file.txt"));
+    submit_queue_head(queue, 0, 0);
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    dma_read(ENTRY_OUT_ADDR, entry_out, sizeof(*entry_out));
+    require_int("scripted read lookup file error", header.out.error, 0);
+    require_bool("scripted read lookup file nodeid", entry_out->nodeid != 0,
+                 true);
+    ack_used_irq();
+
+    publish_open_request(queue, 0x2202, entry_out->nodeid);
+    submit_queue_head(queue, 1, 0);
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    dma_read(OPEN_OUT_ADDR, open_out, sizeof(*open_out));
+    require_int("scripted read open file error", header.out.error, 0);
+    require_bool("scripted read open handle id", open_out->fh != 0, true);
+    ack_used_irq();
+}
+
+static void require_scripted_read_completion(uint16_t queue,
+                                             uint16_t avail_idx,
+                                             uint32_t expected_len,
+                                             int expected_error)
+{
+    struct vfs_resp_header header;
+    guest_paddr_t used_elem = USED_ADDR(queue) + 4 +
+                              (guest_paddr_t) (avail_idx % QUEUE_SIZE) * 8;
+
+    dma_read(RESP_HDR_ADDR, &header, sizeof(header));
+    require_u16("scripted read used idx", read16(USED_ADDR(queue) + 2),
+                (uint16_t) (avail_idx + 1));
+    require_u32("scripted read used id", read32(used_elem), 0);
+    require_u32("scripted read used len", read32(used_elem + 4), expected_len);
+    require_u32("scripted read response len", header.out.len, expected_len);
+    require_int("scripted read response error", header.out.error,
+                expected_error);
+    require_u32("scripted read irq status", mmio_read(REG(InterruptStatus)),
+                VIRTIO_INT__USED_RING);
+    require_bool("scripted read irq line",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VFS), true);
+    require_u32("scripted read needs-reset remains clear",
+                mmio_read(REG(Status)) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+}
+
+static void test_read_host_pread_eintr_retries_and_succeeds_without_reset(void)
+{
+    struct fuse_entry_out entry_out;
+    struct fuse_open_out open_out;
+    virtio_fs_handle_entry *handle;
+    char payload[] = "retry";
+    char contents[sizeof(payload)] = {0};
+    const struct test_pread_op ops[] = {
+        {.ret = -1, .err = EINTR},
+        {.ret = (ssize_t) strlen(payload), .data = payload},
+    };
+    char dir_template[] = "/tmp/semu-vfs-test-XXXXXX";
+    char *shared_dir = NULL;
+    const uint16_t queue = 1;
+
+    open_shared_test_file(dir_template, &shared_dir, &entry_out, &open_out);
+    handle = virtio_fs_find_handle(&emu.vfs, open_out.fh,
+                                   VIRTIO_FS_HANDLE_FILE);
+    require_bool("scripted EINTR host handle found", handle != NULL, true);
+    test_pread_script_set(handle->fd, ops, sizeof(ops) / sizeof(ops[0]));
+
+    publish_read_request(queue, 0x2203, entry_out.nodeid, open_out.fh,
+                         strlen(TEST_FILE_CONTENT));
+    submit_queue_head(queue, 2, 0);
+
+    require_u32("scripted EINTR pread retries", test_pread_script.call_count,
+                2);
+    require_scripted_read_completion(
+        queue, 2, sizeof(struct fuse_out_header) + strlen(payload), 0);
+    dma_read(READ_OUT_ADDR, contents, strlen(payload));
+    require_bool("scripted EINTR payload",
+                 memcmp(contents, payload, strlen(payload)) == 0, true);
+    ack_used_irq();
+
+    test_pread_script_clear();
+    teardown_fixture();
+    remove_shared_file_tree(shared_dir, "file.txt");
+}
+
+static void test_read_host_pread_eio_returns_header_without_reset(void)
+{
+    struct fuse_entry_out entry_out;
+    struct fuse_open_out open_out;
+    virtio_fs_handle_entry *handle;
+    const struct test_pread_op ops[] = {
+        {.ret = -1, .err = EIO},
+    };
+    char dir_template[] = "/tmp/semu-vfs-test-XXXXXX";
+    char *shared_dir = NULL;
+    const uint16_t queue = 1;
+
+    open_shared_test_file(dir_template, &shared_dir, &entry_out, &open_out);
+    handle = virtio_fs_find_handle(&emu.vfs, open_out.fh,
+                                   VIRTIO_FS_HANDLE_FILE);
+    require_bool("scripted EIO host handle found", handle != NULL, true);
+    test_pread_script_set(handle->fd, ops, sizeof(ops) / sizeof(ops[0]));
+
+    publish_read_request(queue, 0x2303, entry_out.nodeid, open_out.fh,
+                         strlen(TEST_FILE_CONTENT));
+    submit_queue_head(queue, 2, 0);
+
+    require_u32("scripted EIO pread calls", test_pread_script.call_count, 1);
+    require_scripted_read_completion(queue, 2, sizeof(struct fuse_out_header),
+                                     -EIO);
+    ack_used_irq();
+
+    test_pread_script_clear();
+    teardown_fixture();
+    remove_shared_file_tree(shared_dir, "file.txt");
+}
+
+static void test_read_host_pread_short_success_without_reset(void)
+{
+    struct fuse_entry_out entry_out;
+    struct fuse_open_out open_out;
+    virtio_fs_handle_entry *handle;
+    char payload[] = "short";
+    char contents[sizeof(payload)] = {0};
+    const struct test_pread_op ops[] = {
+        {.ret = (ssize_t) strlen(payload), .data = payload},
+    };
+    char dir_template[] = "/tmp/semu-vfs-test-XXXXXX";
+    char *shared_dir = NULL;
+    const uint16_t queue = 1;
+
+    open_shared_test_file(dir_template, &shared_dir, &entry_out, &open_out);
+    handle = virtio_fs_find_handle(&emu.vfs, open_out.fh,
+                                   VIRTIO_FS_HANDLE_FILE);
+    require_bool("scripted short host handle found", handle != NULL, true);
+    test_pread_script_set(handle->fd, ops, sizeof(ops) / sizeof(ops[0]));
+
+    publish_read_request(queue, 0x2403, entry_out.nodeid, open_out.fh,
+                         strlen(TEST_FILE_CONTENT));
+    submit_queue_head(queue, 2, 0);
+
+    require_u32("scripted short pread calls", test_pread_script.call_count, 1);
+    require_scripted_read_completion(
+        queue, 2, sizeof(struct fuse_out_header) + strlen(payload), 0);
+    dma_read(READ_OUT_ADDR, contents, strlen(payload));
+    require_bool("scripted short payload",
+                 memcmp(contents, payload, strlen(payload)) == 0, true);
+    ack_used_irq();
+
+    test_pread_script_clear();
+    teardown_fixture();
+    remove_shared_file_tree(shared_dir, "file.txt");
+}
+
 static void test_invalid_releasedir_handle_returns_ebadf(void)
 {
     struct vfs_resp_header header;
@@ -1332,6 +1561,9 @@ int main(void)
     test_lookup_rejects_embedded_nul_name();
     test_lookup_open_read_release_valid_file();
     test_read_host_pread_failure_returns_ebadf_without_reset();
+    test_read_host_pread_eintr_retries_and_succeeds_without_reset();
+    test_read_host_pread_eio_returns_header_without_reset();
+    test_read_host_pread_short_success_without_reset();
     test_invalid_read_handle_returns_ebadf();
     test_invalid_releasedir_handle_returns_ebadf();
     test_invalid_queue_notify_sets_needs_reset();
