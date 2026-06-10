@@ -134,7 +134,7 @@ static void init_vgpu_test_state(emu_state_t *emu,
     emu->ram = ram;
     ram_dma_init(&emu->ram_dma, ram, ram_size, NULL);
     require_int("plic lock init", pthread_mutex_init(&emu->plic_lock, NULL), 0);
-    virtio_gpu_init(vgpu, emu);
+    virtio_gpu_init(vgpu, emu, true);
 }
 
 static void destroy_vgpu_test_state(emu_state_t *emu, virtio_gpu_state_t *vgpu)

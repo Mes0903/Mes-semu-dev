@@ -270,16 +270,25 @@ static void require_debug_counters_zero(
     require_u64("actor failed callbacks", counters->actor_failed_callbacks, 0);
 }
 
-static void init_vgpu_test_state(emu_state_t *emu,
-                                 virtio_gpu_state_t *vgpu,
-                                 uint32_t *ram,
-                                 size_t ram_size)
+static void init_vgpu_test_state_with_virgl(emu_state_t *emu,
+                                            virtio_gpu_state_t *vgpu,
+                                            uint32_t *ram,
+                                            size_t ram_size,
+                                            bool enable_virgl_runtime)
 {
     memset(emu, 0, sizeof(*emu));
     emu->ram = ram;
     ram_dma_init(&emu->ram_dma, ram, ram_size, NULL);
     require_int("plic lock init", pthread_mutex_init(&emu->plic_lock, NULL), 0);
-    virtio_gpu_init(vgpu, emu);
+    virtio_gpu_init(vgpu, emu, enable_virgl_runtime);
+}
+
+static void init_vgpu_test_state(emu_state_t *emu,
+                                 virtio_gpu_state_t *vgpu,
+                                 uint32_t *ram,
+                                 size_t ram_size)
+{
+    init_vgpu_test_state_with_virgl(emu, vgpu, ram, ram_size, true);
 }
 
 static void destroy_vgpu_test_state(emu_state_t *emu, virtio_gpu_state_t *vgpu)
@@ -4300,6 +4309,8 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
         (struct virtio_gpu_ctx_resource *) ((uint8_t *) ram + 0x180);
     struct virtio_gpu_ctx_resource *detach =
         (struct virtio_gpu_ctx_resource *) ((uint8_t *) ram + 0x1c0);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x100);
     uint32_t len = 0;
     const uint64_t renderer_generation = 0x72;
 
@@ -4346,6 +4357,17 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     require_u32("ctx create response capacity", payload->response_capacity,
                 sizeof(struct virtio_gpu_ctrl_hdr));
     queued.release_payload(queued.payload);
+
+    create->context_init = VIRTIO_GPU_CAPSET_VIRGL2;
+    len = 0;
+    response->type = 0;
+
+    g_virtio_gpu_backend.ctx_create(&vgpu, desc, &len);
+    require_u32("unsupported ctx init response len", len, sizeof(*response));
+    require_u32("unsupported ctx init response", response->type,
+                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    require_int("unsupported ctx init queues no renderer work",
+                vgpu_renderer_pop_request(&queued), false);
 
     vgpu.ctrl_dispatch.desc_head = 9;
     destroy->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
@@ -4682,6 +4704,38 @@ static void test_vgpu_common_reset_queues_renderer_reset_request(void)
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
+
+static void test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    uint64_t old_generation;
+
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    old_generation = vgpu.common.generation;
+    virtio_gpu_disable_virgl_runtime(&vgpu);
+
+    require_int("common reset after disabled virgl",
+                virtio_device_common_reset(&vgpu.common), 0);
+    require_false("disabled reset advanced common generation",
+                  vgpu.common.generation == old_generation);
+    require_u64("disabled reset keeps VirGL feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
+    require_u64("disabled reset keeps context-init hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+
+    struct vgpu_renderer_request request = {0};
+    require_int("disabled reset queues no renderer request",
+                vgpu_renderer_pop_request(&request), false);
+
+    struct vgpu_renderer_debug_stats renderer_stats;
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_false("disabled reset keeps renderer unavailable",
+                  renderer_stats.available);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
 #endif
 
 static void test_vgpu_display_counters_snapshot_reads_existing_counters(void)
@@ -4846,13 +4900,7 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
                 VIRTIO_GPU_F_CONTEXT_INIT);
     require_u64("resource-blob feature hidden",
                 vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
-    require_u32("host-visible SHM configured", vgpu.common.has_shm_region, 1);
-    require_u32("host-visible SHM id", vgpu.common.shm_region.id,
-                VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
-    require_u64("host-visible SHM base", vgpu.common.shm_region.base,
-                SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
-    require_u64("host-visible SHM length", vgpu.common.shm_region.length,
-                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+    require_false("host-visible SHM hidden", vgpu.common.has_shm_region);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
@@ -4862,7 +4910,52 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
-    require_u32("classic virgl capsets visible", num_capsets, 5);
+    require_u32("classic virgl capsets clamped", num_capsets, 1);
+
+    virtio_gpu_disable_virgl_runtime(&vgpu);
+    require_u64("fallback VirGL feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
+    require_u64("fallback context-init feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_u64("fallback resource-blob feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
+    require_false("fallback host-visible SHM hidden",
+                  vgpu.common.has_shm_region);
+    num_capsets = vgpu.common.ops->read_config(
+        vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    require_u32("fallback capsets hidden", num_capsets, 0);
+    struct vgpu_renderer_debug_stats renderer_stats;
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_false("fallback renderer queue unavailable",
+                  renderer_stats.available);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+
+    init_vgpu_test_state_with_virgl(&emu, &vgpu, ram, sizeof(ram), false);
+
+    require_u64("headless VirGL feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
+    require_u64("headless context-init feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_u64("headless resource-blob feature hidden",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
+    require_false("headless host-visible SHM hidden",
+                  vgpu.common.has_shm_region);
+    num_capsets = vgpu.common.ops->read_config(
+        vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    require_u32("headless capsets hidden", num_capsets, 0);
+
+    virtio_gpu_set_num_capsets(&vgpu, 5);
+    num_capsets = vgpu.common.ops->read_config(
+        vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    require_u32("headless capsets remain hidden", num_capsets, 0);
+
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_false("headless renderer queue unavailable",
+                  renderer_stats.available);
 
     destroy_vgpu_test_state(&emu, &vgpu);
 }
@@ -5396,7 +5489,7 @@ static void test_vgpu_destroy_stops_started_actor_and_is_idempotent(void)
     ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
     require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
 
-    virtio_gpu_init(&vgpu, &emu);
+    virtio_gpu_init(&vgpu, &emu, true);
     require_int("start actor", virtio_actor_start(&vgpu.actor), 0);
 
     virtio_gpu_destroy(&vgpu);
@@ -5432,7 +5525,7 @@ static void test_vgpu_destroy_shutdowns_renderer_queue(void)
     ram_dma_init(&emu.ram_dma, ram, sizeof(ram), NULL);
     require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
 
-    virtio_gpu_init(&vgpu, &emu);
+    virtio_gpu_init(&vgpu, &emu, true);
     generation = vgpu.common.generation;
 
     renderer_release_payload_count = 0;
@@ -5503,6 +5596,7 @@ int main(void)
     test_vgpu_debug_counters_init_and_reset_to_zero();
 #if SEMU_HAS(VIRGL)
     test_vgpu_common_reset_queues_renderer_reset_request();
+    test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable();
 #endif
     test_vgpu_display_counters_snapshot_reads_existing_counters();
     test_undefined_command_returns_device_error();
