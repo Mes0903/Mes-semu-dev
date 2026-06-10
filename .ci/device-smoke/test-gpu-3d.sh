@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/../common.sh"
+
+export ENABLE_VIRGL="${ENABLE_VIRGL:-1}"
+export HEADLESS="${HEADLESS:-0}"
+export DISKIMG_FILE="${DISKIMG_FILE:-test-tools.img}"
+export NETDEV="${NETDEV:-user}"
+export SMP="${SMP:-2}"
+export EXECUTOR="${EXECUTOR:-threaded-cpu-with-device-actors}"
+
+case "${OS_TYPE}" in
+    Darwin)
+        DEFAULT_BOOT_TIMEOUT=10800
+        DEFAULT_CMD_TIMEOUT=600
+        DEFAULT_GLXINFO_RETRIES=90
+        DEFAULT_XORG_RETRIES=90
+        DEFAULT_GLXGEARS_SECONDS=10
+        ;;
+    *)
+        DEFAULT_BOOT_TIMEOUT=300
+        DEFAULT_CMD_TIMEOUT=180
+        DEFAULT_GLXINFO_RETRIES=45
+        DEFAULT_XORG_RETRIES=45
+        DEFAULT_GLXGEARS_SECONDS=5
+        ;;
+esac
+
+export TIMEOUT="${VGPU3D_BOOT_TIMEOUT:-${SEMU_TEST_TIMEOUT:-${DEFAULT_BOOT_TIMEOUT}}}"
+export VGPU3D_CMD_TIMEOUT="${VGPU3D_CMD_TIMEOUT:-${DEFAULT_CMD_TIMEOUT}}"
+export VGPU3D_GLXINFO_RETRIES="${VGPU3D_GLXINFO_RETRIES:-${DEFAULT_GLXINFO_RETRIES}}"
+export VGPU3D_GLXINFO_SLEEP="${VGPU3D_GLXINFO_SLEEP:-1}"
+export VGPU3D_XORG_RETRIES="${VGPU3D_XORG_RETRIES:-${DEFAULT_XORG_RETRIES}}"
+export VGPU3D_XORG_SLEEP="${VGPU3D_XORG_SLEEP:-1}"
+export VGPU3D_GLXGEARS_SECONDS="${VGPU3D_GLXGEARS_SECONDS:-${DEFAULT_GLXGEARS_SECONDS}}"
+
+case "${HEADLESS}" in
+    0|false|no)
+        if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+            print_error "FAIL: visible vgpu 3D smoke needs host DISPLAY or WAYLAND_DISPLAY"
+            exit 1
+        fi
+        ;;
+esac
+
+if ! command -v sdl2-config >/dev/null 2>&1; then
+    print_error "FAIL: vgpu 3D smoke needs sdl2-config in PATH"
+    exit 1
+fi
+
+case "${ENABLE_VIRGL}" in
+    1|true|yes)
+        if ! command -v pkg-config >/dev/null 2>&1 ||
+           ! pkg-config --exists virglrenderer epoxy gl egl; then
+            print_error "FAIL: vgpu 3D smoke needs pkg-config packages: virglrenderer epoxy gl egl"
+            exit 1
+        fi
+        ;;
+esac
+
+cleanup
+trap cleanup EXIT
+
+echo "Running vgpu 3D smoke: ENABLE_VIRGL=${ENABLE_VIRGL} HEADLESS=${HEADLESS} DISKIMG_FILE=${DISKIMG_FILE} NETDEV=${NETDEV} SMP=${SMP} EXECUTOR=${EXECUTOR}"
+
+# Feature toggles are passed through environment variables, which do not
+# participate in make's normal dependency tracking. Force a rebuild here so
+# virgl/windowed/SMP test runs never reuse a stale semu binary or DTB.
+make -B semu minimal.dtb
+
+if [ ! -f Image ] || [ ! -f rootfs.cpio ]; then
+    make Image rootfs.cpio
+fi
+if [ ! -f test-tools.img ]; then
+    make test-tools.img
+fi
+if [[ "${DISKIMG_FILE}" != "test-tools.img" && ! -f "${DISKIMG_FILE}" ]]; then
+    print_error "FAIL: DISKIMG_FILE not found: ${DISKIMG_FILE}"
+    exit 1
+fi
+
+# NOTE: We want to capture the 'expect' exit code and map it to our MESSAGES
+# array for meaningful error output. Temporarily disable 'errexit' for the
+# 'expect' call.
+set +e
+expect <<'DONE'
+set timeout $env(TIMEOUT)
+spawn make check
+
+# Boot and login
+expect "buildroot login:" { send "root\r" } timeout { exit 1 }
+expect "# "              { send "uname -a\r" } timeout { exit 2 }
+expect "riscv32 GNU/Linux" {}
+
+set timeout $env(VGPU3D_CMD_TIMEOUT)
+
+# ---------------- virtio-gpu basic checks ----------------
+expect "# " { send "ls -la /dev/dri/ 2>/dev/null || true\r" }
+expect "# " { send "if test -c /dev/dri/card0 && test -c /dev/dri/renderD128; then status=OK; else status=MISSING; fi; printf \"__VGPU_DRM_%s__\\n\" \"\$status\"\r" } timeout { exit 3 }
+expect {
+  -exact "__VGPU_DRM_OK__" {}
+  -exact "__VGPU_DRM_MISSING__" { exit 3 }
+  timeout { exit 3 }
+}
+
+expect "# " {
+  send "sh -lc 'if ls /sys/bus/virtio/drivers/virtio_gpu/virtio* >/dev/null 2>&1; then status=OK; else status=BAD; fi; printf \"__VGPU_BIND_%s__\\n\" \"\u0024status\"'\r"
+} timeout { exit 3 }
+expect {
+  -exact "__VGPU_BIND_OK__" {}
+  -exact "__VGPU_BIND_BAD__" {
+    send "ls -l /sys/bus/virtio/drivers/virtio_gpu/ 2>/dev/null || true\r"
+    send "sh -lc 'for d in /sys/bus/virtio/devices/virtio*; do echo \u0024d; ls -l \u0024d/driver 2>/dev/null || true; done'\r"
+    exit 3
+  }
+  timeout { exit 3 }
+}
+
+# ---------------- kernel 3D feature evidence ----------------
+expect "# " { send "dmesg > /tmp/vgpu3d-dmesg.log; grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' /tmp/vgpu3d-dmesg.log | tail -n 120 || true\r" }
+
+expect "# " { send "if grep -Eiq '\\+virgl' /tmp/vgpu3d-dmesg.log; then status=OK; else status=BAD; fi; printf \"__VGPU_DMESG_VIRGL_%s__\\n\" \"\$status\"\r" } timeout { exit 4 }
+expect {
+  -exact "__VGPU_DMESG_VIRGL_OK__" {}
+  -exact "__VGPU_DMESG_VIRGL_BAD__" { exit 4 }
+  timeout { exit 4 }
+}
+
+expect "# " { send "if grep -Eiq 'number of cap[[:space:]]+sets:[[:space:]]*[1-9]|cap[[:space:]]+set.*id[[:space:]]+1' /tmp/vgpu3d-dmesg.log; then status=OK; else status=BAD; fi; printf \"__VGPU_DMESG_CAPSET_%s__\\n\" \"\$status\"\r" } timeout { exit 4 }
+expect {
+  -exact "__VGPU_DMESG_CAPSET_OK__" {}
+  -exact "__VGPU_DMESG_CAPSET_BAD__" { exit 4 }
+  timeout { exit 4 }
+}
+
+expect "# " { send "if grep -Eiq '\\+resource_blob' /tmp/vgpu3d-dmesg.log; then status=OK; else status=BAD; fi; printf \"__VGPU_DMESG_BLOB_%s__\\n\" \"\$status\"\r" } timeout { exit 4 }
+expect {
+  -exact "__VGPU_DMESG_BLOB_OK__" {}
+  -exact "__VGPU_DMESG_BLOB_BAD__" { exit 4 }
+  timeout { exit 4 }
+}
+
+expect "# " { send "if grep -Eiq '\\+host_visible' /tmp/vgpu3d-dmesg.log; then status=OK; else status=BAD; fi; printf \"__VGPU_DMESG_HOST_VISIBLE_%s__\\n\" \"\$status\"\r" } timeout { exit 4 }
+expect {
+  -exact "__VGPU_DMESG_HOST_VISIBLE_OK__" {}
+  -exact "__VGPU_DMESG_HOST_VISIBLE_BAD__" { exit 4 }
+  timeout { exit 4 }
+}
+
+# ---------------- Mesa/X11 3D checks from test-tools.img ----------------
+expect "# " { send "if test -f /root/local-env.sh; then status=OK; else status=MISSING; fi; printf \"__LOCALENV_%s__\\n\" \"\$status\"\r" } timeout { exit 5 }
+expect {
+  -exact "__LOCALENV_OK__" {}
+  -exact "__LOCALENV_MISSING__" { exit 5 }
+  timeout { exit 5 }
+}
+
+expect "# " { send ". /root/local-env.sh >/dev/null 2>&1; if test \$? -eq 0; then status=OK; else status=FAIL; fi; export DISPLAY=:0; printf \"__LOCALENV_SRC_%s__\\n\" \"\$status\"\r" } timeout { exit 5 }
+expect {
+  -exact "__LOCALENV_SRC_OK__" {}
+  -exact "__LOCALENV_SRC_FAIL__" { exit 5 }
+  timeout { exit 5 }
+}
+
+expect "# " {
+  send "ls -l /usr/lib/dri 2>/dev/null || true; if test -f /etc/semu-test-tools-virgl && test -e /usr/lib/dri/virtio_gpu_dri.so; then status=OK; else status=MISSING; fi; printf \"__VIRGL_GUEST_DRIVER_%s__\\n\" \"\$status\"\r"
+} timeout { exit 5 }
+expect {
+  -exact "__VIRGL_GUEST_DRIVER_OK__" {}
+  -exact "__VIRGL_GUEST_DRIVER_MISSING__" { exit 5 }
+  timeout { exit 5 }
+}
+
+expect "# " { send "if command -v glxinfo >/dev/null 2>&1; then status=OK; else status=MISSING; fi; printf \"__GLXINFO_APP_%s__\\n\" \"\$status\"\r" } timeout { exit 5 }
+expect {
+  -exact "__GLXINFO_APP_OK__" {}
+  -exact "__GLXINFO_APP_MISSING__" { exit 5 }
+  timeout { exit 5 }
+}
+
+expect "# " { send "if command -v glxgears >/dev/null 2>&1; then status=OK; else status=MISSING; fi; printf \"__GLXGEARS_APP_%s__\\n\" \"\$status\"\r" } timeout { exit 5 }
+expect {
+  -exact "__GLXGEARS_APP_OK__" {}
+  -exact "__GLXGEARS_APP_MISSING__" { exit 5 }
+  timeout { exit 5 }
+}
+
+expect "# " {
+  send "if test -S /tmp/.X11-unix/X0; then status=RUNNING; elif command -v Xorg >/dev/null 2>&1; then rm -f /tmp/.X0-lock; Xorg :0 -noreset -nolisten tcp >/tmp/xorg.log 2>&1 & echo \$! >/tmp/xorg.pid; status=STARTED; else status=MISSING; fi; printf \"__VIRGL_XORG_%s__\\n\" \"\$status\"\r"
+} timeout { exit 6 }
+expect {
+  -exact "__VIRGL_XORG_RUNNING__" {}
+  -exact "__VIRGL_XORG_STARTED__" {}
+  -exact "__VIRGL_XORG_MISSING__" { exit 6 }
+  timeout { exit 6 }
+}
+
+expect "# " {
+  send "i=0; status=FAIL; while test \u0024i -lt $env(VGPU3D_XORG_RETRIES); do if test -S /tmp/.X11-unix/X0; then status=READY; break; fi; sleep $env(VGPU3D_XORG_SLEEP); i=\u0024((i + 1)); done; printf \"__VIRGL_XORG_%s__\\n\" \"\u0024status\"\r"
+} timeout { exit 6 }
+expect {
+  -exact "__VIRGL_XORG_READY__" {}
+  -exact "__VIRGL_XORG_FAIL__" {
+    send "cat /tmp/xorg.log 2>/dev/null || true\r"
+    exit 6
+  }
+  timeout { exit 6 }
+}
+
+expect "# " {
+  send "rm -f /tmp/vgpu3d-glxinfo.log; i=0; status=FAIL; while test \u0024i -lt $env(VGPU3D_GLXINFO_RETRIES); do DISPLAY=:0 glxinfo -B >/tmp/vgpu3d-glxinfo.log 2>&1 && { status=OK; break; }; i=\u0024((i + 1)); sleep $env(VGPU3D_GLXINFO_SLEEP); done; head -80 /tmp/vgpu3d-glxinfo.log; printf \"__GLXINFO_RUN_%s__\\n\" \"\u0024status\"\r"
+} timeout { exit 7 }
+expect {
+  -exact "__GLXINFO_RUN_OK__" {}
+  -exact "__GLXINFO_RUN_FAIL__" { exit 7 }
+  timeout { exit 7 }
+}
+
+expect "# " { send "if grep -Eiq 'OpenGL renderer string:.*virgl|Device:.*virgl|virgl' /tmp/vgpu3d-glxinfo.log; then status=OK; else status=BAD; echo '--- forced virgl loader diagnostic ---'; DISPLAY=:0 LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B >/tmp/vgpu3d-glxinfo-virtio.log 2>&1 || true; head -120 /tmp/vgpu3d-glxinfo-virtio.log; echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; fi; printf \"__GLXINFO_RENDERER_%s__\\n\" \"\$status\"\r" } timeout { exit 7 }
+expect {
+  -exact "__GLXINFO_RENDERER_OK__" {}
+  -exact "__GLXINFO_RENDERER_BAD__" { exit 7 }
+  timeout { exit 7 }
+}
+
+expect "# " {
+  send "rm -f /tmp/vgpu3d-glxgears.log; if command -v timeout >/dev/null 2>&1; then DISPLAY=:0 timeout ${env(VGPU3D_GLXGEARS_SECONDS)}s glxgears >/tmp/vgpu3d-glxgears.log 2>&1; rc=\u0024?; else DISPLAY=:0 glxgears >/tmp/vgpu3d-glxgears.log 2>&1 & pid=\u0024!; sleep $env(VGPU3D_GLXGEARS_SECONDS); kill \u0024pid 2>/dev/null || true; wait \u0024pid 2>/dev/null || true; rc=124; fi; head -40 /tmp/vgpu3d-glxgears.log; if { test \"\u0024rc\" -eq 0 || test \"\u0024rc\" -eq 124; } && grep -Eiq 'Running synchronized|frames in|GL_RENDERER|virgl' /tmp/vgpu3d-glxgears.log; then status=OK; else status=FAIL; fi; printf \"__GLXGEARS_%s__\\n\" \"\u0024status\"\r"
+} timeout { exit 8 }
+expect {
+  -exact "__GLXGEARS_OK__" {}
+  -exact "__GLXGEARS_FAIL__" { exit 8 }
+  timeout { exit 8 }
+}
+DONE
+
+ret="$?"
+set -e  # Re-enable 'errexit' after capturing 'expect' return code.
+
+MESSAGES=(
+  "PASS: windowed virtio-gpu virgl 3D checks"
+  "FAIL: boot/login prompt not found"
+  "FAIL: shell prompt not found"
+  "FAIL: virtio-gpu basic checks failed (/dev/dri/card0, /dev/dri/renderD128, or virtio_gpu binding)"
+  "FAIL: virgl/capset/resource_blob/host_visible dmesg checks failed"
+  "FAIL: guest VirGL tools/driver missing or local-env.sh failed"
+  "FAIL: guest Xorg did not start on :0"
+  "FAIL: glxinfo -B failed or did not report a virgl renderer"
+  "FAIL: glxgears did not start cleanly"
+)
+
+if [[ "${ret}" -eq 0 ]]; then
+  print_success "${MESSAGES[0]}"
+  exit 0
+fi
+
+print_error "${MESSAGES[${ret}]:-FAIL: unknown error (exit code ${ret})}"
+exit "${ret}"
