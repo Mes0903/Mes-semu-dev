@@ -57,6 +57,7 @@ struct virtio_device_common {
     uint32_t queue_sel;
     struct virtq *queues;
     uint16_t num_queues;
+    uint16_t required_ready_queues;
     atomic_uint status;
     struct virtio_irq irq;
     uint32_t config_generation;
@@ -86,6 +87,7 @@ struct virtio_device_common_config {
     uint64_t required_features;
     const uint16_t *queue_max_sizes;
     uint16_t num_queues;
+    uint16_t required_ready_queues;
     const struct virtio_device_ops *ops;
     void *opaque;
 };

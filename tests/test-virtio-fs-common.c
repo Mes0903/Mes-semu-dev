@@ -347,6 +347,40 @@ static void setup_fixture(void)
     setup_fixture_with_dir("/tmp");
 }
 
+static void setup_fixture_with_two_ready_queues(const char *shared_dir)
+{
+    memset(&emu, 0, sizeof(emu));
+    memset(ram_words, 0, sizeof(ram_words));
+    ram_dma_init(&emu.ram_dma, ram_words, TEST_RAM_SIZE, NULL);
+    emu.ram = ram_words;
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    require_int("lifecycle running",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    require_int("plic lock init", pthread_mutex_init(&emu.plic_lock, NULL), 0);
+    wake_count = 0;
+
+    require_bool("virtio fs init",
+                 virtio_fs_init(&emu.vfs, &emu, "myfs", (char *) shared_dir),
+                 true);
+
+    mmio_write(REG(DeviceFeaturesSel), 1);
+    require_u32("VERSION_1 advertised", mmio_read(REG(DeviceFeatures)), 1);
+    mmio_write(REG(DriverFeaturesSel), 1);
+    mmio_write(REG(DriverFeatures), 1);
+    mmio_write(REG(Status), VIRTIO_STATUS__ACKNOWLEDGE);
+    mmio_write(REG(Status), VIRTIO_STATUS__DRIVER);
+    mmio_write(REG(Status), VIRTIO_STATUS__FEATURES_OK);
+
+    for (uint16_t q = 0; q < 2; q++) {
+        mmio_write(REG(QueueSel), q);
+        mmio_write(REG(QueueNum), QUEUE_SIZE);
+        mmio_write(REG(QueueDescLow), DESC_ADDR(q));
+        mmio_write(REG(QueueDriverLow), AVAIL_ADDR(q));
+        mmio_write(REG(QueueDeviceLow), USED_ADDR(q));
+        mmio_write(REG(QueueReady), 1);
+    }
+}
+
 static void teardown_fixture(void)
 {
     virtio_fs_destroy(&emu.vfs);
@@ -398,6 +432,21 @@ static bool wait_for_interrupt_status(uint32_t status)
         sleep_one_ms();
     }
     return false;
+}
+
+static void test_driver_ok_accepts_single_request_queue(void)
+{
+    setup_fixture_with_two_ready_queues("/tmp");
+
+    require_int("DRIVER_OK with optional request queue not ready",
+                mmio_write_result(REG(Status), VIRTIO_STATUS__DRIVER_OK), 0);
+    require_u32("DRIVER_OK stored with optional request queue not ready",
+                mmio_read(REG(Status)) & VIRTIO_STATUS__DRIVER_OK,
+                VIRTIO_STATUS__DRIVER_OK);
+    require_bool("actor active after partial queue activation",
+                 wait_for_fs_actor_state(&emu.vfs, VIRTIO_ACTOR_ACTIVE), true);
+
+    teardown_fixture();
 }
 
 struct async_fs_call {
@@ -1148,6 +1197,7 @@ static void test_malformed_avail_sets_needs_reset_and_conf_change_irq(void)
 
 int main(void)
 {
+    test_driver_ok_accepts_single_request_queue();
     test_config_reads_tag_and_request_queue_count();
     test_config_writes_do_not_mutate_device_config();
     test_fuse_init_completes_asynchronously_and_acks_irq();

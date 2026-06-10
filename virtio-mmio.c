@@ -157,7 +157,12 @@ static int virtio_mmio_unlock_transport(struct virtio_device_common *common,
 static bool virtio_mmio_all_queues_ready(
     const struct virtio_device_common *common)
 {
-    for (uint16_t i = 0; i < common->num_queues; i++) {
+    uint16_t required_queues = common->required_ready_queues;
+
+    if (required_queues == 0 || required_queues > common->num_queues)
+        required_queues = common->num_queues;
+
+    for (uint16_t i = 0; i < required_queues; i++) {
         if (common->queue_cfgs[i].max_size != 0 && !common->queues[i].ready)
             return false;
     }
@@ -523,12 +528,24 @@ int virtio_device_common_init(struct virtio_device_common *common,
     common->device_features = config->device_features;
     common->required_features = config->required_features;
     common->num_queues = config->num_queues;
+    common->required_ready_queues = config->required_ready_queues == 0
+                                        ? config->num_queues
+                                        : config->required_ready_queues;
     common->emu = config->emu;
     common->dma = config->dma;
     common->ops = config->ops;
     common->opaque = config->opaque;
     atomic_init(&common->status, 0);
     common->generation = 1;
+
+    if (common->required_ready_queues > common->num_queues) {
+        pthread_mutex_destroy(&common->backend_lock);
+        pthread_mutex_destroy(&common->transport_lock);
+        free(common->queues);
+        free(common->queue_cfgs);
+        memset(common, 0, sizeof(*common));
+        return -EINVAL;
+    }
 
     for (uint16_t i = 0; i < config->num_queues; i++) {
         virtq_init(&common->queues[i]);

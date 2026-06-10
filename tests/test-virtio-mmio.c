@@ -434,6 +434,36 @@ static void init_common(struct virtio_device_common *common,
     backend->activate_common = common;
 }
 
+static void init_common_with_required_ready_queues(
+    struct virtio_device_common *common,
+    emu_state_t *emu,
+    struct backend_state *backend,
+    uint64_t device_features,
+    uint64_t required_features,
+    const uint16_t *queue_max_sizes,
+    uint16_t num_queues,
+    uint16_t required_ready_queues)
+{
+    struct virtio_device_common_config config = {
+        .emu = emu,
+        .dma = &dma,
+        .irq_source = emu ? SEMU_IRQ_SOURCE_VGPU : SEMU_IRQ_SOURCE_COUNT,
+        .device_id = 16,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .device_features = device_features,
+        .required_features = required_features,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = num_queues,
+        .required_ready_queues = required_ready_queues,
+        .ops = &backend_ops,
+        .opaque = backend,
+    };
+
+    memset(backend, 0, sizeof(*backend));
+    require_int("common init", virtio_device_common_init(common, &config), 0);
+    backend->activate_common = common;
+}
+
 static uint32_t read_reg(struct virtio_device_common *common, uint32_t reg)
 {
     uint32_t value;
@@ -1102,6 +1132,45 @@ static void test_driver_ok_activation_edge(void)
     destroy_test_emu(&emu);
 }
 
+static void test_driver_ok_accepts_configured_optional_queues(void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    const uint16_t queue_max_sizes[] = {8, 8, 8};
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common_with_required_ready_queues(&common, &emu, &backend, 0x1, 0x1,
+                                           queue_max_sizes,
+                                           ARRAY_SIZE(queue_max_sizes), 2);
+    set_driver_features(&common, 0x1);
+    write_reg(&common, REG(Status),
+              VIRTIO_STATUS__ACKNOWLEDGE | VIRTIO_STATUS__DRIVER);
+    write_reg(&common, REG(Status), VIRTIO_STATUS__FEATURES_OK);
+
+    write_reg(&common, REG(QueueSel), 0);
+    make_queue_ready(&common);
+    write_reg(&common, REG(QueueSel), 1);
+    make_queue_ready(&common);
+
+    require_int(
+        "DRIVER_OK with optional queue not ready",
+        virtio_mmio_write(&common, REG(Status), 4, VIRTIO_STATUS__DRIVER_OK),
+        0);
+    require_u32("DRIVER_OK stored with optional queue not ready",
+                read_reg(&common, REG(Status)) & VIRTIO_STATUS__DRIVER_OK,
+                VIRTIO_STATUS__DRIVER_OK);
+    require_int("optional queue activation count", backend.activate_count, 1);
+    require_u16("optional queue activation still sees all queues",
+                backend.activate_num_queues, 3);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
 static void test_activation_failure_marks_needs_reset(void)
 {
     emu_state_t emu;
@@ -1549,6 +1618,7 @@ int main(void)
     test_queue_notify_rejects_tracked_rank_inversion();
     test_status_order_rejects_bare_driver_ok();
     test_driver_ok_activation_edge();
+    test_driver_ok_accepts_configured_optional_queues();
     test_activation_failure_marks_needs_reset();
     test_interrupt_status_and_ack();
     test_interrupt_ack_racing_with_actor_completion_keeps_line_asserted();
