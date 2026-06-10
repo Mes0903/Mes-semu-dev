@@ -45,6 +45,12 @@ static uint32_t fake_last_context_create_nlen;
 static char fake_last_context_create_name[64];
 static int fake_context_destroy_count;
 static uint32_t fake_last_context_destroy_handle;
+static int fake_context_attach_count;
+static int fake_last_context_attach_ctx_id;
+static int fake_last_context_attach_resource_id;
+static int fake_context_detach_count;
+static int fake_last_context_detach_ctx_id;
+static int fake_last_context_detach_resource_id;
 static int fake_resource_create_count;
 static struct virgl_renderer_resource_create_args
     fake_last_resource_create_args;
@@ -210,6 +216,20 @@ void virgl_renderer_context_destroy(uint32_t handle)
 {
     fake_context_destroy_count++;
     fake_last_context_destroy_handle = handle;
+}
+
+void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
+{
+    fake_context_attach_count++;
+    fake_last_context_attach_ctx_id = ctx_id;
+    fake_last_context_attach_resource_id = res_handle;
+}
+
+void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
+{
+    fake_context_detach_count++;
+    fake_last_context_detach_ctx_id = ctx_id;
+    fake_last_context_detach_resource_id = res_handle;
 }
 
 int virgl_renderer_resource_create(
@@ -449,6 +469,12 @@ static void reset_test_state(uint64_t generation)
            sizeof(fake_last_context_create_name));
     fake_context_destroy_count = 0;
     fake_last_context_destroy_handle = 0;
+    fake_context_attach_count = 0;
+    fake_last_context_attach_ctx_id = 0;
+    fake_last_context_attach_resource_id = 0;
+    fake_context_detach_count = 0;
+    fake_last_context_detach_ctx_id = 0;
+    fake_last_context_detach_resource_id = 0;
     fake_resource_create_count = 0;
     fake_last_resource_create_args =
         (struct virgl_renderer_resource_create_args) {0};
@@ -941,6 +967,65 @@ static void test_ctrl_request_executes_context_create_destroy(void)
     CHECK(completion.response == NULL);
     CHECK(fake_context_destroy_count == 1);
     CHECK(fake_last_context_destroy_handle == 77);
+}
+
+static void test_ctrl_request_executes_context_resource_attach_detach(void)
+{
+    reset_test_state(133);
+
+    struct vgpu_renderer_ctrl_payload payload = {
+        .hdr = {.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, .ctx_id = 77},
+        .cmd.ctx_resource =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+                        .ctx_id = 77},
+                .resource_id = 88,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_CTRL,
+        .token = {.generation = 133},
+        .command_type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+        .payload = &payload,
+        .payload_size = sizeof(payload),
+    };
+    struct vgpu_renderer_completion completion = {0};
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.response == NULL);
+    CHECK(fake_context_attach_count == 1);
+    CHECK(fake_last_context_attach_ctx_id == 77);
+    CHECK(fake_last_context_attach_resource_id == 88);
+    CHECK(fake_context_detach_count == 0);
+
+    payload = (struct vgpu_renderer_ctrl_payload) {
+        .hdr = {.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, .ctx_id = 77},
+        .cmd.ctx_resource =
+            {
+                .hdr = {.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+                        .ctx_id = 77},
+                .resource_id = 88,
+            },
+        .response_capacity = sizeof(struct virtio_gpu_ctrl_hdr),
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+    };
+    request.command_type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    request.payload = &payload;
+    request.payload_size = sizeof(payload);
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
+    CHECK(completion.response == NULL);
+    CHECK(fake_context_detach_count == 1);
+    CHECK(fake_last_context_detach_ctx_id == 77);
+    CHECK(fake_last_context_detach_resource_id == 88);
 }
 
 static void test_ctrl_request_executes_resource_create_3d_completion(void)
@@ -2581,8 +2666,8 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
     CHECK(completion.request_hdr.fence_id == UINT64_C(0xf00d00000000abcd));
     CHECK(!vgpu_renderer_pop_completion(&completion));
 
-    submit_payload.hdr.flags = VIRTIO_GPU_FLAG_FENCE |
-                               VIRTIO_GPU_FLAG_INFO_RING_IDX;
+    submit_payload.hdr.flags =
+        VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
     submit_payload.hdr.fence_id = UINT64_C(0xabcddcba11223344);
     submit_payload.hdr.ctx_id = 0;
     submit_payload.hdr.ring_idx = 6;
@@ -2609,8 +2694,8 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
     CHECK(completion.has_ctrl_completion);
     CHECK(completion.ctrl_completion.desc_head == 16);
     CHECK(completion.response_desc.addr == 0xc0);
-    CHECK(completion.request_hdr.flags == (VIRTIO_GPU_FLAG_FENCE |
-                                           VIRTIO_GPU_FLAG_INFO_RING_IDX));
+    CHECK(completion.request_hdr.flags ==
+          (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX));
     CHECK(!vgpu_renderer_pop_completion(&completion));
 
     fake_submit_cmd_result = -1;
@@ -2640,8 +2725,8 @@ static void test_ctrl_request_executes_submit_3d_completion(void)
 
     fake_create_fence_result = 0;
     fake_context_create_fence_result = -1;
-    submit_payload.hdr.flags = VIRTIO_GPU_FLAG_FENCE |
-                               VIRTIO_GPU_FLAG_INFO_RING_IDX;
+    submit_payload.hdr.flags =
+        VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
     submit_payload.hdr.fence_id = UINT64_C(0x7777666655554444);
     submit_payload.hdr.ctx_id = 0;
     submit_payload.hdr.ring_idx = 7;
@@ -2735,6 +2820,7 @@ int main(void)
     test_ctrl_request_executes_get_capset_info_completion();
     test_ctrl_request_executes_get_capset_completion();
     test_ctrl_request_executes_context_create_destroy();
+    test_ctrl_request_executes_context_resource_attach_detach();
     test_ctrl_request_executes_resource_create_3d_completion();
     test_ctrl_request_executes_resource_create_blob_completion();
     test_ctrl_request_maps_and_unmaps_blob_resources();

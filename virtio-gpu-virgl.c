@@ -895,6 +895,18 @@ static void vgpu_virgl_execute_ctrl_request(
         virgl_renderer_context_destroy(payload->cmd.ctx_destroy.hdr.ctx_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+        virgl_renderer_ctx_attach_resource(
+            payload->cmd.ctx_resource.hdr.ctx_id,
+            payload->cmd.ctx_resource.resource_id);
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
+        virgl_renderer_ctx_detach_resource(
+            payload->cmd.ctx_resource.hdr.ctx_id,
+            payload->cmd.ctx_resource.resource_id);
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
         const struct virtio_gpu_resource_create_blob *cmd =
             &payload->cmd.resource_create_blob;

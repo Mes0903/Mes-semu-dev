@@ -1213,6 +1213,10 @@ static void virtio_gpu_copy_renderer_ctrl_cmd(
     case VIRTIO_GPU_CMD_CTX_DESTROY:
         memcpy(&payload->cmd.ctx_destroy, request, request_size);
         break;
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
+        memcpy(&payload->cmd.ctx_resource, request, request_size);
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
         memcpy(&payload->cmd.resource_unref, request, request_size);
         break;
@@ -1481,6 +1485,44 @@ void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
     virtio_gpu_submit_renderer_ctrl(
         vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
         sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_CTX_DESTROY,
+        VIRTIO_GPU_RESP_OK_NODATA, 0, plen);
+}
+
+void virtio_gpu_virgl_ctx_attach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen)
+{
+    const struct virtio_gpu_ctx_resource *request = virtio_gpu_get_request(
+        vgpu, vq_desc, sizeof(struct virtio_gpu_ctx_resource));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_ctx_resource snapshot = *request;
+    virtio_gpu_submit_renderer_ctrl(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+        VIRTIO_GPU_RESP_OK_NODATA, 0, plen);
+}
+
+void virtio_gpu_virgl_ctx_detach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen)
+{
+    const struct virtio_gpu_ctx_resource *request = virtio_gpu_get_request(
+        vgpu, vq_desc, sizeof(struct virtio_gpu_ctx_resource));
+    if (!request) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
+    struct virtio_gpu_ctx_resource snapshot = *request;
+    virtio_gpu_submit_renderer_ctrl(
+        vgpu, vq_desc, &snapshot.hdr, sizeof(snapshot),
+        sizeof(struct virtio_gpu_ctrl_hdr), VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
         VIRTIO_GPU_RESP_OK_NODATA, 0, plen);
 }
 

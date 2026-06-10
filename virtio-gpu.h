@@ -520,6 +520,12 @@ void virtio_gpu_virgl_ctx_create_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
                                           struct virtq_desc *vq_desc,
                                           uint32_t *plen);
+void virtio_gpu_virgl_ctx_attach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
+void virtio_gpu_virgl_ctx_detach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
 void virtio_gpu_virgl_resource_create_3d_handler(virtio_gpu_state_t *vgpu,
                                                  struct virtq_desc *vq_desc,
                                                  uint32_t *plen);

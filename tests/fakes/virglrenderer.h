@@ -101,6 +101,8 @@ int virgl_renderer_context_create(uint32_t handle,
                                   uint32_t nlen,
                                   const char *name);
 void virgl_renderer_context_destroy(uint32_t handle);
+void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle);
+void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle);
 int virgl_renderer_resource_create(
     struct virgl_renderer_resource_create_args *args,
     struct iovec *iov,

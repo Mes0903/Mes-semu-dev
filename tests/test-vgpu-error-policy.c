@@ -4106,6 +4106,10 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
         (struct virtio_gpu_ctx_create *) ((uint8_t *) ram + 0x40);
     struct virtio_gpu_ctx_destroy *destroy =
         (struct virtio_gpu_ctx_destroy *) ((uint8_t *) ram + 0x140);
+    struct virtio_gpu_ctx_resource *attach =
+        (struct virtio_gpu_ctx_resource *) ((uint8_t *) ram + 0x180);
+    struct virtio_gpu_ctx_resource *detach =
+        (struct virtio_gpu_ctx_resource *) ((uint8_t *) ram + 0x1c0);
     uint32_t len = 0;
     const uint64_t renderer_generation = 0x72;
 
@@ -4167,6 +4171,50 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     require_u32("ctx destroy id snapshot", payload->cmd.ctx_destroy.hdr.ctx_id,
                 44);
     require_u32("ctx destroy desc head", payload->ctrl_completion.desc_head, 9);
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 10;
+    attach->hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    attach->hdr.ctx_id = 44;
+    attach->resource_id = 88;
+    desc[0].addr = 0x180;
+    desc[0].len = sizeof(*attach);
+    len = 0;
+
+    g_virtio_gpu_backend.ctx_attach_resource(&vgpu, desc, &len);
+    require_u32("ctx attach is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    require_int("ctx attach queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("ctx attach command type", queued.command_type,
+                VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE);
+    payload = queued.payload;
+    require_u32("ctx attach id snapshot", payload->cmd.ctx_resource.hdr.ctx_id,
+                44);
+    require_u32("ctx attach resource snapshot",
+                payload->cmd.ctx_resource.resource_id, 88);
+    require_u32("ctx attach desc head", payload->ctrl_completion.desc_head, 10);
+    queued.release_payload(queued.payload);
+
+    vgpu.ctrl_dispatch.desc_head = 11;
+    detach->hdr.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    detach->hdr.ctx_id = 44;
+    detach->resource_id = 88;
+    desc[0].addr = 0x1c0;
+    desc[0].len = sizeof(*detach);
+    len = 0;
+
+    g_virtio_gpu_backend.ctx_detach_resource(&vgpu, desc, &len);
+    require_u32("ctx detach is deferred", len, VIRTIO_GPU_RESPONSE_DEFERRED);
+
+    require_int("ctx detach queued", vgpu_renderer_pop_request(&queued), true);
+    require_u32("ctx detach command type", queued.command_type,
+                VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE);
+    payload = queued.payload;
+    require_u32("ctx detach id snapshot", payload->cmd.ctx_resource.hdr.ctx_id,
+                44);
+    require_u32("ctx detach resource snapshot",
+                payload->cmd.ctx_resource.resource_id, 88);
+    require_u32("ctx detach desc head", payload->ctrl_completion.desc_head, 11);
     queued.release_payload(queued.payload);
 
     destroy_vgpu_test_state(&emu, &vgpu);

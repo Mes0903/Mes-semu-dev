@@ -1876,8 +1876,13 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .ctx_create = VIRTIO_GPU_CMD_UNDEF,
     .ctx_destroy = VIRTIO_GPU_CMD_UNDEF,
 #endif
+#if SEMU_HAS(VIRGL)
+    .ctx_attach_resource = virtio_gpu_virgl_ctx_attach_resource_handler,
+    .ctx_detach_resource = virtio_gpu_virgl_ctx_detach_resource_handler,
+#else
     .ctx_attach_resource = VIRTIO_GPU_CMD_UNDEF,
     .ctx_detach_resource = VIRTIO_GPU_CMD_UNDEF,
+#endif
 #if SEMU_HAS(VIRGL)
     .resource_create_3d = virtio_gpu_virgl_resource_create_3d_handler,
     .apply_renderer_side_effect = virtio_gpu_virgl_apply_renderer_side_effect,
