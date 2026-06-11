@@ -489,6 +489,14 @@ static void async_snd_call_join(struct async_snd_call *call)
 }
 
 
+static void sync_after_snd_actor_completion(void)
+{
+    require_int("completion sync lock",
+                pthread_mutex_lock(&emu.vsnd.common.transport_lock), 0);
+    require_int("completion sync unlock",
+                pthread_mutex_unlock(&emu.vsnd.common.transport_lock), 0);
+}
+
 static bool wait_for_used_idx(unsigned queue,
                               uint16_t expected,
                               unsigned timeout_ms)
@@ -502,8 +510,10 @@ static bool wait_for_used_idx(unsigned queue,
             .tv_nsec = 1000000L,
         };
 
-        if (read16(USED_ADDR(queue) + 2) == expected)
+        if (read16(USED_ADDR(queue) + 2) == expected) {
+            sync_after_snd_actor_completion();
             return true;
+        }
 
         clock_gettime(CLOCK_REALTIME, &now);
         if (now.tv_sec > deadline.tv_sec ||
