@@ -41,6 +41,8 @@ static unsigned fake_start_count;
 static unsigned fake_stop_count;
 static unsigned fake_close_count;
 static PaError fake_start_error;
+static struct virtio_device_common *reset_start_on_avail_read_common;
+static guest_paddr_t reset_start_on_avail_read_addr;
 static bool fake_stop_saw_buffer;
 static bool fake_close_saw_buffer;
 static bool fake_terminate_saw_unclosed_stream;
@@ -131,6 +133,17 @@ static bool test_ram_dma_read(const ram_dma_t *dma,
                               void *buf,
                               guest_size_t len)
 {
+    if (reset_start_on_avail_read_common &&
+        addr == reset_start_on_avail_read_addr && len == sizeof(uint16_t)) {
+        struct virtio_device_common *common = reset_start_on_avail_read_common;
+
+        reset_start_on_avail_read_common = NULL;
+        pthread_mutex_lock(&common->transport_lock);
+        common->generation++;
+        common->reset_in_progress = true;
+        pthread_mutex_unlock(&common->transport_lock);
+    }
+
     dma_gate_block_if_enabled(&snd_dma_read_gate, addr, len);
     return ram_dma_read(dma, addr, buf, len);
 }
@@ -343,6 +356,8 @@ static void configure_snd_fixture(void)
     fake_stop_count = 0;
     fake_close_count = 0;
     fake_start_error = paNoError;
+    reset_start_on_avail_read_common = NULL;
+    reset_start_on_avail_read_addr = 0;
     fake_stop_saw_buffer = false;
     fake_close_saw_buffer = false;
     fake_terminate_saw_unclosed_stream = false;
@@ -743,6 +758,37 @@ static void test_reset_closes_stream_opened_by_inflight_actor(void)
     destroy_snd_fixture();
 }
 
+static void test_common_reset_start_cancels_stale_avail_failure(void)
+{
+    int ret;
+
+    configure_snd_fixture();
+    configure_all_snd_queues();
+    write16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 2, QUEUE_SIZE + 1);
+
+    reset_start_on_avail_read_common = &emu.vsnd.common;
+    reset_start_on_avail_read_addr = AVAIL_ADDR(VSND_QUEUE_CTRL) + 2;
+    ret = virtio_snd_actor_drain_queue(
+        &emu.vsnd, &emu.vsnd.actor, VSND_QUEUE_CTRL,
+        virtio_actor_generation(&emu.vsnd.actor));
+
+    require_int("common reset stale avail drain return", ret, 0);
+    require_bool("common reset stale avail hook consumed",
+                 reset_start_on_avail_read_common == NULL, true);
+    require_int("common reset stale avail used idx remains clear",
+                read16(USED_ADDR(VSND_QUEUE_CTRL) + 2), 0);
+    require_u32("common reset stale avail interrupt remains clear",
+                virtio_irq_read_status(&emu.vsnd.common.irq), 0);
+    require_bool("common reset stale avail irq remains clear",
+                 virtio_snd_irq_pending(&emu.vsnd), false);
+    require_u32(
+        "common reset stale avail needs-reset remains clear",
+        virtio_snd_status_load(&emu.vsnd) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+        0);
+
+    destroy_snd_fixture();
+}
+
 static void test_standalone_stop_drops_inflight_actor_completion(void)
 {
     struct async_snd_call call;
@@ -826,6 +872,7 @@ int main(void)
     test_pcm_start_failure_reset_closes_prepared_stream();
     test_reset_closes_callbacks_before_freeing_buffers();
     test_reset_closes_stream_opened_by_inflight_actor();
+    test_common_reset_start_cancels_stale_avail_failure();
     test_standalone_stop_drops_inflight_actor_completion();
     test_destroy_closes_stream_opened_by_inflight_actor();
     return 0;
