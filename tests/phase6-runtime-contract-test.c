@@ -14,8 +14,10 @@
 static bool gdbstub_init_result;
 static bool gdbstub_run_result;
 static int gdbstub_init_calls;
+static int gdbstub_init_interruptible_calls;
 static int gdbstub_run_calls;
 static int gdbstub_close_calls;
+static bool gdbstub_last_shutdown_result;
 
 void u8250_update_interrupts(u8250_state_t *uart UNUSED)
 {
@@ -42,6 +44,19 @@ bool gdbstub_init(gdbstub_t *gdbstub UNUSED,
 {
     gdbstub_init_calls++;
     return gdbstub_init_result;
+}
+
+bool gdbstub_init_interruptible(gdbstub_t *gdbstub UNUSED,
+                                struct target_ops *ops UNUSED,
+                                arch_info_t arch UNUSED,
+                                char *s UNUSED,
+                                gdbstub_should_shutdown_fn should_shutdown,
+                                void *opaque)
+{
+    gdbstub_init_interruptible_calls++;
+    gdbstub_last_shutdown_result =
+        should_shutdown ? should_shutdown(opaque) : false;
+    return gdbstub_last_shutdown_result ? false : gdbstub_init_result;
 }
 
 bool gdbstub_run(gdbstub_t *gdbstub UNUSED, void *args UNUSED)
@@ -277,12 +292,15 @@ static void test_debug_runtime_exit_stops_lifecycle(void)
     gdbstub_init_result = true;
     gdbstub_run_result = true;
     gdbstub_init_calls = 0;
+    gdbstub_init_interruptible_calls = 0;
     gdbstub_run_calls = 0;
     gdbstub_close_calls = 0;
+    gdbstub_last_shutdown_result = false;
 
     semu_run_debug(&emu);
 
-    require_int("debug init called", gdbstub_init_calls, 1);
+    require_int("debug init called", gdbstub_init_interruptible_calls, 1);
+    require_int("debug legacy init skipped", gdbstub_init_calls, 0);
     require_int("debug run called", gdbstub_run_calls, 1);
     require_int("debug close called", gdbstub_close_calls, 1);
     require_int("debug exit code", emu.exit_code, 0);
@@ -303,13 +321,16 @@ static void test_debug_unsupported_config_fails_lifecycle(void)
     gdbstub_init_result = true;
     gdbstub_run_result = true;
     gdbstub_init_calls = 0;
+    gdbstub_init_interruptible_calls = 0;
     gdbstub_run_calls = 0;
     gdbstub_close_calls = 0;
 
     semu_run_debug(&emu);
 
     require_int("debug unsupported exit code", emu.exit_code, 1);
-    require_int("debug unsupported skips init", gdbstub_init_calls, 0);
+    require_int("debug unsupported skips init", gdbstub_init_interruptible_calls,
+                0);
+    require_int("debug unsupported skips legacy init", gdbstub_init_calls, 0);
     require_int("debug unsupported skips run", gdbstub_run_calls, 0);
     require_int("debug unsupported skips close", gdbstub_close_calls, 0);
     require_int("debug unsupported lifecycle failed",
@@ -329,12 +350,16 @@ static void test_debug_init_failure_fails_lifecycle(void)
     gdbstub_init_result = false;
     gdbstub_run_result = true;
     gdbstub_init_calls = 0;
+    gdbstub_init_interruptible_calls = 0;
     gdbstub_run_calls = 0;
     gdbstub_close_calls = 0;
+    gdbstub_last_shutdown_result = false;
 
     semu_run_debug(&emu);
 
-    require_int("debug init failure init called", gdbstub_init_calls, 1);
+    require_int("debug init failure init called",
+                gdbstub_init_interruptible_calls, 1);
+    require_int("debug init failure skips legacy init", gdbstub_init_calls, 0);
     require_int("debug init failure skips run", gdbstub_run_calls, 0);
     require_int("debug init failure skips close", gdbstub_close_calls, 0);
     require_int("debug init failure exit code", emu.exit_code, 1);
@@ -412,7 +437,7 @@ static void test_window_loop_return_before_runtime_running_remains_startable(voi
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
-static void test_debug_window_loop_return_leaves_debug_runtime_running(void)
+static void test_debug_window_loop_return_requests_debug_runtime_shutdown(void)
 {
     emu_state_t emu;
     memset(&emu, 0, sizeof(emu));
@@ -423,11 +448,54 @@ static void test_debug_window_loop_return_leaves_debug_runtime_running(void)
 
     semu_runtime_window_loop_returned(&emu);
 
-    require_int("debug window return leaves lifecycle running",
-                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_RUNNING);
-    require_bool("debug window return leaves device work unchanged",
-                 semu_vm_accepting_device_work(&emu.lifecycle), true);
+    require_bool("debug window return requests gdbstub shutdown",
+                 atomic_load_explicit(&emu.debug_shutdown_requested,
+                                      memory_order_acquire),
+                 true);
+    require_int("debug window return closes lifecycle",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPING);
+    require_bool("debug window return closes device work",
+                 semu_vm_accepting_device_work(&emu.lifecycle), false);
     semu_runtime_enter_stopped(&emu);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
+static void test_debug_window_return_before_running_cancels_gdbstub_init(void)
+{
+    emu_state_t emu;
+    memset(&emu, 0, sizeof(emu));
+    require_int("lifecycle init", semu_vm_lifecycle_init(&emu.lifecycle), 0);
+    emu.debug = true;
+    emu.vm.n_hart = 1;
+
+    semu_runtime_window_loop_returned(&emu);
+
+    require_bool("early debug window requests gdbstub shutdown",
+                 atomic_load_explicit(&emu.debug_shutdown_requested,
+                                      memory_order_acquire),
+                 true);
+    require_int("early debug window leaves lifecycle created",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_CREATED);
+
+    gdbstub_init_result = true;
+    gdbstub_run_result = true;
+    gdbstub_init_calls = 0;
+    gdbstub_init_interruptible_calls = 0;
+    gdbstub_run_calls = 0;
+    gdbstub_close_calls = 0;
+    gdbstub_last_shutdown_result = false;
+
+    semu_run_debug(&emu);
+
+    require_int("early debug close init attempted",
+                gdbstub_init_interruptible_calls, 1);
+    require_bool("early debug close init saw shutdown",
+                 gdbstub_last_shutdown_result, true);
+    require_int("early debug close skips run", gdbstub_run_calls, 0);
+    require_int("early debug close skips close", gdbstub_close_calls, 0);
+    require_int("early debug close lifecycle stopped",
+                semu_vm_lifecycle_state(&emu.lifecycle), SEMU_VM_STOPPED);
+    require_int("early debug close exits cleanly", emu.exit_code, 0);
     semu_vm_lifecycle_destroy(&emu.lifecycle);
 }
 
@@ -445,6 +513,7 @@ int main(void)
     test_runtime_enters_running_before_threaded_executor_start();
     test_window_loop_return_closes_device_work_before_join();
     test_window_loop_return_before_runtime_running_remains_startable();
-    test_debug_window_loop_return_leaves_debug_runtime_running();
+    test_debug_window_loop_return_requests_debug_runtime_shutdown();
+    test_debug_window_return_before_running_cancels_gdbstub_init();
     return 0;
 }

@@ -20,7 +20,7 @@
 
 #include "device.h"
 #include "irq-source.h"
-#include "mini-gdbstub/include/gdbstub.h"
+#include "gdbstub.h"
 #include "mmio-bus.h"
 #include "platform.h"
 #include "semu-event.h"
@@ -311,18 +311,21 @@ static void semu_runtime_enter_stopped(emu_state_t *emu)
 
 static void UNUSED semu_runtime_window_loop_returned(emu_state_t *emu)
 {
-    if (!emu || emu->debug)
+    if (!emu)
         return;
+    if (emu->debug) {
+        atomic_store_explicit(&emu->debug_shutdown_requested, true,
+                              memory_order_release);
+        if (semu_vm_accepting_device_work(&emu->lifecycle))
+            semu_runtime_enter_stopping(emu);
+        return;
+    }
 
     /* The main-thread window loop can return before the emulator thread has
      * entered RUNNING. Only publish STOPPING once the runtime is accepting
      * device work; CREATED is already closed to device work and must remain
      * startable so the emulator thread can observe the closed window and exit
      * through the normal runtime path.
-     *
-     * Debug/gdbstub idle waits are not window-close interruptible here because
-     * the gdbstub handle is local to the emulator thread. Leave that path
-     * unchanged until debug shutdown has an explicit wake/close primitive.
      */
     if (!semu_vm_accepting_device_work(&emu->lifecycle))
         return;
@@ -3331,6 +3334,16 @@ static void semu_on_interrupt(void *args)
     __atomic_store_n(&emu->is_interrupted, true, __ATOMIC_RELAXED);
 }
 
+static bool semu_debug_shutdown_requested(void *args)
+{
+    emu_state_t *emu = (emu_state_t *) args;
+
+    if (!emu)
+        return true;
+    return atomic_load_explicit(&emu->debug_shutdown_requested,
+                                memory_order_acquire);
+}
+
 static int semu_get_cpu(void *args)
 {
     emu_state_t *emu = (emu_state_t *) args;
@@ -3372,15 +3385,28 @@ static void semu_run_debug(emu_state_t *emu)
     };
 
     emu->curr_cpuid = 0;
-    if (!gdbstub_init(&gdbstub, &gdbstub_ops,
-                      (arch_info_t) {
-                          .smp = vm->n_hart,
-                          .reg_num = 33,
-                          .target_desc = TARGET_RV32,
-                      },
-                      "127.0.0.1:1234")) {
+    if (!gdbstub_init_interruptible(&gdbstub, &gdbstub_ops,
+                                    (arch_info_t) {
+                                        .smp = vm->n_hart,
+                                        .reg_num = 33,
+                                        .target_desc = TARGET_RV32,
+                                    },
+                                    "127.0.0.1:1234",
+                                    semu_debug_shutdown_requested, emu)) {
+        if (semu_debug_shutdown_requested(emu)) {
+            semu_runtime_enter_stopped(emu);
+            emu->exit_code = 0;
+            return;
+        }
         semu_runtime_enter_failed(emu);
         emu->exit_code = 1;
+        return;
+    }
+
+    if (semu_debug_shutdown_requested(emu)) {
+        semu_runtime_enter_stopped(emu);
+        emu->exit_code = 0;
+        gdbstub_close(&gdbstub);
         return;
     }
 

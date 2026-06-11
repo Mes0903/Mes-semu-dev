@@ -287,13 +287,13 @@ phase4-rfence-contract-test:
 	/tmp/phase4-rfence-contract-test
 
 .PHONY: phase5-hsm-contract-test
-phase5-hsm-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c hart-executor.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
+phase5-hsm-contract-test: .stamps/mini-gdbstub-patched/build/libgdbstub.a
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -I.stamps/mini-gdbstub-patched/include -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase5-hsm-contract-test.c hart-executor.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase5-hsm-contract-test
 	/tmp/phase5-hsm-contract-test
 
 .PHONY: phase6-runtime-contract-test
-phase6-runtime-contract-test:
-	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c executor-config.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
+phase6-runtime-contract-test: .stamps/mini-gdbstub-patched/build/libgdbstub.a
+	$(CC) -std=c11 -O2 -Wall -Wextra -pthread -ffunction-sections -fdata-sections -I. -I.stamps/mini-gdbstub-patched/include -include common.h -D CLOCK_FREQ=$(CLOCK_FREQ) -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/phase6-runtime-contract-test.c executor-config.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/phase6-runtime-contract-test
 	/tmp/phase6-runtime-contract-test
 
 HOST_TEST_CFLAGS := -std=c11 -O2 -g -Wall -Wextra -pthread -I. -include common.h $(DT_CFLAGS)
@@ -347,7 +347,7 @@ test-vm-lifecycle:
 	/tmp/test-vm-lifecycle
 
 .PHONY: test-pause-ack
-test-pause-ack:
+test-pause-ack: .stamps/mini-gdbstub-patched/build/libgdbstub.a
 	$(CC) $(HOST_TEST_CFLAGS) -ffunction-sections -fdata-sections -D SEMU_BOOT_TARGET_TIME=10 -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-pause-ack.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-pause-ack $(HOST_TEST_LDLIBS)
 	/tmp/test-pause-ack
 
@@ -447,9 +447,14 @@ bench-vgpu-copy:
 	VGPU_COPY_BENCH_SCALE=$(VGPU_COPY_BENCH_SCALE) /tmp/bench-vgpu-copy
 
 .PHONY: test-debug-gate
-test-debug-gate: mini-gdbstub/Makefile
+test-debug-gate: .stamps/mini-gdbstub-patched/build/libgdbstub.a
 	$(CC) $(HOST_TEST_CFLAGS) -D SEMU_BOOT_TARGET_TIME=10 -ffunction-sections -fdata-sections -D SEMU_FEATURE_VIRTIOBLK=0 -D SEMU_FEATURE_VIRTIONET=0 -D SEMU_FEATURE_VIRTIORNG=0 -D SEMU_FEATURE_VIRTIOSND=0 -D SEMU_FEATURE_VIRTIOFS=0 -D SEMU_FEATURE_VIRTIOINPUT=0 -D SEMU_FEATURE_VIRTIOGPU=0 tests/test-debug-gate.c hart-executor.c vm-lifecycle.c riscv.c ram.c utils.c aclint.c -Wl,--gc-sections -o /tmp/test-debug-gate $(HOST_TEST_LDLIBS)
 	/tmp/test-debug-gate
+
+.PHONY: test-gdbstub-cancel
+test-gdbstub-cancel: .stamps/mini-gdbstub-patched/build/libgdbstub.a
+	$(CC) $(HOST_TEST_CFLAGS) tests/test-gdbstub-cancel.c $(GDBSTUB_LIB) -o /tmp/test-gdbstub-cancel $(HOST_TEST_LDLIBS)
+	timeout 5s /tmp/test-gdbstub-cancel
 
 .PHONY: test-executor-config
 test-executor-config:
@@ -476,7 +481,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-gdbstub-cancel test-executor-config test-hart-executor
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
@@ -523,12 +528,24 @@ BUILD_CONFIG_STAMP := $(STAMP_DIR)/build-config.stamp
 DTB_CONFIG_STAMP := $(STAMP_DIR)/dtb-config.stamp
 BUILD_CONFIG := CC=$(CC) $(strip $(CFLAGS))
 
-GDBSTUB_LIB := mini-gdbstub/build/libgdbstub.a
+GDBSTUB_PATCH := patches/mini-gdbstub-interruptible-shutdown.patch
+GDBSTUB_PATCHED_DIR := $(STAMP_DIR)/mini-gdbstub-patched
+GDBSTUB_PATCHED_STAMP := $(GDBSTUB_PATCHED_DIR)/.patched-stamp
+GDBSTUB_LIB := $(GDBSTUB_PATCHED_DIR)/build/libgdbstub.a
+GDBSTUB_SRCS := $(shell find mini-gdbstub/src mini-gdbstub/include -type f 2>/dev/null)
+CFLAGS += -I$(GDBSTUB_PATCHED_DIR)/include
+HOST_TEST_CFLAGS += -I$(GDBSTUB_PATCHED_DIR)/include
 LDFLAGS += $(GDBSTUB_LIB)
 mini-gdbstub/Makefile:
 	git submodule update --init $(dir $@)
-$(GDBSTUB_LIB): mini-gdbstub/Makefile
-	$(MAKE) -C $(dir $<)
+$(GDBSTUB_PATCHED_STAMP): mini-gdbstub/Makefile $(GDBSTUB_SRCS) $(GDBSTUB_PATCH)
+	$(RM) -r $(GDBSTUB_PATCHED_DIR)
+	mkdir -p $(GDBSTUB_PATCHED_DIR)
+	cp -a mini-gdbstub/Makefile mini-gdbstub/include mini-gdbstub/src $(GDBSTUB_PATCHED_DIR)/
+	patch -d $(GDBSTUB_PATCHED_DIR) -p1 < $(abspath $(GDBSTUB_PATCH))
+	touch $@
+$(GDBSTUB_LIB): $(GDBSTUB_PATCHED_STAMP)
+	$(MAKE) -C $(GDBSTUB_PATCHED_DIR)
 $(OBJS): $(GDBSTUB_LIB)
 
 ifeq ($(call has, VIRTIONET), 1)
@@ -666,6 +683,7 @@ build-artifacts:
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
 	$(Q)$(RM) -r $(BUILDROOT_OUTPUT_DIRS)
+	$(Q)$(RM) -r $(GDBSTUB_PATCHED_DIR)
 	$(Q)if [ -f mini-gdbstub/Makefile ]; then \
 		$(MAKE) -C mini-gdbstub clean; \
 	fi

@@ -27,6 +27,18 @@ bool gdbstub_init(gdbstub_t *gdbstub,
     return false;
 }
 
+bool gdbstub_init_interruptible(gdbstub_t *gdbstub,
+                                struct target_ops *ops,
+                                arch_info_t arch,
+                                char *s,
+                                gdbstub_should_shutdown_fn should_shutdown,
+                                void *opaque)
+{
+    if (should_shutdown && should_shutdown(opaque))
+        return false;
+    return gdbstub_init(gdbstub, ops, arch, s);
+}
+
 bool gdbstub_run(gdbstub_t *gdbstub, void *args)
 {
     (void) gdbstub;
