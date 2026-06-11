@@ -4865,6 +4865,72 @@ static void test_vgpu_common_reset_queues_renderer_reset_request(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void require_vgpu_3d_runtime_hidden(const char *prefix,
+                                           virtio_gpu_state_t *vgpu)
+{
+    char name[128];
+    uint32_t num_capsets;
+    uint32_t mmio_value;
+
+    snprintf(name, sizeof(name), "%s VirGL feature hidden", prefix);
+    require_u64(name, vgpu->common.device_features & VIRTIO_GPU_F_VIRGL, 0);
+    snprintf(name, sizeof(name), "%s context-init feature hidden", prefix);
+    require_u64(name,
+                vgpu->common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    snprintf(name, sizeof(name), "%s resource-blob feature hidden", prefix);
+    require_u64(name,
+                vgpu->common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
+    snprintf(name, sizeof(name), "%s host-visible SHM hidden", prefix);
+    require_false(name, vgpu->common.has_shm_region);
+
+    snprintf(name, sizeof(name), "select %s host-visible SHM", prefix);
+    require_int(name,
+                virtio_mmio_write(&vgpu->common, REG(SHMSel), 4,
+                                  VIRTIO_GPU_SHM_ID_HOST_VISIBLE),
+                0);
+    snprintf(name, sizeof(name), "read %s SHM len low", prefix);
+    require_int(name,
+                virtio_mmio_read(&vgpu->common, REG(SHMLenLow), 4,
+                                 &mmio_value),
+                0);
+    snprintf(name, sizeof(name), "%s MMIO SHM len low", prefix);
+    require_u32(name, mmio_value, UINT32_MAX);
+    snprintf(name, sizeof(name), "read %s SHM len high", prefix);
+    require_int(name,
+                virtio_mmio_read(&vgpu->common, REG(SHMLenHigh), 4,
+                                 &mmio_value),
+                0);
+    snprintf(name, sizeof(name), "%s MMIO SHM len high", prefix);
+    require_u32(name, mmio_value, UINT32_MAX);
+    snprintf(name, sizeof(name), "read %s SHM base low", prefix);
+    require_int(name,
+                virtio_mmio_read(&vgpu->common, REG(SHMBaseLow), 4,
+                                 &mmio_value),
+                0);
+    snprintf(name, sizeof(name), "%s MMIO SHM base low", prefix);
+    require_u32(name, mmio_value, UINT32_MAX);
+    snprintf(name, sizeof(name), "read %s SHM base high", prefix);
+    require_int(name,
+                virtio_mmio_read(&vgpu->common, REG(SHMBaseHigh), 4,
+                                 &mmio_value),
+                0);
+    snprintf(name, sizeof(name), "%s MMIO SHM base high", prefix);
+    require_u32(name, mmio_value, UINT32_MAX);
+
+    num_capsets = vgpu->common.ops->read_config(
+        vgpu->common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    snprintf(name, sizeof(name), "%s capsets hidden", prefix);
+    require_u32(name, num_capsets, 0);
+
+    virtio_gpu_set_num_capsets(vgpu, 5);
+    num_capsets = vgpu->common.ops->read_config(
+        vgpu->common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
+        sizeof(num_capsets));
+    snprintf(name, sizeof(name), "%s capsets remain hidden", prefix);
+    require_u32(name, num_capsets, 0);
+}
+
 static void test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable(void)
 {
     uint32_t ram[64] = {0};
@@ -4880,10 +4946,7 @@ static void test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable(void)
                 virtio_device_common_reset(&vgpu.common), 0);
     require_false("disabled reset advanced common generation",
                   vgpu.common.generation == old_generation);
-    require_u64("disabled reset keeps VirGL feature hidden",
-                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL, 0);
-    require_u64("disabled reset keeps context-init hidden",
-                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_vgpu_3d_runtime_hidden("disabled reset", &vgpu);
 
     struct vgpu_renderer_request request = {0};
     require_int("disabled reset queues no renderer request",
@@ -4892,6 +4955,34 @@ static void test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable(void)
     struct vgpu_renderer_debug_stats renderer_stats;
     vgpu_renderer_debug_snapshot(&renderer_stats);
     require_false("disabled reset keeps renderer unavailable",
+                  renderer_stats.available);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
+static void test_vgpu_headless_virgl_reset_keeps_renderer_unavailable(void)
+{
+    uint32_t ram[64] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    uint64_t old_generation;
+
+    init_vgpu_test_state_with_virgl(&emu, &vgpu, ram, sizeof(ram), false);
+    old_generation = vgpu.common.generation;
+
+    require_int("common reset after headless virgl",
+                virtio_device_common_reset(&vgpu.common), 0);
+    require_false("headless reset advanced common generation",
+                  vgpu.common.generation == old_generation);
+    require_vgpu_3d_runtime_hidden("headless reset", &vgpu);
+
+    struct vgpu_renderer_request request = {0};
+    require_int("headless reset queues no renderer request",
+                vgpu_renderer_pop_request(&request), false);
+
+    struct vgpu_renderer_debug_stats renderer_stats;
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_false("headless reset keeps renderer unavailable",
                   renderer_stats.available);
 
     destroy_vgpu_test_state(&emu, &vgpu);
@@ -5886,6 +5977,7 @@ int main(void)
 #if SEMU_HAS(VIRGL)
     test_vgpu_common_reset_queues_renderer_reset_request();
     test_vgpu_disabled_virgl_reset_keeps_renderer_unavailable();
+    test_vgpu_headless_virgl_reset_keeps_renderer_unavailable();
 #endif
     test_vgpu_display_counters_snapshot_reads_existing_counters();
     test_undefined_command_returns_device_error();
