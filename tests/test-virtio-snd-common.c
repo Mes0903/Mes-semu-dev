@@ -35,6 +35,8 @@ static bool test_ram_dma_read(const ram_dma_t *dma,
 #define TX_RELEASE_RESP_ADDR 0x1180
 #define CTRL_RELEASE_REQ_ADDR 0x11c0
 #define CTRL_RELEASE_RESP_ADDR 0x1200
+#define RX_XFER_ADDR 0x1240
+#define RX_STATUS_ADDR 0x1280
 
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static emu_state_t emu;
@@ -785,6 +787,48 @@ static void test_pcm_release_flushes_pending_tx_queue(void)
     destroy_snd_fixture();
 }
 
+static void test_rx_queue_notify_completes_io_error(void)
+{
+    virtio_snd_pcm_xfer_t rx_request = {
+        .stream_id = 0,
+    };
+    virtio_snd_pcm_status_t rx_response = {
+        .status = 0xffffffffU,
+        .latency_bytes = 0xffffffffU,
+    };
+    guest_paddr_t rx_used_elem = USED_ADDR(VSND_QUEUE_RX) + 4;
+
+    configure_snd_fixture();
+    configure_all_snd_queues();
+
+    dma_write(RX_XFER_ADDR, &rx_request, sizeof(rx_request));
+    dma_write(RX_STATUS_ADDR, &rx_response, sizeof(rx_response));
+    write_desc(DESC_ADDR(VSND_QUEUE_RX), 0, RX_XFER_ADDR, sizeof(rx_request),
+               VIRTIO_DESC_F_NEXT, 1);
+    write_desc(DESC_ADDR(VSND_QUEUE_RX), 1, RX_STATUS_ADDR,
+               sizeof(rx_response), VIRTIO_DESC_F_WRITE, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_RX) + 4, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_RX) + 2, 1);
+
+    mmio_write(REG(QueueNotify), VSND_QUEUE_RX);
+
+    require_bool("RX used idx", wait_for_used_idx(VSND_QUEUE_RX, 1, 1000),
+                 true);
+    require_u32("RX used id", read32(rx_used_elem), 0);
+    require_u32("RX used len", read32(rx_used_elem + 4),
+                sizeof(virtio_snd_pcm_status_t));
+    dma_read(RX_STATUS_ADDR, &rx_response, sizeof(rx_response));
+    require_u32("RX status", rx_response.status, VIRTIO_SND_S_IO_ERR);
+    require_u32("RX latency", rx_response.latency_bytes, 0);
+    require_u32("RX no device reset",
+                virtio_snd_status_load(&emu.vsnd) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+    require_bool("RX IRQ published", virtio_snd_irq_pending(&emu.vsnd), true);
+
+    destroy_snd_fixture();
+}
+
 static void test_reset_closes_callbacks_before_freeing_buffers(void)
 {
     virtio_snd_prop_t *props;
@@ -970,6 +1014,7 @@ int main(void)
     test_pcm_start_failure_completes_without_started_state();
     test_pcm_start_failure_reset_closes_prepared_stream();
     test_pcm_release_flushes_pending_tx_queue();
+    test_rx_queue_notify_completes_io_error();
     test_reset_closes_callbacks_before_freeing_buffers();
     test_reset_closes_stream_opened_by_inflight_actor();
     test_common_reset_start_cancels_stale_avail_failure();
