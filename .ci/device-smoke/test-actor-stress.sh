@@ -39,6 +39,9 @@ script_for_test() {
         netdev)
             printf '%s\n' "${SCRIPT_DIR}/test-netdev-actor.sh"
             ;;
+        sound)
+            printf '%s\n' "${SCRIPT_DIR}/test-sound-actor.sh"
+            ;;
         gpu3d)
             printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d.sh"
             ;;
@@ -60,7 +63,7 @@ script_for_test() {
 for test_name in "${ACTOR_STRESS_TESTS[@]}"; do
     if ! script_for_test "${test_name}" >/dev/null; then
         echo "FAIL: unknown actor stress test '${test_name}'" >&2
-        echo "Known tests: gpu vinput netdev gpu3d gpu3d-stress gpu3d-reboot gpu3d-window-close" >&2
+        echo "Known tests: gpu vinput netdev sound gpu3d gpu3d-stress gpu3d-reboot gpu3d-window-close" >&2
         exit 1
     fi
 done
