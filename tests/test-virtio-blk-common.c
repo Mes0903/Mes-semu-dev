@@ -1045,6 +1045,62 @@ static void test_reset_drains_pending_out_disk_write_without_stale_completion(
     async_blk_call_destroy(&notify);
 }
 
+static void test_stop_drains_pending_out_disk_write_without_stale_completion(
+    void)
+{
+    uint8_t guest_pattern[DISK_BLK_SIZE];
+    uint8_t disk_before[DISK_BLK_SIZE];
+    struct async_blk_call notify;
+    struct async_blk_call destroy;
+
+    configure_blk();
+    for (size_t i = 0; i < sizeof(guest_pattern); i++) {
+        guest_pattern[i] = (uint8_t) (0x80U + i);
+        disk_before[i] = (uint8_t) (0xb0U + i);
+    }
+    memcpy(disk_words, disk_before, sizeof(disk_before));
+    dma_write(DATA_ADDR, guest_pattern, sizeof(guest_pattern));
+    dma_write(STATUS_ADDR, &(uint8_t) {0xff}, 1);
+
+    publish_one_request(VIRTIO_BLK_T_OUT, 0, sizeof(guest_pattern));
+    dma_gate_enable(&blk_dma_read_gate, DATA_ADDR, sizeof(guest_pattern));
+    async_blk_call_init(&notify, &emu.vblk);
+    async_blk_call_start_notify(&notify);
+    require_bool("actor entered disk write read before stop",
+                 dma_gate_wait_entered(&blk_dma_read_gate, 1000), true);
+    require_bool("QueueNotify returned before out stop",
+                 async_blk_call_wait_done(&notify, 1000), true);
+
+    async_blk_call_init(&destroy, &emu.vblk);
+    async_blk_call_start_destroy(&destroy);
+    require_bool("out stop advanced actor generation",
+                 wait_for_blk_actor_state(&emu.vblk, VIRTIO_ACTOR_STOPPING),
+                 true);
+    require_bool("destroy waits while out disk write is blocked",
+                 async_blk_call_wait_done(&destroy, 25), false);
+    require_mem("disk unchanged before blocked out write is released",
+                disk_words, disk_before, sizeof(disk_before));
+
+    dma_gate_release(&blk_dma_read_gate);
+    async_blk_call_join(&notify);
+    async_blk_call_join(&destroy);
+    require_int("out destroy return", destroy.ret, 0);
+    require_mem("out disk write drained before destroy returned", disk_words,
+                guest_pattern, sizeof(guest_pattern));
+    require_u16("out stop stale used idx remains clear", read16(USED_ADDR + 2),
+                0);
+    require_u32("out stop stale interrupt remains clear",
+                virtio_irq_read_status(&emu.vblk.common.irq), 0);
+    require_u32("out stop only destroy clear wakes harts", wake_count, 1);
+    require_bool("out stop stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VBLK), false);
+
+    async_blk_call_destroy(&destroy);
+    async_blk_call_destroy(&notify);
+    pthread_mutex_destroy(&emu.plic_lock);
+    semu_vm_lifecycle_destroy(&emu.lifecycle);
+}
+
 static void test_common_reset_start_cancels_stale_avail_failure(void)
 {
     int ret;
@@ -1137,6 +1193,8 @@ int main(void)
 
     test_reset_drains_pending_out_disk_write_without_stale_completion();
     destroy_blk_fixture();
+
+    test_stop_drains_pending_out_disk_write_without_stale_completion();
 
     test_stop_cancels_stale_pending_actor_completion();
 
