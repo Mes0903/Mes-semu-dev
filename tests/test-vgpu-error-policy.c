@@ -1200,6 +1200,128 @@ static void test_active_disable_preserves_queued_actor_blob_request(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_common_reset_clears_queued_actor_blob_request(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x80);
+    struct virtq_desc desc0 = {
+        .addr = 0x40,
+        .len = sizeof(*blob),
+        .flags = VIRTIO_DESC_F_NEXT,
+        .next = 1,
+    };
+    struct virtq_desc desc1 = {
+        .addr = 0x80,
+        .len = sizeof(*response),
+        .flags = VIRTIO_DESC_F_WRITE,
+    };
+    struct vgpu_renderer_debug_stats renderer_stats;
+    struct vgpu_renderer_request request = {0};
+    const uint32_t resource_id = 81;
+    uint64_t old_generation;
+    uint64_t old_requests_popped;
+
+    drain_display_queue();
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+    vgpu_renderer_reset_queues(vgpu.common.generation);
+
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = resource_id;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->size = 4096;
+    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
+    memcpy((uint8_t *) ram + 0x110, &desc1, sizeof(desc1));
+    store_u16(ram, 0x200, 0);
+    store_u16(ram, 0x202, 1);
+    store_u16(ram, 0x204, 0);
+    store_u16(ram, 0x302, 0);
+
+    require_int("configure reset queued actor",
+                virtio_actor_enter_configuring(&vgpu.actor), 0);
+    require_int("activate reset queued actor",
+                virtio_actor_activate(&vgpu.actor), 0);
+    require_int("start reset queued actor", virtio_actor_start(&vgpu.actor),
+                0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    require_int(
+        "notify queued actor blob create before common reset",
+        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
+                                      vgpu.common.generation),
+        0);
+    wait_for_renderer_request_depth(1, &renderer_stats);
+    old_generation = vgpu.common.generation;
+    old_requests_popped = renderer_stats.requests_popped;
+
+    require_int("reset queued blob renderer queue available before reset",
+                renderer_stats.available, true);
+    require_u64("reset queued blob renderer generation before reset",
+                renderer_stats.active_generation, old_generation);
+    require_u16("reset queued blob used ring deferred before reset",
+                load_u16(ram, 0x302), 0);
+    require_u32("reset queued blob response untouched before reset",
+                response->type, 0);
+
+    require_int("common reset with queued actor blob request",
+                virtio_device_common_reset(&vgpu.common), 0);
+    require_false("queued blob reset advanced common generation",
+                  vgpu.common.generation == old_generation);
+
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_int("queued blob reset keeps renderer queue available",
+                renderer_stats.available, true);
+    require_u64("queued blob reset renderer generation",
+                renderer_stats.active_generation, vgpu.common.generation);
+    require_u32("queued blob reset leaves one renderer request",
+                renderer_stats.request_depth, 1);
+    require_u32("queued blob reset clears completions",
+                renderer_stats.completion_depth, 0);
+    require_u64("queued blob reset did not pop stale request",
+                renderer_stats.requests_popped, old_requests_popped);
+    require_u16("queued blob reset used ring unchanged", load_u16(ram, 0x302),
+                0);
+    require_u32("queued blob reset response untouched", response->type, 0);
+    require_u32(
+        "queued blob reset used-ring irq not raised",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
+    struct vgpu_display_cmd cmd = {0};
+    require_int("queued blob reset publishes no display payload",
+                vgpu_display_pop_cmd(&cmd), false);
+
+    require_int("queued blob reset request queued",
+                vgpu_renderer_pop_request(&request), true);
+    require_u32("queued blob reset request type", request.type,
+                VGPU_RENDERER_REQ_RESET);
+    require_u64("queued blob reset request generation",
+                request.token.generation, vgpu.common.generation);
+    require_ptr("queued blob reset request payload", request.payload, NULL);
+    require_ptr("queued blob reset release hook", request.release_payload,
+                NULL);
+    require_int("queued blob reset queues only reset request",
+                vgpu_renderer_pop_request(&request), false);
+
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_u32("queued blob reset request queue drained",
+                renderer_stats.request_depth, 0);
+    require_u16("queued blob reset used ring still unchanged",
+                load_u16(ram, 0x302), 0);
+    require_u32("queued blob reset response still untouched", response->type,
+                0);
+    require_u32(
+        "queued blob reset still has no used-ring irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_resource_create_3d_handler_tracks_pending_resource(void)
 {
     uint32_t ram[512] = {0};
@@ -6456,6 +6578,7 @@ int main(void)
     test_runtime_ready_blob_command_reaches_renderer_gate();
     test_active_disable_after_actor_blob_dispatch_keeps_completion_live();
     test_active_disable_preserves_queued_actor_blob_request();
+    test_common_reset_clears_queued_actor_blob_request();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_unsupported_capset_requests_skip_renderer_queue();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
