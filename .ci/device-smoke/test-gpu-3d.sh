@@ -32,6 +32,7 @@ esac
 export TIMEOUT="${VGPU3D_BOOT_TIMEOUT:-${SEMU_TEST_TIMEOUT:-${DEFAULT_BOOT_TIMEOUT}}}"
 export VGPU3D_CMD_TIMEOUT="${VGPU3D_CMD_TIMEOUT:-${DEFAULT_CMD_TIMEOUT}}"
 export VGPU3D_GLXINFO_RETRIES="${VGPU3D_GLXINFO_RETRIES:-${DEFAULT_GLXINFO_RETRIES}}"
+export VGPU3D_GLXINFO_TIMEOUT="${VGPU3D_GLXINFO_TIMEOUT:-10}"
 export VGPU3D_GLXINFO_SLEEP="${VGPU3D_GLXINFO_SLEEP:-1}"
 export VGPU3D_XORG_RETRIES="${VGPU3D_XORG_RETRIES:-${DEFAULT_XORG_RETRIES}}"
 export VGPU3D_XORG_SLEEP="${VGPU3D_XORG_SLEEP:-1}"
@@ -50,6 +51,17 @@ case "${VGPU3D_GLXGEARS_RUNS}" in
 esac
 if (( VGPU3D_GLXGEARS_RUNS < 1 )); then
     print_error "FAIL: VGPU3D_GLXGEARS_RUNS must be a positive integer"
+    exit 1
+fi
+
+case "${VGPU3D_GLXINFO_TIMEOUT}" in
+    ''|*[!0-9]*)
+        print_error "FAIL: VGPU3D_GLXINFO_TIMEOUT must be a positive integer"
+        exit 1
+        ;;
+esac
+if (( VGPU3D_GLXINFO_TIMEOUT < 1 )); then
+    print_error "FAIL: VGPU3D_GLXINFO_TIMEOUT must be a positive integer"
     exit 1
 fi
 
@@ -263,8 +275,223 @@ expect {
   timeout { exit 6 }
 }
 
+proc send_guest_line {line} {
+  send -- $line
+  send "\r"
+}
+
+proc send_guest_script {script} {
+  foreach line [split [string trim $script "\n"] "\n"] {
+    send_guest_line $line
+  }
+}
+
 expect "# " {
-  send "pass=0; total=\u0024(($env(VGPU3D_XORG_RESTARTS) + 1)); status=OK; while test \u0024pass -lt \u0024total; do if test \u0024pass -gt 0; then echo \"--- restarting Xorg pass \u0024pass ---\"; if test -f /tmp/xorg.pid; then kill \u0024(cat /tmp/xorg.pid) 2>/dev/null || true; fi; if command -v pidof >/dev/null 2>&1; then pids=\u0024(pidof Xorg X 2>/dev/null || true); if test -n \"\u0024pids\"; then kill \u0024pids 2>/dev/null || true; fi; else pids=\u0024(ps | awk '/\[X]org|\[X] / {print \u00241}' 2>/dev/null || true); if test -n \"\u0024pids\"; then kill \u0024pids 2>/dev/null || true; fi; fi; sleep 1; rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/xorg.log /tmp/xorg.pid; Xorg :0 -noreset -nolisten tcp >/tmp/xorg.log 2>&1 & echo \u0024! >/tmp/xorg.pid; i=0; ready=FAIL; while test \u0024i -lt $env(VGPU3D_XORG_RETRIES); do if test -S /tmp/.X11-unix/X0; then ready=READY; break; fi; sleep $env(VGPU3D_XORG_SLEEP); i=\u0024((i + 1)); done; if test \"\u0024ready\" != READY; then echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; status=XORG; break; fi; fi; run=1; while test \u0024run -le $env(VGPU3D_GLXGEARS_RUNS); do echo \"--- glxinfo pass \u0024pass run \u0024run ---\"; rm -f /tmp/vgpu3d-glxinfo.log; i=0; glxinfo_status=FAIL; while test \u0024i -lt $env(VGPU3D_GLXINFO_RETRIES); do DISPLAY=:0 glxinfo -B >/tmp/vgpu3d-glxinfo.log 2>&1 && { glxinfo_status=OK; break; }; i=\u0024((i + 1)); sleep $env(VGPU3D_GLXINFO_SLEEP); done; head -80 /tmp/vgpu3d-glxinfo.log; if test \"\u0024glxinfo_status\" != OK || ! grep -Eiq 'OpenGL renderer string:.*virgl|Device:.*virgl|virgl' /tmp/vgpu3d-glxinfo.log; then echo '--- forced virgl loader diagnostic ---'; DISPLAY=:0 LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B >/tmp/vgpu3d-glxinfo-virtio.log 2>&1 || true; head -120 /tmp/vgpu3d-glxinfo-virtio.log; echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; echo '--- dmesg virgl tail ---'; dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true; status=GLXINFO; break; fi; echo \"--- glxgears pass \u0024pass run \u0024run ---\"; rm -f /tmp/vgpu3d-glxgears.log; if command -v timeout >/dev/null 2>&1; then DISPLAY=:0 timeout ${env(VGPU3D_STRESS_GLXGEARS_SECONDS)}s glxgears >/tmp/vgpu3d-glxgears.log 2>&1; rc=\u0024?; else DISPLAY=:0 glxgears >/tmp/vgpu3d-glxgears.log 2>&1 & pid=\u0024!; sleep $env(VGPU3D_STRESS_GLXGEARS_SECONDS); kill \u0024pid 2>/dev/null || true; wait \u0024pid 2>/dev/null || true; rc=124; fi; head -40 /tmp/vgpu3d-glxgears.log; if ! { test \"\u0024rc\" -eq 0 || test \"\u0024rc\" -eq 124; } || ! grep -Eiq 'Running synchronized|frames in|GL_RENDERER|virgl' /tmp/vgpu3d-glxgears.log; then echo '--- xorg log tail ---'; tail -120 /tmp/xorg.log 2>/dev/null || true; echo '--- dmesg virgl tail ---'; dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true; status=GLXGEARS; break; fi; run=\u0024((run + 1)); done; if test \"\u0024status\" != OK; then break; fi; pass=\u0024((pass + 1)); done; printf \"__VGPU3D_REPEAT_%s__\\n\" \"\u0024status\"\r"
+  send_guest_line {cat > /tmp/vgpu3d-repeat.sh <<'VGPU3D_SCRIPT'}
+  send_guest_line {#!/bin/sh}
+  send_guest_line "xorg_restarts=$env(VGPU3D_XORG_RESTARTS)"
+  send_guest_line "xorg_retries=$env(VGPU3D_XORG_RETRIES)"
+  send_guest_line "xorg_sleep=$env(VGPU3D_XORG_SLEEP)"
+  send_guest_line "glxinfo_retries=$env(VGPU3D_GLXINFO_RETRIES)"
+  send_guest_line "glxinfo_timeout=$env(VGPU3D_GLXINFO_TIMEOUT)"
+  send_guest_line "glxinfo_sleep=$env(VGPU3D_GLXINFO_SLEEP)"
+  send_guest_line "glxgears_runs=$env(VGPU3D_GLXGEARS_RUNS)"
+  send_guest_line "glxgears_seconds=$env(VGPU3D_STRESS_GLXGEARS_SECONDS)"
+  send_guest_script {
+status=OK
+
+print_xorg_logs() {
+  for log_file in /tmp/xorg.log /var/log/Xorg.0.0.log /var/log/Xorg.0.log; do
+    if test -f "$log_file"; then
+      echo "--- xorg log tail ($log_file) ---"
+      tail -120 "$log_file" 2>/dev/null || true
+    fi
+  done
+}
+
+restart_xorg() {
+  echo "--- restarting Xorg pass $pass ---"
+  if test -f /tmp/xorg.pid; then
+    kill "$(cat /tmp/xorg.pid)" 2>/dev/null || true
+  fi
+
+  if command -v pidof >/dev/null 2>&1; then
+    pids=$(pidof Xorg X 2>/dev/null || true)
+  else
+    pids=$(ps | awk '/[X]org|[X] / {print $1}' 2>/dev/null || true)
+  fi
+  if test -n "$pids"; then
+    kill $pids 2>/dev/null || true
+  fi
+
+  sleep 1
+  rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/xorg.log /tmp/xorg.pid
+  Xorg :0 -noreset -nolisten tcp >/tmp/xorg.log 2>&1 &
+  echo $! >/tmp/xorg.pid
+}
+
+wait_for_xorg() {
+  i=0
+  ready=FAIL
+  while test "$i" -lt "$xorg_retries"; do
+    if test -S /tmp/.X11-unix/X0; then
+      ready=READY
+      break
+    fi
+    sleep "$xorg_sleep"
+    i=$((i + 1))
+  done
+  test "$ready" = READY
+}
+
+run_glxinfo_bounded() {
+  log_file=$1
+  forced=$2
+  timeout_message=$3
+  timeout_flag=$4
+
+  glxinfo_rc=1
+  rm -f "$timeout_flag"
+  if test "$forced" = 1; then
+    DISPLAY=:0 LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B >"$log_file" 2>&1 &
+  else
+    DISPLAY=:0 glxinfo -B >"$log_file" 2>&1 &
+  fi
+  glxinfo_pid=$!
+  (
+    sleep "$glxinfo_timeout"
+    if kill -0 "$glxinfo_pid" 2>/dev/null; then
+      : >"$timeout_flag"
+      kill "$glxinfo_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$glxinfo_pid" 2>/dev/null || true
+    fi
+  ) &
+  glxinfo_watchdog=$!
+  wait "$glxinfo_pid"
+  glxinfo_rc=$?
+  kill "$glxinfo_watchdog" 2>/dev/null || true
+  wait "$glxinfo_watchdog" 2>/dev/null || true
+  if test -f "$timeout_flag"; then
+    glxinfo_rc=124
+  fi
+
+  if test "$glxinfo_rc" -eq 124; then
+    echo "$timeout_message" >>"$log_file"
+  fi
+  return "$glxinfo_rc"
+}
+
+run_glxgears_bounded() {
+  log_file=$1
+  timeout_flag=$2
+
+  rm -f "$timeout_flag"
+  DISPLAY=:0 glxgears -info >"$log_file" 2>&1 &
+  glxgears_pid=$!
+  (
+    sleep "$glxgears_seconds"
+    if kill -0 "$glxgears_pid" 2>/dev/null; then
+      : >"$timeout_flag"
+      kill "$glxgears_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$glxgears_pid" 2>/dev/null || true
+    fi
+  ) &
+  glxgears_watchdog=$!
+  wait "$glxgears_pid"
+  glxgears_rc=$?
+  kill "$glxgears_watchdog" 2>/dev/null || true
+  wait "$glxgears_watchdog" 2>/dev/null || true
+
+  if test -f "$timeout_flag"; then
+    echo "glxgears stayed alive for ${glxgears_seconds}s" >>"$log_file"
+    glxgears_rc=124
+  fi
+  return "$glxgears_rc"
+}
+
+pass=0
+total=$((xorg_restarts + 1))
+while test "$pass" -lt "$total"; do
+  if test "$pass" -gt 0; then
+    restart_xorg
+    if ! wait_for_xorg; then
+      print_xorg_logs
+      status=XORG
+      break
+    fi
+  fi
+
+  run=1
+  while test "$run" -le "$glxgears_runs"; do
+    echo "--- glxinfo pass $pass run $run ---"
+    rm -f /tmp/vgpu3d-glxinfo.log
+    i=0
+    glxinfo_status=FAIL
+    while test "$i" -lt "$glxinfo_retries"; do
+      run_glxinfo_bounded /tmp/vgpu3d-glxinfo.log 0 \
+        "glxinfo -B timed out after ${glxinfo_timeout}s" \
+        /tmp/vgpu3d-glxinfo-timeout.flag
+      glxinfo_rc=$?
+      if test "$glxinfo_rc" -eq 0; then
+        glxinfo_status=OK
+        break
+      fi
+      if test "$glxinfo_rc" -eq 124; then
+        glxinfo_status=TIMEOUT
+        break
+      fi
+      i=$((i + 1))
+      sleep "$glxinfo_sleep"
+    done
+
+    head -80 /tmp/vgpu3d-glxinfo.log
+    if test "$glxinfo_status" != OK ||
+       ! grep -Eiq 'OpenGL renderer string:.*virgl|Device:.*virgl|virgl' /tmp/vgpu3d-glxinfo.log; then
+      echo '--- forced virgl loader diagnostic ---'
+      run_glxinfo_bounded /tmp/vgpu3d-glxinfo-virtio.log 1 \
+        "forced glxinfo -B timed out after ${glxinfo_timeout}s" \
+        /tmp/vgpu3d-glxinfo-virtio-timeout.flag
+      head -120 /tmp/vgpu3d-glxinfo-virtio.log
+      print_xorg_logs
+      echo '--- dmesg virgl tail ---'
+      dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true
+      status=GLXINFO
+      break
+    fi
+
+    echo "--- glxgears pass $pass run $run ---"
+    rm -f /tmp/vgpu3d-glxgears.log
+    run_glxgears_bounded /tmp/vgpu3d-glxgears.log /tmp/vgpu3d-glxgears-timeout.flag
+    rc=$?
+    head -40 /tmp/vgpu3d-glxgears.log
+    glxgears_status=OK
+    if test "$rc" -ne 124; then
+      glxgears_status=FAIL
+    fi
+    if test "$glxgears_status" != OK; then
+      print_xorg_logs
+      echo '--- dmesg virgl tail ---'
+      dmesg | grep -Ei 'virtio.*gpu|drm.*virtio|virgl|capset|resource.*blob|host.*visible' | tail -120 || true
+      status=GLXGEARS
+      break
+    fi
+
+    run=$((run + 1))
+  done
+
+  if test "$status" != OK; then
+    break
+  fi
+  pass=$((pass + 1))
+done
+
+printf "__VGPU3D_REPEAT_%s__\n" "$status"
+}
+  send_guest_line {VGPU3D_SCRIPT}
+  send_guest_line {chmod +x /tmp/vgpu3d-repeat.sh}
+  send_guest_line {/tmp/vgpu3d-repeat.sh}
 } timeout { exit 7 }
 expect {
   -exact "__VGPU3D_REPEAT_OK__" {}
