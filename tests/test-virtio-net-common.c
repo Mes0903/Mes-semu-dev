@@ -567,6 +567,16 @@ static bool wait_for_rx_used_idx(uint16_t idx)
     return false;
 }
 
+static bool wait_for_net_queue_fd_ready(uint16_t queue, bool want)
+{
+    for (unsigned i = 0; i < 1000; i++) {
+        if (virtio_net_queue_fd_ready(&emu.vnet, queue) == want)
+            return true;
+        sleep_one_ms();
+    }
+    return false;
+}
+
 static ssize_t event_loop_find_fd(const struct semu_event_loop *loop, int fd)
 {
     for (size_t i = 0; i < loop->count; i++) {
@@ -1411,6 +1421,73 @@ static void test_tx_eagain_event_restores_tx_readiness(void)
     semu_event_loop_destroy(&loop);
 }
 
+static void test_rx_eagain_event_restores_rx_readiness_and_preserves_avail(
+    void)
+{
+    struct semu_event_loop loop;
+    struct semu_event event = {0};
+    const char payload[] = "rx-eagain";
+    unsigned header_len;
+    ssize_t rx_index;
+    int flags;
+
+    configure_net();
+    header_len = virtio_net_header_len(&emu.vnet);
+    flags = fcntl(user_net.guest_to_host_channel[SLIRP_READ_SIDE], F_GETFL, 0);
+    require_bool("rx pipe get flags", flags >= 0, true);
+    require_int("rx pipe nonblock",
+                fcntl(user_net.guest_to_host_channel[SLIRP_READ_SIDE],
+                      F_SETFL, flags | O_NONBLOCK),
+                0);
+
+    publish_rx_buffer(header_len + sizeof(payload) - 1);
+    virtio_net_set_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX, true);
+    mmio_write(REG(QueueNotify), VNET_QUEUE_RX);
+
+    require_bool("rx readiness cleared after EAGAIN",
+                 wait_for_net_queue_fd_ready(VNET_QUEUE_RX, false), true);
+    require_u16("rx EAGAIN used idx unchanged", read16(RX_USED_ADDR + 2), 0);
+    require_u32("rx EAGAIN interrupt remains clear",
+                mmio_read(REG(InterruptStatus)), 0);
+    require_bool("rx EAGAIN irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VNET), false);
+    require_u32("rx EAGAIN needs-reset remains clear",
+                mmio_read(REG(Status)) & VIRTIO_STATUS__DEVICE_NEEDS_RESET, 0);
+
+    require_int("event loop init", semu_event_loop_init(&loop, "net-test"), 0);
+    require_int("net event sync",
+                virtio_net_event_sync(&emu.vnet, &loop,
+                                      SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                0);
+    rx_index =
+        event_loop_find_fd(&loop,
+                           user_net.guest_to_host_channel[SLIRP_READ_SIDE]);
+    require_bool("rx readable fd registered after EAGAIN", rx_index >= 0,
+                 true);
+
+    require_int("write rx packet after EAGAIN",
+                (int) write(user_net.guest_to_host_channel[SLIRP_WRITE_SIDE],
+                            payload, sizeof(payload) - 1),
+                (int) sizeof(payload) - 1);
+    event.token = loop.tokens[rx_index];
+    event.events = SEMU_EVENT_READABLE;
+    require_bool("rx readable event handled",
+                 virtio_net_event_handle(&emu.vnet, &event,
+                                         SEMU_EVENT_TOKEN_FIRST_DEVICE),
+                 true);
+    require_bool("rx readiness restored after event",
+                 virtio_net_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX), true);
+    require_bool("rx actor completed preserved avail",
+                 wait_for_rx_used_idx(1), true);
+    require_u32("rx preserved avail used id", read32(RX_USED_ADDR + 4), 0);
+    require_u32("rx preserved avail used len", read32(RX_USED_ADDR + 8),
+                header_len + sizeof(payload) - 1);
+    require_u32("rx preserved avail irq status",
+                mmio_read(REG(InterruptStatus)), VIRTIO_INT__USED_RING);
+
+    semu_event_loop_destroy(&loop);
+}
+
 static void test_net_reset_resync_does_not_restore_fd_readiness(void)
 {
     struct semu_event_loop loop;
@@ -1506,6 +1583,9 @@ int main(void)
     destroy_net_fixture();
 
     test_tx_eagain_event_restores_tx_readiness();
+    destroy_net_fixture();
+
+    test_rx_eagain_event_restores_rx_readiness_and_preserves_avail();
     destroy_net_fixture();
 
     test_net_reset_resync_does_not_restore_fd_readiness();
