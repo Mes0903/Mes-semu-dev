@@ -80,11 +80,27 @@ static struct writev_gate net_writev_gate = {
     .cond = PTHREAD_COND_INITIALIZER,
 };
 
+struct dma_write_gate {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    guest_paddr_t addr;
+    guest_size_t len;
+    bool enabled;
+    bool entered;
+    bool release;
+};
+
+static struct dma_write_gate net_dma_write_gate = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+
 struct async_net_call {
     pthread_t thread;
     pthread_mutex_t lock;
     pthread_cond_t cond;
     virtio_net_state_t *vnet;
+    uint16_t queue_index;
     bool done;
     int ret;
 };
@@ -174,6 +190,17 @@ static bool test_ram_dma_write(ram_dma_t *dma,
                                const void *buf,
                                guest_size_t len)
 {
+    pthread_mutex_lock(&net_dma_write_gate.lock);
+    if (net_dma_write_gate.enabled && addr == net_dma_write_gate.addr &&
+        len == net_dma_write_gate.len) {
+        net_dma_write_gate.entered = true;
+        pthread_cond_broadcast(&net_dma_write_gate.cond);
+        while (!net_dma_write_gate.release)
+            pthread_cond_wait(&net_dma_write_gate.cond,
+                              &net_dma_write_gate.lock);
+    }
+    pthread_mutex_unlock(&net_dma_write_gate.lock);
+
     return ram_dma_write(dma, addr, buf, len);
 }
 
@@ -576,6 +603,17 @@ static void publish_rx_buffer(uint32_t len)
     write16(RX_AVAIL_ADDR + 2, 1);
 }
 
+static void publish_rx_packet_buffer(uint32_t packet_len)
+{
+    uint32_t header_len = virtio_net_header_len(&emu.vnet);
+
+    write_desc(RX_DESC_ADDR, 0, HEADER_ADDR, header_len,
+               VIRTIO_DESC_F_WRITE | VIRTIO_DESC_F_NEXT, 1);
+    write_desc(RX_DESC_ADDR, 1, DATA_ADDR, packet_len, VIRTIO_DESC_F_WRITE, 0);
+    write16(RX_AVAIL_ADDR + 4, 0);
+    write16(RX_AVAIL_ADDR + 2, 1);
+}
+
 static void fill_tx_pipe_until_eagain(void)
 {
     uint8_t bytes[512] = {0};
@@ -628,11 +666,49 @@ static void writev_gate_release(void)
     pthread_mutex_unlock(&net_writev_gate.lock);
 }
 
+static void dma_write_gate_enable(guest_paddr_t addr, guest_size_t len)
+{
+    pthread_mutex_lock(&net_dma_write_gate.lock);
+    net_dma_write_gate.addr = addr;
+    net_dma_write_gate.len = len;
+    net_dma_write_gate.enabled = true;
+    net_dma_write_gate.entered = false;
+    net_dma_write_gate.release = false;
+    pthread_mutex_unlock(&net_dma_write_gate.lock);
+}
+
+static bool dma_write_gate_wait_entered(unsigned timeout_ms)
+{
+    struct timespec deadline = deadline_after_ms(timeout_ms);
+    bool entered;
+
+    pthread_mutex_lock(&net_dma_write_gate.lock);
+    while (!net_dma_write_gate.entered) {
+        int ret = pthread_cond_timedwait(&net_dma_write_gate.cond,
+                                         &net_dma_write_gate.lock, &deadline);
+        if (ret == ETIMEDOUT)
+            break;
+    }
+    entered = net_dma_write_gate.entered;
+    pthread_mutex_unlock(&net_dma_write_gate.lock);
+    return entered;
+}
+
+static void dma_write_gate_release(void)
+{
+    pthread_mutex_lock(&net_dma_write_gate.lock);
+    net_dma_write_gate.enabled = false;
+    net_dma_write_gate.release = true;
+    pthread_cond_broadcast(&net_dma_write_gate.cond);
+    pthread_mutex_unlock(&net_dma_write_gate.lock);
+}
+
 static void async_net_call_init(struct async_net_call *call,
                                 virtio_net_state_t *vnet)
 {
     memset(call, 0, sizeof(*call));
     call->vnet = vnet;
+    call->queue_index = VNET_QUEUE_TX;
     require_int("async lock init", pthread_mutex_init(&call->lock, NULL), 0);
     require_int("async cond init", pthread_cond_init(&call->cond, NULL), 0);
 }
@@ -673,7 +749,7 @@ static void *notify_queue_thread(void *opaque)
 {
     struct async_net_call *call = opaque;
     int ret = virtio_mmio_write(&call->vnet->common, REG(QueueNotify), 4,
-                                VNET_QUEUE_TX);
+                                call->queue_index);
 
     async_net_call_finish(call, ret);
     return NULL;
@@ -702,6 +778,13 @@ static void async_net_call_start_notify(struct async_net_call *call)
     require_int("notify thread create",
                 pthread_create(&call->thread, NULL, notify_queue_thread, call),
                 0);
+}
+
+static void async_net_call_start_notify_queue(struct async_net_call *call,
+                                              uint16_t queue_index)
+{
+    call->queue_index = queue_index;
+    async_net_call_start_notify(call);
 }
 
 static void async_net_call_start_reset(struct async_net_call *call)
@@ -866,6 +949,92 @@ static void test_stop_cancels_stale_net_completion(void)
     require_u32("stop stale interrupt remains clear",
                 virtio_irq_read_status(&emu.vnet.common.irq), 0);
     require_bool("stop stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VNET), false);
+
+    async_net_call_join(&notify);
+    async_net_call_join(&stop);
+    async_net_call_destroy(&notify);
+    async_net_call_destroy(&stop);
+}
+
+static void test_reset_cancels_stale_net_rx_completion(void)
+{
+    struct async_net_call notify;
+    struct async_net_call reset;
+    const char payload[] = "rxreset";
+    uint32_t packet_len = sizeof(payload) - 1;
+
+    configure_net();
+    publish_rx_packet_buffer(packet_len);
+    require_int("write rx reset packet",
+                (int) write(user_net.guest_to_host_channel[SLIRP_WRITE_SIDE],
+                            payload, packet_len),
+                (int) packet_len);
+    virtio_net_set_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX, true);
+
+    dma_write_gate_enable(DATA_ADDR, packet_len);
+    async_net_call_init(&notify, &emu.vnet);
+    async_net_call_init(&reset, &emu.vnet);
+    async_net_call_start_notify_queue(&notify, VNET_QUEUE_RX);
+
+    require_bool("actor entered rx guest packet write",
+                 dma_write_gate_wait_entered(1000), true);
+    async_net_call_start_reset(&reset);
+    require_bool("reset waits for in-flight rx actor mutation",
+                 async_net_call_wait_done(&reset, 50), false);
+
+    dma_write_gate_release();
+    require_bool("reset completed after rx guest write release",
+                 async_net_call_wait_done(&reset, 1000), true);
+    require_int("rx reset return", reset.ret, 0);
+    require_u16("rx reset stale used idx remains clear",
+                read16(RX_USED_ADDR + 2), 0);
+    require_u32("rx reset stale interrupt remains clear",
+                virtio_irq_read_status(&emu.vnet.common.irq), 0);
+    require_bool("rx reset stale irq line remains clear",
+                 source_asserted(&emu, SEMU_IRQ_SOURCE_VNET), false);
+
+    async_net_call_join(&notify);
+    async_net_call_join(&reset);
+    async_net_call_destroy(&notify);
+    async_net_call_destroy(&reset);
+}
+
+static void test_stop_cancels_stale_net_rx_completion(void)
+{
+    struct async_net_call notify;
+    struct async_net_call stop;
+    const char payload[] = "rxstop";
+    uint32_t packet_len = sizeof(payload) - 1;
+
+    configure_net();
+    publish_rx_packet_buffer(packet_len);
+    require_int("write rx stop packet",
+                (int) write(user_net.guest_to_host_channel[SLIRP_WRITE_SIDE],
+                            payload, packet_len),
+                (int) packet_len);
+    virtio_net_set_queue_fd_ready(&emu.vnet, VNET_QUEUE_RX, true);
+
+    dma_write_gate_enable(DATA_ADDR, packet_len);
+    async_net_call_init(&notify, &emu.vnet);
+    async_net_call_init(&stop, &emu.vnet);
+    async_net_call_start_notify_queue(&notify, VNET_QUEUE_RX);
+
+    require_bool("actor entered rx guest packet write before stop",
+                 dma_write_gate_wait_entered(1000), true);
+    async_net_call_start_stop(&stop);
+    require_bool("stop waits for in-flight rx actor mutation",
+                 async_net_call_wait_done(&stop, 50), false);
+
+    dma_write_gate_release();
+    require_bool("stop completed after rx guest write release",
+                 async_net_call_wait_done(&stop, 1000), true);
+    require_int("rx stop return", stop.ret, 0);
+    require_u16("rx stop stale used idx remains clear",
+                read16(RX_USED_ADDR + 2), 0);
+    require_u32("rx stop stale interrupt remains clear",
+                virtio_irq_read_status(&emu.vnet.common.irq), 0);
+    require_bool("rx stop stale irq line remains clear",
                  source_asserted(&emu, SEMU_IRQ_SOURCE_VNET), false);
 
     async_net_call_join(&notify);
@@ -1304,6 +1473,12 @@ int main(void)
     destroy_net_fixture();
 
     test_stop_cancels_stale_net_completion();
+    destroy_net_fixture();
+
+    test_reset_cancels_stale_net_rx_completion();
+    destroy_net_fixture();
+
+    test_stop_cancels_stale_net_rx_completion();
     destroy_net_fixture();
 
     test_common_reset_start_cancels_stale_net_avail_failure();
