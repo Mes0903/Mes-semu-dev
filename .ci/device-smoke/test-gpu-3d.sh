@@ -83,6 +83,48 @@ if (( VGPU3D_STRESS_GLXGEARS_SECONDS < 1 )); then
     exit 1
 fi
 
+case "${VGPU3D_CMD_TIMEOUT}" in
+    ''|*[!0-9]*)
+        print_error "FAIL: VGPU3D_CMD_TIMEOUT must be a positive integer"
+        exit 1
+        ;;
+esac
+if (( VGPU3D_CMD_TIMEOUT < 1 )); then
+    print_error "FAIL: VGPU3D_CMD_TIMEOUT must be a positive integer"
+    exit 1
+fi
+
+if [ -z "${VGPU3D_REPEAT_TIMEOUT:-}" ]; then
+    repeat_runs=$(( (VGPU3D_XORG_RESTARTS + 1) * VGPU3D_GLXGEARS_RUNS ))
+    per_run_budget=$((VGPU3D_STRESS_GLXGEARS_SECONDS + VGPU3D_GLXINFO_TIMEOUT + 2))
+    setup_budget=$(( (VGPU3D_XORG_RESTARTS + 1) * 60 ))
+    calculated_repeat_timeout=$((repeat_runs * per_run_budget + setup_budget))
+    if (( calculated_repeat_timeout < VGPU3D_CMD_TIMEOUT )); then
+        calculated_repeat_timeout="${VGPU3D_CMD_TIMEOUT}"
+    fi
+    export VGPU3D_REPEAT_TIMEOUT="${calculated_repeat_timeout}"
+else
+    case "${VGPU3D_REPEAT_TIMEOUT}" in
+        ''|*[!0-9]*)
+            print_error "FAIL: VGPU3D_REPEAT_TIMEOUT must be a positive integer"
+            exit 1
+            ;;
+    esac
+    if (( VGPU3D_REPEAT_TIMEOUT < 1 )); then
+        print_error "FAIL: VGPU3D_REPEAT_TIMEOUT must be a positive integer"
+        exit 1
+    fi
+    export VGPU3D_REPEAT_TIMEOUT
+fi
+
+case "${VGPU3D_PRINT_TIMEOUTS:-0}" in
+    1|true|yes)
+        printf 'VGPU3D_CMD_TIMEOUT=%s\n' "${VGPU3D_CMD_TIMEOUT}"
+        printf 'VGPU3D_REPEAT_TIMEOUT=%s\n' "${VGPU3D_REPEAT_TIMEOUT}"
+        exit 0
+        ;;
+esac
+
 case "${VGPU3D_EXPECT_WINDOW_CLOSE}" in
     1|true|yes)
         if [ -z "${SEMU_TEST_WINDOW_CLOSE_ARM_FILE:-}" ]; then
@@ -492,14 +534,17 @@ printf "__VGPU3D_REPEAT_%s__\n" "$status"
   send_guest_line {VGPU3D_SCRIPT}
   send_guest_line {chmod +x /tmp/vgpu3d-repeat.sh}
   send_guest_line {/tmp/vgpu3d-repeat.sh}
-} timeout { exit 7 }
+} timeout { exit 10 } eof { exit 10 }
+set timeout $env(VGPU3D_REPEAT_TIMEOUT)
 expect {
   -exact "__VGPU3D_REPEAT_OK__" {}
   -exact "__VGPU3D_REPEAT_XORG__" { exit 6 }
   -exact "__VGPU3D_REPEAT_GLXINFO__" { exit 7 }
   -exact "__VGPU3D_REPEAT_GLXGEARS__" { exit 8 }
-  timeout { exit 7 }
+  eof { exit 10 }
+  timeout { exit 10 }
 }
+set timeout $env(VGPU3D_CMD_TIMEOUT)
 
 set expect_window_close 0
 if {[info exists env(VGPU3D_EXPECT_WINDOW_CLOSE)]} {
@@ -548,6 +593,7 @@ MESSAGES=(
   "FAIL: glxinfo -B failed or did not report a virgl renderer"
   "FAIL: glxgears did not start cleanly"
   "FAIL: host window-close trigger did not stop semu"
+  "FAIL: vgpu 3D repeat script timed out waiting for completion sentinel"
 )
 
 if [[ "${ret}" -eq 0 ]]; then
