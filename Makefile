@@ -438,6 +438,10 @@ test-vgpu-3d-stress-timeout:
 test-vgpu-3d-reset-stress-wrapper:
 	$(Q)bash tests/test-vgpu-3d-reset-stress-wrapper.sh
 
+.PHONY: test-vgpu-3d-soak-wrapper
+test-vgpu-3d-soak-wrapper:
+	$(Q)bash tests/test-vgpu-3d-soak-wrapper.sh
+
 .PHONY: test-actor-stress-soak-wrapper
 test-actor-stress-soak-wrapper:
 	$(Q)bash tests/test-actor-stress-soak-wrapper.sh
@@ -493,7 +497,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-3d-stress-timeout test-vgpu-3d-reset-stress-wrapper test-actor-stress-soak-wrapper test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-gdbstub-cancel test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-3d-stress-timeout test-vgpu-3d-reset-stress-wrapper test-vgpu-3d-soak-wrapper test-actor-stress-soak-wrapper test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-gdbstub-cancel test-executor-config test-hart-executor
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:

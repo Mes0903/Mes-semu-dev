@@ -120,6 +120,7 @@ fi
 case "${VGPU3D_PRINT_TIMEOUTS:-0}" in
     1|true|yes)
         printf 'VGPU3D_CMD_TIMEOUT=%s\n' "${VGPU3D_CMD_TIMEOUT}"
+        printf 'VGPU3D_STRESS_GLXGEARS_SECONDS=%s\n' "${VGPU3D_STRESS_GLXGEARS_SECONDS}"
         printf 'VGPU3D_REPEAT_TIMEOUT=%s\n' "${VGPU3D_REPEAT_TIMEOUT}"
         exit 0
         ;;
