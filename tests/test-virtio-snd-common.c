@@ -733,6 +733,12 @@ static void test_reset_closes_stream_opened_by_inflight_actor(void)
     require_int("Pa_OpenStream called", (int) fake_open_count, 1);
     require_int("Pa_CloseStream called after quiescence",
                 (int) fake_close_count, 1);
+    require_int("reset actor does not publish used idx",
+                read16(USED_ADDR(VSND_QUEUE_CTRL) + 2), 0);
+    require_u32("reset actor does not raise IRQ status",
+                virtio_irq_read_status(&emu.vsnd.common.irq), 0);
+    require_bool("reset actor has no pending IRQ",
+                 virtio_snd_irq_pending(&emu.vsnd), false);
     async_snd_call_destroy(&call);
     destroy_snd_fixture();
 }
