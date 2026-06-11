@@ -6180,6 +6180,152 @@ static void test_renderer_gl_scanout_add_used_fault_does_not_publish(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_renderer_gl_scanout_display_unavailable_does_not_publish(void)
+{
+    uint32_t ram[1024] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtq_desc create_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtq_desc scanout_desc[VIRTIO_GPU_MAX_DESC] = {0};
+    struct virtio_gpu_resource_create_3d *create =
+        (struct virtio_gpu_resource_create_3d *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_set_scanout *scanout =
+        (struct virtio_gpu_set_scanout *) ((uint8_t *) ram + 0x100);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x180);
+    virtio_gpu_data_t *data;
+    uint32_t len = 0;
+    const uint64_t renderer_generation = 0x5c;
+    const uint64_t fence_id = UINT64_C(0x5c5c123456789abc);
+
+    drain_display_queue();
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    virtio_gpu_register_scanout(&vgpu, 1024, 768);
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+    activate_test_renderer_dispatch(&vgpu, renderer_generation, 5);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+    data = vgpu.priv;
+
+    create->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    create->resource_id = 76;
+    create->target = 2;
+    create->format = 3;
+    create->bind = 4;
+    create->width = 320;
+    create->height = 240;
+    create->depth = 1;
+    create->array_size = 1;
+    create->nr_samples = 1;
+    create_desc[0].addr = 0x40;
+    create_desc[0].len = sizeof(*create);
+    create_desc[1].addr = 0x180;
+    create_desc[1].len = sizeof(*response);
+    create_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    g_virtio_gpu_backend.resource_create_3d(&vgpu, create_desc, &len);
+    require_u32("3d create before unavailable scanout is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    struct vgpu_renderer_request queued = {0};
+    require_int("3d create before unavailable scanout queued",
+                vgpu_renderer_pop_request(&queued), true);
+    queued.release_payload(queued.payload);
+
+    scanout->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    scanout->hdr.fence_id = fence_id;
+    scanout->r.width = 160;
+    scanout->r.height = 120;
+    scanout->scanout_id = 0;
+    scanout->resource_id = 76;
+    scanout_desc[0].addr = 0x100;
+    scanout_desc[0].len = sizeof(*scanout);
+    scanout_desc[1].addr = 0x180;
+    scanout_desc[1].len = sizeof(*response);
+    scanout_desc[1].flags = VIRTIO_DESC_F_WRITE;
+    vgpu.ctrl_dispatch.desc_head = 5;
+    len = 0;
+    g_virtio_gpu_backend.set_scanout(&vgpu, scanout_desc, &len);
+    require_u32("3d set scanout with unavailable display is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("3d set scanout with unavailable display queued",
+                vgpu_renderer_pop_request(&queued), true);
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    struct virtio_gpu_deferred_ctrl_completion ctrl = payload->ctrl_completion;
+    struct virtq_desc response_desc = payload->response_desc;
+    struct virtio_gpu_ctrl_hdr request_hdr = payload->hdr;
+    uint64_t resource_generation = payload->resource_generation;
+    uint64_t scanout_generation = payload->scanout_generation;
+    queued.release_payload(queued.payload);
+
+    vgpu_display_shutdown_after_producer_stopped();
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .has_ctrl_completion = true,
+        .ctrl_completion = ctrl,
+        .has_response_desc = true,
+        .request_hdr = request_hdr,
+        .response_desc = response_desc,
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .scanout_generation = scanout_generation,
+                            .resource_generation = resource_generation,
+                            .has_gl_payload = true,
+                            .gl_payload = test_gl_payload(0x7600),
+                            .scanout =
+                                {
+                                    .enabled = 1,
+                                    .width = data->scanouts[0].width,
+                                    .height = data->scanouts[0].height,
+                                    .primary_resource_id = 76,
+                                    .src_w = 160,
+                                    .src_h = 120,
+                                },
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+
+    require_int("queue renderer gl scanout unavailable completion",
+                vgpu_renderer_complete(&completion), true);
+    virtio_gpu_drain_renderer_completions(&vgpu);
+
+    require_u32("unavailable gl scanout response type", response->type,
+                VIRTIO_GPU_RESP_ERR_UNSPEC);
+    require_u32("unavailable gl scanout response flags", response->flags,
+                VIRTIO_GPU_FLAG_FENCE);
+    require_u64("unavailable gl scanout response fence", response->fence_id,
+                fence_id);
+    require_u16("unavailable gl scanout used idx", load_u16(ram, 0x302), 1);
+    require_u32("unavailable gl scanout used elem id", load_u32(ram, 0x304),
+                5);
+    require_u32("unavailable gl scanout used elem len", load_u32(ram, 0x308),
+                sizeof(*response));
+    require_u32(
+        "unavailable gl scanout used-ring irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING,
+        VIRTIO_INT__USED_RING);
+    require_u32(
+        "unavailable gl scanout does not set reset-needed",
+        atomic_load(&vgpu.common.status) & VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+        0);
+    require_u32("unavailable gl scanout does not commit frontend scanout",
+                data->scanouts[0].primary_resource_id, 0);
+    struct vgpu_display_cmd cmd = {0};
+    require_int("unavailable gl scanout publishes no display payload",
+                vgpu_display_pop_cmd(&cmd), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_renderer_completion_drops_stale_common_generation(void)
 {
     uint32_t ram[512] = {0};
@@ -6621,6 +6767,8 @@ int main(void)
     test_vgpu_destroy_stops_started_actor_and_is_idempotent();
 #if SEMU_HAS(VIRGL)
     test_vgpu_destroy_shutdowns_renderer_queue();
+    /* Keep this last: it latches the process-wide display bridge unavailable. */
+    test_renderer_gl_scanout_display_unavailable_does_not_publish();
 #endif
     return 0;
 }
