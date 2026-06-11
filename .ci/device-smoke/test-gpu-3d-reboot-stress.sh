@@ -192,7 +192,7 @@ proc run_compact_probe {label} {
 }
 
 set timeout $env(TIMEOUT)
-spawn make check
+spawn make check DISKIMG_FILE=$env(DISKIMG_FILE)
 
 login_guest 1
 run_compact_probe "initial"
