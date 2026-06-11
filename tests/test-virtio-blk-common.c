@@ -804,6 +804,39 @@ static void test_host_disk_read_eagain_retry_exhaustion_completes_ioerr(void)
     test_blk_disk_script_clear();
 }
 
+static void test_host_disk_write_eagain_retry_exhaustion_completes_ioerr(void)
+{
+    uint8_t disk_pattern[DISK_BLK_SIZE];
+    uint8_t guest_pattern[DISK_BLK_SIZE];
+    const struct test_blk_disk_op ops[] = {
+        {.kind = TEST_BLK_DISK_WRITE_FROM_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_WRITE_FROM_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_WRITE_FROM_GUEST, .ret = -EAGAIN},
+        {.kind = TEST_BLK_DISK_WRITE_FROM_GUEST, .ret = -EAGAIN},
+    };
+
+    configure_blk();
+    for (size_t i = 0; i < sizeof(disk_pattern); i++) {
+        disk_pattern[i] = (uint8_t) (0x40U + i);
+        guest_pattern[i] = (uint8_t) (0xa0U + i);
+    }
+    memcpy(disk_words, disk_pattern, sizeof(disk_pattern));
+    dma_write(DATA_ADDR, guest_pattern, sizeof(guest_pattern));
+    dma_write(STATUS_ADDR, &(uint8_t) {0xff}, 1);
+    test_blk_disk_script_set(ops, ARRAY_SIZE(ops));
+
+    publish_one_request(VIRTIO_BLK_T_OUT, 0, sizeof(guest_pattern));
+    mmio_write(REG(QueueNotify), 0);
+
+    require_blk_ioerr_completion_without_reset(
+        "host write eagain exhaustion completion");
+    require_u32("host write eagain exhaustion calls",
+                (uint32_t) test_blk_disk_script.call_count, ARRAY_SIZE(ops));
+    require_mem("host write eagain exhaustion leaves disk unchanged",
+                disk_words, disk_pattern, sizeof(disk_pattern));
+    test_blk_disk_script_clear();
+}
+
 static void test_host_disk_read_eio_completes_ioerr_without_reset(void)
 {
     test_host_disk_fault_injection(VIRTIO_BLK_T_IN, EIO, true);
@@ -1085,6 +1118,9 @@ int main(void)
     destroy_blk_fixture();
 
     test_host_disk_read_eagain_retry_exhaustion_completes_ioerr();
+    destroy_blk_fixture();
+
+    test_host_disk_write_eagain_retry_exhaustion_completes_ioerr();
     destroy_blk_fixture();
 
     test_host_disk_read_eio_completes_ioerr_without_reset();
