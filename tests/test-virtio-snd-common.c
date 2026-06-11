@@ -30,6 +30,11 @@ static bool test_ram_dma_read(const ram_dma_t *dma,
 #define CTRL_PREPARE_RESP_ADDR 0x1040
 #define CTRL_START_REQ_ADDR 0x1080
 #define CTRL_START_RESP_ADDR 0x10c0
+#define TX_RELEASE_XFER_ADDR 0x1100
+#define TX_RELEASE_PAYLOAD_ADDR 0x1140
+#define TX_RELEASE_RESP_ADDR 0x1180
+#define CTRL_RELEASE_REQ_ADDR 0x11c0
+#define CTRL_RELEASE_RESP_ADDR 0x1200
 
 static uint32_t ram_words[TEST_RAM_SIZE / 4];
 static emu_state_t emu;
@@ -484,7 +489,9 @@ static void async_snd_call_join(struct async_snd_call *call)
 }
 
 
-static bool wait_for_ctrl_used_idx(uint16_t expected, unsigned timeout_ms)
+static bool wait_for_used_idx(unsigned queue,
+                              uint16_t expected,
+                              unsigned timeout_ms)
 {
     struct timespec deadline = deadline_after_ms(timeout_ms);
 
@@ -495,7 +502,7 @@ static bool wait_for_ctrl_used_idx(uint16_t expected, unsigned timeout_ms)
             .tv_nsec = 1000000L,
         };
 
-        if (read16(USED_ADDR(VSND_QUEUE_CTRL) + 2) == expected)
+        if (read16(USED_ADDR(queue) + 2) == expected)
             return true;
 
         clock_gettime(CLOCK_REALTIME, &now);
@@ -505,6 +512,11 @@ static bool wait_for_ctrl_used_idx(uint16_t expected, unsigned timeout_ms)
             return false;
         nanosleep(&pause, NULL);
     }
+}
+
+static bool wait_for_ctrl_used_idx(uint16_t expected, unsigned timeout_ms)
+{
+    return wait_for_used_idx(VSND_QUEUE_CTRL, expected, timeout_ms);
 }
 
 static uint32_t submit_control_request(const char *name,
@@ -684,6 +696,83 @@ static void test_pcm_start_failure_reset_closes_prepared_stream(void)
     destroy_snd_fixture();
     require_bool("failed START reset/destroy leaves no unclosed stream",
                  fake_terminate_saw_unclosed_stream, false);
+}
+
+static void test_pcm_release_flushes_pending_tx_queue(void)
+{
+    static const uint8_t payload[] = { 0x10, 0x20, 0x30, 0x40, 0x50 };
+    virtio_snd_prop_t *props = &vsnd_props[0];
+    virtio_snd_pcm_xfer_t tx_request = {
+        .stream_id = 0,
+    };
+    virtio_snd_pcm_status_t tx_response = {
+        .status = 0xffffffffU,
+        .latency_bytes = 0xffffffffU,
+    };
+    virtio_snd_pcm_hdr_t release = {
+        .hdr.code = VIRTIO_SND_R_PCM_RELEASE,
+        .stream_id = 0,
+    };
+    virtio_snd_hdr_t release_response = {
+        .code = 0xffffffffU,
+    };
+    guest_paddr_t tx_used_elem = USED_ADDR(VSND_QUEUE_TX) + 4;
+    guest_paddr_t ctrl_used_elem = USED_ADDR(VSND_QUEUE_CTRL) + 4;
+
+    configure_snd_fixture();
+    configure_all_snd_queues();
+
+    dma_write(TX_RELEASE_XFER_ADDR, &tx_request, sizeof(tx_request));
+    dma_write(TX_RELEASE_PAYLOAD_ADDR, payload, sizeof(payload));
+    dma_write(TX_RELEASE_RESP_ADDR, &tx_response, sizeof(tx_response));
+    write_desc(DESC_ADDR(VSND_QUEUE_TX), 0, TX_RELEASE_XFER_ADDR,
+               sizeof(tx_request), VIRTIO_DESC_F_NEXT, 1);
+    write_desc(DESC_ADDR(VSND_QUEUE_TX), 1, TX_RELEASE_PAYLOAD_ADDR,
+               sizeof(payload), VIRTIO_DESC_F_NEXT, 2);
+    write_desc(DESC_ADDR(VSND_QUEUE_TX), 2, TX_RELEASE_RESP_ADDR,
+               sizeof(tx_response), VIRTIO_DESC_F_WRITE, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_TX) + 4, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_TX) + 2, 1);
+
+    dma_write(CTRL_RELEASE_REQ_ADDR, &release, sizeof(release));
+    dma_write(CTRL_RELEASE_RESP_ADDR, &release_response,
+              sizeof(release_response));
+    write_desc(DESC_ADDR(VSND_QUEUE_CTRL), 0, CTRL_RELEASE_REQ_ADDR,
+               sizeof(release), VIRTIO_DESC_F_NEXT, 1);
+    write_desc(DESC_ADDR(VSND_QUEUE_CTRL), 1, CTRL_RELEASE_RESP_ADDR,
+               sizeof(release_response), VIRTIO_DESC_F_WRITE, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 4, 0);
+    write16(AVAIL_ADDR(VSND_QUEUE_CTRL) + 2, 1);
+
+    mmio_write(REG(QueueNotify), VSND_QUEUE_CTRL);
+
+    require_bool("PCM_RELEASE flushes TX used idx",
+                 wait_for_used_idx(VSND_QUEUE_TX, 1, 1000), true);
+    require_bool("PCM_RELEASE control used idx",
+                 wait_for_ctrl_used_idx(1, 1000), true);
+    require_u32("flushed TX used id", read32(tx_used_elem), 0);
+    require_u32("flushed TX used len", read32(tx_used_elem + 4),
+                sizeof(virtio_snd_pcm_status_t));
+    dma_read(TX_RELEASE_RESP_ADDR, &tx_response, sizeof(tx_response));
+    require_u32("flushed TX status", tx_response.status, VIRTIO_SND_S_OK);
+    require_u32("flushed TX latency", tx_response.latency_bytes,
+                sizeof(payload));
+    require_u32("PCM_RELEASE used id", read32(ctrl_used_elem), 0);
+    require_u32("PCM_RELEASE used len", read32(ctrl_used_elem + 4),
+                sizeof(virtio_snd_hdr_t));
+    dma_read(CTRL_RELEASE_RESP_ADDR, &release_response,
+             sizeof(release_response));
+    require_u32("PCM_RELEASE status", release_response.code, VIRTIO_SND_S_OK);
+    require_u32("PCM_RELEASE no device reset",
+                virtio_snd_status_load(&emu.vsnd) &
+                    VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                0);
+    require_bool("PCM_RELEASE leaves TX callback queue empty",
+                 list_empty(&props->buf_queue_head), true);
+    require_int("PCM_RELEASE leaves TX callback notify clear",
+                props->lock.buf_ev_notify, 0);
+
+    destroy_snd_fixture();
 }
 
 static void test_reset_closes_callbacks_before_freeing_buffers(void)
@@ -870,6 +959,7 @@ int main(void)
     test_queue_notify_wakes_actor_without_draining_on_caller();
     test_pcm_start_failure_completes_without_started_state();
     test_pcm_start_failure_reset_closes_prepared_stream();
+    test_pcm_release_flushes_pending_tx_queue();
     test_reset_closes_callbacks_before_freeing_buffers();
     test_reset_closes_stream_opened_by_inflight_actor();
     test_common_reset_start_cancels_stale_avail_failure();
