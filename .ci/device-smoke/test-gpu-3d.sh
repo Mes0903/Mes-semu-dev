@@ -39,6 +39,8 @@ export VGPU3D_GLXGEARS_SECONDS="${VGPU3D_GLXGEARS_SECONDS:-${DEFAULT_GLXGEARS_SE
 export VGPU3D_GLXGEARS_RUNS="${VGPU3D_GLXGEARS_RUNS:-1}"
 export VGPU3D_XORG_RESTARTS="${VGPU3D_XORG_RESTARTS:-0}"
 export VGPU3D_STRESS_GLXGEARS_SECONDS="${VGPU3D_STRESS_GLXGEARS_SECONDS:-${VGPU3D_GLXGEARS_SECONDS}}"
+export VGPU3D_EXPECT_WINDOW_CLOSE="${VGPU3D_EXPECT_WINDOW_CLOSE:-0}"
+export VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT="${VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT:-30}"
 
 case "${VGPU3D_GLXGEARS_RUNS}" in
     ''|*[!0-9]*)
@@ -68,6 +70,25 @@ if (( VGPU3D_STRESS_GLXGEARS_SECONDS < 1 )); then
     print_error "FAIL: VGPU3D_STRESS_GLXGEARS_SECONDS must be a positive integer"
     exit 1
 fi
+
+case "${VGPU3D_EXPECT_WINDOW_CLOSE}" in
+    1|true|yes)
+        if [ -z "${SEMU_TEST_WINDOW_CLOSE_ARM_FILE:-}" ]; then
+            print_error "FAIL: window-close stress needs SEMU_TEST_WINDOW_CLOSE_ARM_FILE"
+            exit 1
+        fi
+        case "${VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT}" in
+            ''|*[!0-9]*)
+                print_error "FAIL: VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT must be a positive integer"
+                exit 1
+                ;;
+        esac
+        if (( VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT < 1 )); then
+            print_error "FAIL: VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT must be a positive integer"
+            exit 1
+        fi
+        ;;
+esac
 
 case "${HEADLESS}" in
     0|false|no)
@@ -252,6 +273,38 @@ expect {
   -exact "__VGPU3D_REPEAT_GLXGEARS__" { exit 8 }
   timeout { exit 7 }
 }
+
+set expect_window_close 0
+if {[info exists env(VGPU3D_EXPECT_WINDOW_CLOSE)]} {
+  set close_value [string tolower $env(VGPU3D_EXPECT_WINDOW_CLOSE)]
+  if {$close_value eq "1" || $close_value eq "true" || $close_value eq "yes"} {
+    set expect_window_close 1
+  }
+}
+
+if {$expect_window_close} {
+  if {![info exists env(SEMU_TEST_WINDOW_CLOSE_ARM_FILE)] ||
+      $env(SEMU_TEST_WINDOW_CLOSE_ARM_FILE) eq ""} {
+    exit 9
+  }
+
+  set arm_file $env(SEMU_TEST_WINDOW_CLOSE_ARM_FILE)
+  if {[catch {set fh [open $arm_file w]} err]} {
+    puts stderr "failed to arm host window-close hook: $err"
+    exit 9
+  }
+  close $fh
+  puts "__VGPU_WINDOW_CLOSE_ARMED__"
+
+  set timeout $env(VGPU3D_WINDOW_CLOSE_WAIT_TIMEOUT)
+  expect eof {
+    set wait_status [wait]
+    set close_rc [lindex $wait_status 3]
+    exit $close_rc
+  } timeout {
+    exit 9
+  }
+}
 DONE
 
 ret="$?"
@@ -267,6 +320,7 @@ MESSAGES=(
   "FAIL: guest Xorg did not start on :0"
   "FAIL: glxinfo -B failed or did not report a virgl renderer"
   "FAIL: glxgears did not start cleanly"
+  "FAIL: host window-close trigger did not stop semu"
 )
 
 if [[ "${ret}" -eq 0 ]]; then
