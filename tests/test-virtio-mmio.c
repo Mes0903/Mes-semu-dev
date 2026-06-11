@@ -863,6 +863,45 @@ static void test_queue_notify_is_gated_when_lifecycle_not_accepting(void)
     destroy_test_emu(&emu);
 }
 
+static void test_queue_notify_resetting_to_running_accepts_only_fresh_notify(
+    void)
+{
+    emu_state_t emu;
+    hart_t hart;
+    hart_t *harts[1];
+    struct virtio_device_common common;
+    struct backend_state backend;
+    const uint16_t queue_max_sizes[] = {8};
+
+    init_ram();
+    init_test_emu(&emu, &hart, harts);
+    init_common(&common, &emu, &backend, 0, 0, queue_max_sizes,
+                ARRAY_SIZE(queue_max_sizes));
+    make_queue_ready(&common);
+
+    require_int("enter resetting",
+                semu_vm_lifecycle_enter_resetting(&emu.lifecycle), 0);
+    require_false("resetting stops device work",
+                  semu_vm_accepting_device_work(&emu.lifecycle));
+    require_int("resetting notify ignored",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
+    require_int("resetting notify skipped backend", backend.notify_count, 0);
+
+    require_int("running after resetting",
+                semu_vm_lifecycle_enter_running(&emu.lifecycle), 0);
+    require_true("running accepts device work",
+                 semu_vm_accepting_device_work(&emu.lifecycle));
+    require_int("fresh notify after running",
+                virtio_mmio_write(&common, REG(QueueNotify), 4, 0), 0);
+    require_int("only fresh notify reached backend", backend.notify_count, 1);
+    require_u16("fresh notify queue", backend.notify_queue, 0);
+    require_u64("fresh notify generation", backend.notify_generation,
+                common.generation);
+
+    virtio_device_common_destroy(&common);
+    destroy_test_emu(&emu);
+}
+
 static void test_queue_notify_without_emu_has_no_lifecycle_gate(void)
 {
     struct virtio_device_common common;
@@ -1677,6 +1716,7 @@ int main(void)
     test_queue_notify_does_not_drain_queue();
     test_queue_notify_succeeds_while_lifecycle_accepting();
     test_queue_notify_is_gated_when_lifecycle_not_accepting();
+    test_queue_notify_resetting_to_running_accepts_only_fresh_notify();
     test_queue_notify_without_emu_has_no_lifecycle_gate();
     test_queue_notify_stale_generation_is_canceled_at_completion();
     test_queue_notify_lifecycle_stop_before_backend_is_ignored();
