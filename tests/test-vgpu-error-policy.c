@@ -879,6 +879,146 @@ static void test_runtime_ready_blob_command_reaches_renderer_gate(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_active_disable_after_actor_blob_dispatch_keeps_completion_live(
+    void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    struct virtio_gpu_resource_create_blob *blob =
+        (struct virtio_gpu_resource_create_blob *) ((uint8_t *) ram + 0x40);
+    struct virtio_gpu_ctrl_hdr *response =
+        (struct virtio_gpu_ctrl_hdr *) ((uint8_t *) ram + 0x80);
+    struct virtq_desc desc0 = {
+        .addr = 0x40,
+        .len = sizeof(*blob),
+        .flags = VIRTIO_DESC_F_NEXT,
+        .next = 1,
+    };
+    struct virtq_desc desc1 = {
+        .addr = 0x80,
+        .len = sizeof(*response),
+        .flags = VIRTIO_DESC_F_WRITE,
+    };
+    struct vgpu_renderer_request queued = {0};
+    struct vgpu_renderer_debug_stats renderer_stats;
+
+    drain_display_queue();
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+    vgpu_renderer_reset_queues(vgpu.common.generation);
+
+    blob->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    blob->resource_id = 79;
+    blob->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    blob->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    blob->size = 4096;
+    memcpy((uint8_t *) ram + 0x100, &desc0, sizeof(desc0));
+    memcpy((uint8_t *) ram + 0x110, &desc1, sizeof(desc1));
+    store_u16(ram, 0x200, 0);
+    store_u16(ram, 0x202, 1);
+    store_u16(ram, 0x204, 0);
+    store_u16(ram, 0x302, 0);
+
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    require_int("start actor", virtio_actor_start(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+
+    require_int(
+        "notify actor blob create before active disable",
+        vgpu.common.ops->notify_queue(vgpu.common.opaque, VIRTIO_GPU_CONTROLQ,
+                                      vgpu.common.generation),
+        0);
+    wait_for_renderer_request(&queued);
+
+    require_u32("actor blob queues command", queued.command_type,
+                VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
+    require_u64("actor blob renderer generation", queued.token.generation,
+                vgpu.common.generation);
+    require_u16("actor blob remains deferred before disable",
+                load_u16(ram, 0x302), 0);
+    require_u32("actor blob response untouched before disable", response->type,
+                0);
+    require_false("actor blob payload missing release hook",
+                  queued.release_payload == NULL);
+    require_false("actor blob payload missing payload", queued.payload == NULL);
+
+    struct vgpu_renderer_ctrl_payload *payload = queued.payload;
+    struct virtio_gpu_deferred_ctrl_completion ctrl =
+        payload->ctrl_completion;
+    struct virtq_desc response_desc = payload->response_desc;
+    struct virtio_gpu_ctrl_hdr request_hdr = payload->hdr;
+    uint64_t renderer_generation = queued.token.generation;
+
+    virtio_gpu_disable_virgl_runtime(&vgpu);
+
+    require_u64("active actor blob keeps VirGL feature",
+                vgpu.common.device_features & VIRTIO_GPU_F_VIRGL,
+                VIRTIO_GPU_F_VIRGL);
+    require_u64("active actor blob keeps context-init feature",
+                vgpu.common.device_features & VIRTIO_GPU_F_CONTEXT_INIT,
+                VIRTIO_GPU_F_CONTEXT_INIT);
+    require_u64("active actor blob keeps resource-blob feature",
+                vgpu.common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB,
+                VIRTIO_GPU_F_RESOURCE_BLOB);
+    require_false("active actor blob keeps host-visible SHM present",
+                  !vgpu.common.has_shm_region);
+    require_u32("active actor blob keeps host-visible SHM id",
+                vgpu.common.shm_region.id, VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
+    require_u64("active actor blob keeps host-visible SHM base",
+                vgpu.common.shm_region.base,
+                SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
+    require_u64("active actor blob keeps host-visible SHM length",
+                vgpu.common.shm_region.length,
+                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_int("active actor blob keeps renderer queue available",
+                renderer_stats.available, true);
+    require_u64("active actor blob keeps renderer generation",
+                renderer_stats.active_generation, renderer_generation);
+
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+        .response_type = VIRTIO_GPU_RESP_OK_NODATA,
+        .has_ctrl_completion = true,
+        .ctrl_completion = ctrl,
+        .has_response_desc = true,
+        .request_hdr = request_hdr,
+        .response_desc = response_desc,
+    };
+    require_int("queue actor blob renderer completion",
+                vgpu_renderer_complete(&completion), true);
+    virtio_gpu_drain_renderer_completions(&vgpu);
+
+    require_u32("actor blob completion response", response->type,
+                VIRTIO_GPU_RESP_OK_NODATA);
+    require_u16("actor blob used idx after completion", load_u16(ram, 0x302),
+                1);
+    require_u32("actor blob used elem id", load_u32(ram, 0x304), 0);
+    require_u32("actor blob used elem len", load_u32(ram, 0x308),
+                sizeof(struct virtio_gpu_ctrl_hdr));
+    require_u32("actor blob completion used-ring irq",
+                virtio_irq_read_status(&vgpu.common.irq) &
+                    VIRTIO_INT__USED_RING,
+                VIRTIO_INT__USED_RING);
+
+    struct vgpu_display_cmd display_cmd = {0};
+    require_int("actor blob completion publishes no display payload",
+                vgpu_display_pop_cmd(&display_cmd), false);
+
+    vgpu_renderer_debug_snapshot(&renderer_stats);
+    require_u32("actor blob completion queue drained",
+                renderer_stats.completion_depth, 0);
+
+    queued.release_payload(payload);
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_virgl_resource_create_3d_handler_tracks_pending_resource(void)
 {
     uint32_t ram[512] = {0};
@@ -6133,6 +6273,7 @@ int main(void)
 #if SEMU_HAS(VIRGL)
     test_hidden_blob_command_returns_undefined_without_renderer_work();
     test_runtime_ready_blob_command_reaches_renderer_gate();
+    test_active_disable_after_actor_blob_dispatch_keeps_completion_live();
     test_virgl_capset_info_handler_submits_host_owned_ctrl_payload();
     test_virgl_unsupported_capset_requests_skip_renderer_queue();
     test_virgl_resource_create_3d_handler_tracks_pending_resource();
