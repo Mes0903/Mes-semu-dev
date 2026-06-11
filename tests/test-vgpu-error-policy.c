@@ -5802,6 +5802,145 @@ static void test_renderer_completion_drops_stale_common_generation(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
+static void test_renderer_completion_reset_boundary_releases_and_rejects_late(void)
+{
+    uint32_t ram[512] = {0};
+    emu_state_t emu;
+    virtio_gpu_state_t vgpu;
+    const uint64_t renderer_generation = 0x5a;
+    struct virtio_gpu_ctrl_hdr *pending_response =
+        calloc(1, sizeof(*pending_response));
+    struct virtio_gpu_ctrl_hdr *late_response =
+        calloc(1, sizeof(*late_response));
+
+    if (!pending_response || !late_response) {
+        fprintf(stderr, "failed to allocate reset-boundary responses\n");
+        free(pending_response);
+        free(late_response);
+        exit(1);
+    }
+
+    drain_display_queue();
+    init_vgpu_test_state(&emu, &vgpu, ram, sizeof(ram));
+    require_int("configure actor", virtio_actor_enter_configuring(&vgpu.actor),
+                0);
+    require_int("activate actor", virtio_actor_activate(&vgpu.actor), 0);
+    atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
+                          memory_order_release);
+    configure_test_queue(&emu, &vgpu, VIRTIO_GPU_CONTROLQ);
+
+    pending_response->type = VIRTIO_GPU_RESP_OK_NODATA;
+    pending_response->flags = VIRTIO_GPU_FLAG_FENCE;
+    pending_response->fence_id = UINT64_C(0x5a5a123456789abc);
+    late_response->type = VIRTIO_GPU_RESP_OK_NODATA;
+    late_response->flags = VIRTIO_GPU_FLAG_FENCE;
+    late_response->fence_id = UINT64_C(0x5a5adeadbeef5678);
+
+    renderer_release_response_count = 0;
+    vgpu_renderer_reset_queues(renderer_generation);
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_CTRL,
+        .token = {.generation = renderer_generation},
+        .response = pending_response,
+        .response_size = sizeof(*pending_response),
+        .release_response = renderer_release_response,
+        .has_ctrl_completion = true,
+        .ctrl_completion =
+            {
+                .queue_index = VIRTIO_GPU_CONTROLQ,
+                .desc_head = 7,
+                .actor_generation = virtio_actor_generation(&vgpu.actor),
+                .common_generation = vgpu.common.generation,
+                .trigger_irq = true,
+            },
+        .has_response_desc = true,
+        .response_desc =
+            {
+                .addr = 0x80,
+                .len = sizeof(*pending_response),
+                .flags = VIRTIO_DESC_F_WRITE,
+            },
+        .virgl_resource =
+            {
+                .type = VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT,
+                .scanouts =
+                    {
+                        {
+                            .scanout_id = 0,
+                            .has_gl_payload = true,
+                            .gl_payload = test_gl_payload(0x5a00),
+                        },
+                    },
+                .scanout_count = 1,
+            },
+    };
+
+    require_int("queue renderer completion before common reset",
+                vgpu_renderer_complete(&completion), true);
+
+    struct vgpu_renderer_debug_stats stats;
+    vgpu_renderer_debug_snapshot(&stats);
+    require_u32("pending completion depth before common reset",
+                stats.completion_depth, 1);
+
+    const uint64_t old_common_generation = vgpu.common.generation;
+    require_int("common reset with pending renderer completion",
+                virtio_device_common_reset(&vgpu.common), 0);
+    require_false("reset advanced common generation",
+                  vgpu.common.generation == old_common_generation);
+    require_u32("common reset released pending renderer response",
+                renderer_release_response_count, 1);
+
+    vgpu_renderer_debug_snapshot(&stats);
+    require_u32("common reset cleared completion depth",
+                stats.completion_depth, 0);
+    require_u64("common reset advanced renderer generation",
+                stats.active_generation, vgpu.common.generation);
+    require_u32("reset-boundary response not written", load_u32(ram, 0x80), 0);
+    require_u16("reset-boundary used idx unchanged", load_u16(ram, 0x302), 0);
+    require_u32(
+        "reset-boundary used-ring irq not raised",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
+    struct vgpu_display_cmd cmd = {0};
+    require_int("reset-boundary publishes no display payload",
+                vgpu_display_pop_cmd(&cmd), false);
+
+    struct vgpu_renderer_request request = {0};
+    require_int("reset-boundary renderer reset request queued",
+                vgpu_renderer_pop_request(&request), true);
+    require_u32("reset-boundary request type", request.type,
+                VGPU_RENDERER_REQ_RESET);
+    require_u64("reset-boundary request generation",
+                request.token.generation, vgpu.common.generation);
+    require_ptr("reset-boundary request payload", request.payload, NULL);
+    require_int("reset-boundary queues only reset request",
+                vgpu_renderer_pop_request(&request), false);
+
+    completion.token.generation = renderer_generation;
+    completion.response = late_response;
+    completion.response_size = sizeof(*late_response);
+    completion.ctrl_completion.common_generation = old_common_generation;
+    require_int("late old-generation renderer completion rejected",
+                vgpu_renderer_complete(&completion), false);
+    require_u32("late renderer response released",
+                renderer_release_response_count, 2);
+
+    vgpu_renderer_debug_snapshot(&stats);
+    require_u32("late completion leaves completion depth empty",
+                stats.completion_depth, 0);
+    require_u32("late completion response not written", load_u32(ram, 0x80),
+                0);
+    require_u16("late completion used idx unchanged", load_u16(ram, 0x302),
+                0);
+    require_u32(
+        "late completion used-ring irq not raised",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
+    require_int("late completion publishes no display payload",
+                vgpu_display_pop_cmd(&cmd), false);
+
+    destroy_vgpu_test_state(&emu, &vgpu);
+}
+
 static void test_renderer_ctrl_completion_without_metadata_fails(void)
 {
     uint32_t ram[64] = {0};
@@ -6029,6 +6168,7 @@ int main(void)
     test_renderer_gl_scanout_response_fault_does_not_publish();
     test_renderer_gl_scanout_add_used_fault_does_not_publish();
     test_renderer_completion_drops_stale_common_generation();
+    test_renderer_completion_reset_boundary_releases_and_rejects_late();
     test_renderer_ctrl_completion_without_metadata_fails();
 #endif
     test_vgpu_destroy_releases_common_without_actor();
