@@ -446,6 +446,10 @@ test-vgpu-3d-soak-wrapper:
 test-actor-stress-soak-wrapper:
 	$(Q)bash tests/test-actor-stress-soak-wrapper.sh
 
+.PHONY: test-actor-stress-all-reboot-wrapper
+test-actor-stress-all-reboot-wrapper:
+	$(Q)bash tests/test-actor-stress-all-reboot-wrapper.sh
+
 .PHONY: test-host-interleaving-stress-wrapper
 test-host-interleaving-stress-wrapper:
 	$(Q)bash tests/test-host-interleaving-stress-wrapper.sh
@@ -521,7 +525,7 @@ test-hart-executor:
 	/tmp/test-hart-executor
 
 .PHONY: test-host
-test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-3d-stress-timeout test-vgpu-3d-reset-stress-wrapper test-vgpu-3d-soak-wrapper test-actor-stress-soak-wrapper test-host-interleaving-stress-wrapper test-blk-backend-stress-wrapper test-fs-backend-stress-wrapper test-net-backend-stress-wrapper test-snd-backend-stress-wrapper test-input-backend-stress-wrapper test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-gdbstub-cancel test-executor-config test-hart-executor
+test-host: test-mmio-bus test-platform test-irq-source test-hart-mailbox test-ram-access test-virtq test-virtq-corpus test-semu-event test-vm-lifecycle test-pause-ack test-virtio-actor test-virtio-irq test-virtio-mmio test-lock-order test-virtio-input-config test-virtio-input-common test-virtio-rng-fault test-virtio-blk-common test-virtio-net-common test-virtio-snd-common test-virtio-fs-common test-vgpu-rect test-vgpu-error-policy test-vgpu-deferred-drain test-vgpu-virgl-gate test-vgpu-3d-stress-timeout test-vgpu-3d-reset-stress-wrapper test-vgpu-3d-soak-wrapper test-actor-stress-soak-wrapper test-actor-stress-all-reboot-wrapper test-host-interleaving-stress-wrapper test-blk-backend-stress-wrapper test-fs-backend-stress-wrapper test-net-backend-stress-wrapper test-snd-backend-stress-wrapper test-input-backend-stress-wrapper test-vgpu-renderer test-vgpu-virgl-backend test-debug-gate test-gdbstub-cancel test-executor-config test-hart-executor
 
 .PHONY: print-vgpu-virgl-config
 print-vgpu-virgl-config:
