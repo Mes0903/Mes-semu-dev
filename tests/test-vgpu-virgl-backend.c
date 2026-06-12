@@ -809,8 +809,38 @@ static void test_poll_requests_coalesce_until_executed(void)
     CHECK(fake_poll_count == 1);
 
     stats = virgl_stats();
+    CHECK(stats.pending_fences == 2);
     CHECK(!stats.poll_request_pending);
+    CHECK(stats.poll_requests_submitted == before.poll_requests_submitted + 1);
     CHECK(stats.poll_requests_executed == before.poll_requests_executed + 1);
+
+    queue_stats = renderer_stats();
+    CHECK(queue_stats.request_depth == 0);
+
+    vgpu_virgl_request_poll();
+    stats = virgl_stats();
+    CHECK(stats.poll_request_pending);
+    CHECK(stats.poll_requests_submitted == before.poll_requests_submitted + 2);
+    queue_stats = renderer_stats();
+    CHECK(queue_stats.request_depth == 1);
+
+    fake_callbacks.write_fence(fake_init_cookie, fake_last_create_fence_id);
+    struct vgpu_renderer_completion completion;
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.fence_id == 1);
+    CHECK(vgpu_renderer_pop_completion(&completion));
+    CHECK(completion.fence_id == 2);
+    CHECK(!vgpu_renderer_pop_completion(&completion));
+
+    CHECK(vgpu_renderer_pop_request(&request));
+    CHECK(request.type == VGPU_RENDERER_REQ_POLL);
+    vgpu_virgl_execute_renderer_request(&request);
+    CHECK(fake_poll_count == 2);
+
+    stats = virgl_stats();
+    CHECK(stats.pending_fences == 0);
+    CHECK(!stats.poll_request_pending);
+    CHECK(stats.poll_requests_executed == before.poll_requests_executed + 2);
 }
 
 static void test_ctrl_request_executes_get_capset_info_completion(void)

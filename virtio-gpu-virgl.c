@@ -506,6 +506,13 @@ static void vgpu_virgl_request_poll_locked(void)
     debug_poll_requests_dropped++;
 }
 
+void vgpu_virgl_request_poll(void)
+{
+    pthread_mutex_lock(&vgpu_virgl_lock);
+    vgpu_virgl_request_poll_locked();
+    pthread_mutex_unlock(&vgpu_virgl_lock);
+}
+
 static bool vgpu_virgl_take_next_completed_fence(
     bool context_fence,
     uint32_t ctx_id,

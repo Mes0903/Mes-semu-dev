@@ -15,11 +15,21 @@
 #include "virtio-gpu.h"
 #if SEMU_HAS(VIRGL)
 #include "vgpu-renderer.h"
+#include "virtio-gpu-virgl-poll.h"
 #endif
 #include "virtio-mmio.h"
 #include "virtio.h"
 
 void semu_wake_interruptible_harts(emu_state_t *emu UNUSED) {}
+
+#if SEMU_HAS(VIRGL)
+static uint32_t test_virgl_request_poll_count;
+
+void vgpu_virgl_request_poll(void)
+{
+    test_virgl_request_poll_count++;
+}
+#endif
 
 #define REG(reg) ((uint32_t) VIRTIO_##reg << 2)
 #define REQUIRE_ATOMIC_U64_COUNTER(expr)                                 \
@@ -5891,7 +5901,10 @@ static void test_renderer_completion_drain_writes_response_and_used_ring(void)
 
     require_int("queue renderer completion",
                 vgpu_renderer_complete(&completion), true);
+    test_virgl_request_poll_count = 0;
     virtio_gpu_drain_renderer_completions(&vgpu);
+    require_u32("renderer drain reaches VirGL poll hook",
+                test_virgl_request_poll_count, 1);
 
     require_u32("renderer response type", load_u32(ram, 0x80),
                 VIRTIO_GPU_RESP_OK_NODATA);

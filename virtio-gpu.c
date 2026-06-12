@@ -22,6 +22,7 @@
 #include "virtio-gpu.h"
 #if SEMU_HAS(VIRGL)
 #include "vgpu-renderer.h"
+#include "virtio-gpu-virgl-poll.h"
 #endif
 #include "virtio-mmio.h"
 #include "virtio.h"
@@ -3807,6 +3808,7 @@ void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
         }
         virtio_gpu_release_renderer_completion(&completion);
     }
+    vgpu_virgl_request_poll();
 #else
     (void) vgpu;
 #endif
