@@ -620,7 +620,7 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
     request->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     request->hdr.fence_id = UINT64_C(0x1234);
-    request->capset_index = 0;
+    request->capset_index = 1;
     desc[0].addr = 0x40;
     desc[0].len = sizeof(*request);
     desc[1].addr = 0x100;
@@ -653,7 +653,7 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
                 VIRTIO_GPU_CMD_GET_CAPSET_INFO);
     require_u64("snapshot fence id", payload->hdr.fence_id, UINT64_C(0x1234));
     require_u32("snapshot capset index",
-                payload->cmd.get_capset_info.capset_index, 0);
+                payload->cmd.get_capset_info.capset_index, 1);
     require_u32("response capacity", payload->response_capacity,
                 sizeof(struct virtio_gpu_resp_capset_info));
     require_u32("completion queue", payload->ctrl_completion.queue_index,
@@ -678,8 +678,8 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
     capset_request->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
     capset_request->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     capset_request->hdr.fence_id = UINT64_C(0x5678);
-    capset_request->capset_id = VIRTIO_GPU_CAPSET_VIRGL;
-    capset_request->capset_version = 2;
+    capset_request->capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
+    capset_request->capset_version = 3;
     desc[0].addr = 0x140;
     desc[0].len = sizeof(*capset_request);
     desc[1].addr = 0x180;
@@ -699,9 +699,9 @@ static void test_virgl_capset_info_handler_submits_host_owned_ctrl_payload(void)
                 VIRTIO_GPU_CMD_GET_CAPSET);
     payload = queued.payload;
     require_u32("snapshot capset id", payload->cmd.get_capset.capset_id,
-                VIRTIO_GPU_CAPSET_VIRGL);
+                VIRTIO_GPU_CAPSET_VIRGL2);
     require_u32("snapshot capset version",
-                payload->cmd.get_capset.capset_version, 2);
+                payload->cmd.get_capset.capset_version, 3);
     require_u32("capset desc head", payload->ctrl_completion.desc_head, 8);
     require_u32("capset response capacity", payload->response_capacity,
                 sizeof(struct virtio_gpu_resp_capset) + 16);
@@ -736,7 +736,7 @@ static void test_virgl_unsupported_capset_requests_skip_renderer_queue(void)
     info->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
     info->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     info->hdr.fence_id = UINT64_C(0x1919);
-    info->capset_index = 1;
+    info->capset_index = 2;
     desc[0].addr = 0x40;
     desc[0].len = sizeof(*info);
     desc[1].addr = 0x100;
@@ -751,13 +751,13 @@ static void test_virgl_unsupported_capset_requests_skip_renderer_queue(void)
                 VIRTIO_GPU_RESP_OK_CAPSET_INFO);
     require_u32("unsupported capset info echoes fence",
                 info_response->hdr.flags, VIRTIO_GPU_FLAG_FENCE);
-    require_u64("unsupported capset info fence id",
-                info_response->hdr.fence_id, UINT64_C(0x1919));
+    require_u64("unsupported capset info fence id", info_response->hdr.fence_id,
+                UINT64_C(0x1919));
     require_u32("unsupported capset info id", info_response->capset_id, 0);
     require_u32("unsupported capset info version",
                 info_response->capset_max_version, 0);
-    require_u32("unsupported capset info size",
-                info_response->capset_max_size, 0);
+    require_u32("unsupported capset info size", info_response->capset_max_size,
+                0);
     require_int("unsupported capset info queues no renderer work",
                 vgpu_renderer_pop_request(&queued), false);
 
@@ -766,7 +766,7 @@ static void test_virgl_unsupported_capset_requests_skip_renderer_queue(void)
     capset->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
     capset->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     capset->hdr.fence_id = UINT64_C(0x2929);
-    capset->capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
+    capset->capset_id = 99;
     capset->capset_version = 1;
     desc[0].addr = 0x140;
     desc[0].len = sizeof(*capset);
@@ -982,8 +982,7 @@ static void test_active_disable_after_actor_blob_dispatch_keeps_completion_live(
     require_false("actor blob payload missing payload", queued.payload == NULL);
 
     struct vgpu_renderer_ctrl_payload *payload = queued.payload;
-    struct virtio_gpu_deferred_ctrl_completion ctrl =
-        payload->ctrl_completion;
+    struct virtio_gpu_deferred_ctrl_completion ctrl = payload->ctrl_completion;
     struct virtq_desc response_desc = payload->response_desc;
     struct virtio_gpu_ctrl_hdr request_hdr = payload->hdr;
     uint64_t renderer_generation = queued.token.generation;
@@ -1007,8 +1006,7 @@ static void test_active_disable_after_actor_blob_dispatch_keeps_completion_live(
                 vgpu.common.shm_region.base,
                 SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
     require_u64("active actor blob keeps host-visible SHM length",
-                vgpu.common.shm_region.length,
-                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+                vgpu.common.shm_region.length, SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
 
     vgpu_renderer_debug_snapshot(&renderer_stats);
     require_int("active actor blob keeps renderer queue available",
@@ -1037,10 +1035,10 @@ static void test_active_disable_after_actor_blob_dispatch_keeps_completion_live(
     require_u32("actor blob used elem id", load_u32(ram, 0x304), 0);
     require_u32("actor blob used elem len", load_u32(ram, 0x308),
                 sizeof(struct virtio_gpu_ctrl_hdr));
-    require_u32("actor blob completion used-ring irq",
-                virtio_irq_read_status(&vgpu.common.irq) &
-                    VIRTIO_INT__USED_RING,
-                VIRTIO_INT__USED_RING);
+    require_u32(
+        "actor blob completion used-ring irq",
+        virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING,
+        VIRTIO_INT__USED_RING);
 
     struct vgpu_display_cmd display_cmd = {0};
     require_int("actor blob completion publishes no display payload",
@@ -1098,8 +1096,7 @@ static void test_active_disable_preserves_queued_actor_blob_request(void)
 
     require_int("configure queued actor",
                 virtio_actor_enter_configuring(&vgpu.actor), 0);
-    require_int("activate queued actor", virtio_actor_activate(&vgpu.actor),
-                0);
+    require_int("activate queued actor", virtio_actor_activate(&vgpu.actor), 0);
     require_int("start queued actor", virtio_actor_start(&vgpu.actor), 0);
     atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
                           memory_order_release);
@@ -1149,8 +1146,7 @@ static void test_active_disable_preserves_queued_actor_blob_request(void)
                 vgpu.common.shm_region.base,
                 SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE);
     require_u64("active queued blob keeps host-visible SHM length",
-                vgpu.common.shm_region.length,
-                SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
+                vgpu.common.shm_region.length, SEMU_PLATFORM_VGPU_HOSTMEM_SIZE);
     require_u16("active queued blob keeps used ring deferred",
                 load_u16(ram, 0x302), 0);
     require_u32("active queued blob keeps response deferred", response->type,
@@ -1165,8 +1161,8 @@ static void test_active_disable_preserves_queued_actor_blob_request(void)
                 VGPU_RENDERER_REQ_CTRL);
     require_u32("queued actor blob command", queued.command_type,
                 VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
-    require_u64("queued actor blob request generation",
-                queued.token.generation, renderer_generation);
+    require_u64("queued actor blob request generation", queued.token.generation,
+                renderer_generation);
     require_false("queued actor blob payload missing release hook",
                   queued.release_payload == NULL);
     require_false("queued actor blob payload missing payload",
@@ -1257,8 +1253,7 @@ static void test_common_reset_clears_queued_actor_blob_request(void)
                 virtio_actor_enter_configuring(&vgpu.actor), 0);
     require_int("activate reset queued actor",
                 virtio_actor_activate(&vgpu.actor), 0);
-    require_int("start reset queued actor", virtio_actor_start(&vgpu.actor),
-                0);
+    require_int("start reset queued actor", virtio_actor_start(&vgpu.actor), 0);
     atomic_store_explicit(&vgpu.common.status, VIRTIO_STATUS__DRIVER_OK,
                           memory_order_release);
 
@@ -1312,7 +1307,7 @@ static void test_common_reset_clears_queued_actor_blob_request(void)
                 VGPU_RENDERER_REQ_RESET);
     require_u64("queued blob reset request generation",
                 request.token.generation, vgpu.common.generation);
-    require_ptr("queued blob reset request payload", request.payload, NULL);
+    require_ptr("queued blob reset request payload", request.payload, &vgpu);
     require_ptr("queued blob reset release hook", request.release_payload,
                 NULL);
     require_int("queued blob reset queues only reset request",
@@ -4972,17 +4967,25 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     queued.release_payload(queued.payload);
 
     create->context_init = VIRTIO_GPU_CAPSET_VIRGL2;
+    vgpu.ctrl_dispatch.desc_head = 9;
     len = 0;
     response->type = 0;
 
     g_virtio_gpu_backend.ctx_create(&vgpu, desc, &len);
-    require_u32("unsupported ctx init response len", len, sizeof(*response));
-    require_u32("unsupported ctx init response", response->type,
-                VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
-    require_int("unsupported ctx init queues no renderer work",
-                vgpu_renderer_pop_request(&queued), false);
+    require_u32("virgl2 ctx create is deferred", len,
+                VIRTIO_GPU_RESPONSE_DEFERRED);
+    require_int("virgl2 ctx create queued", vgpu_renderer_pop_request(&queued),
+                true);
+    require_u32("virgl2 ctx create command type", queued.command_type,
+                VIRTIO_GPU_CMD_CTX_CREATE);
+    payload = queued.payload;
+    require_u32("virgl2 ctx create context init snapshot",
+                payload->cmd.ctx_create.context_init, VIRTIO_GPU_CAPSET_VIRGL2);
+    require_u32("virgl2 ctx create desc head",
+                payload->ctrl_completion.desc_head, 9);
+    queued.release_payload(queued.payload);
 
-    vgpu.ctrl_dispatch.desc_head = 9;
+    vgpu.ctrl_dispatch.desc_head = 10;
     destroy->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
     destroy->hdr.ctx_id = 44;
     desc[0].addr = 0x140;
@@ -4998,10 +5001,11 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
     payload = queued.payload;
     require_u32("ctx destroy id snapshot", payload->cmd.ctx_destroy.hdr.ctx_id,
                 44);
-    require_u32("ctx destroy desc head", payload->ctrl_completion.desc_head, 9);
+    require_u32("ctx destroy desc head", payload->ctrl_completion.desc_head,
+                10);
     queued.release_payload(queued.payload);
 
-    vgpu.ctrl_dispatch.desc_head = 10;
+    vgpu.ctrl_dispatch.desc_head = 11;
     attach->hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     attach->hdr.ctx_id = 44;
     attach->resource_id = 88;
@@ -5020,10 +5024,10 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
                 44);
     require_u32("ctx attach resource snapshot",
                 payload->cmd.ctx_resource.resource_id, 88);
-    require_u32("ctx attach desc head", payload->ctrl_completion.desc_head, 10);
+    require_u32("ctx attach desc head", payload->ctrl_completion.desc_head, 11);
     queued.release_payload(queued.payload);
 
-    vgpu.ctrl_dispatch.desc_head = 11;
+    vgpu.ctrl_dispatch.desc_head = 12;
     detach->hdr.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     detach->hdr.ctx_id = 44;
     detach->resource_id = 88;
@@ -5042,7 +5046,7 @@ static void test_virgl_context_handlers_submit_ctrl_skeletons(void)
                 44);
     require_u32("ctx detach resource snapshot",
                 payload->cmd.ctx_resource.resource_id, 88);
-    require_u32("ctx detach desc head", payload->ctrl_completion.desc_head, 11);
+    require_u32("ctx detach desc head", payload->ctrl_completion.desc_head, 12);
     queued.release_payload(queued.payload);
 
     destroy_vgpu_test_state(&emu, &vgpu);
@@ -5309,7 +5313,7 @@ static void test_vgpu_common_reset_queues_renderer_reset_request(void)
                 VGPU_RENDERER_REQ_RESET);
     require_u64("renderer reset request generation", request.token.generation,
                 vgpu.common.generation);
-    require_ptr("renderer reset request payload", request.payload, NULL);
+    require_ptr("renderer reset request payload", request.payload, &vgpu);
     require_ptr("renderer reset release hook",
                 (const void *) request.release_payload, NULL);
     require_int("only one renderer reset request",
@@ -5328,11 +5332,11 @@ static void require_vgpu_3d_runtime_hidden(const char *prefix,
     snprintf(name, sizeof(name), "%s VirGL feature hidden", prefix);
     require_u64(name, vgpu->common.device_features & VIRTIO_GPU_F_VIRGL, 0);
     snprintf(name, sizeof(name), "%s context-init feature hidden", prefix);
-    require_u64(name,
-                vgpu->common.device_features & VIRTIO_GPU_F_CONTEXT_INIT, 0);
+    require_u64(name, vgpu->common.device_features & VIRTIO_GPU_F_CONTEXT_INIT,
+                0);
     snprintf(name, sizeof(name), "%s resource-blob feature hidden", prefix);
-    require_u64(name,
-                vgpu->common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB, 0);
+    require_u64(name, vgpu->common.device_features & VIRTIO_GPU_F_RESOURCE_BLOB,
+                0);
     snprintf(name, sizeof(name), "%s host-visible SHM hidden", prefix);
     require_false(name, vgpu->common.has_shm_region);
 
@@ -5343,30 +5347,26 @@ static void require_vgpu_3d_runtime_hidden(const char *prefix,
                 0);
     snprintf(name, sizeof(name), "read %s SHM len low", prefix);
     require_int(name,
-                virtio_mmio_read(&vgpu->common, REG(SHMLenLow), 4,
-                                 &mmio_value),
+                virtio_mmio_read(&vgpu->common, REG(SHMLenLow), 4, &mmio_value),
                 0);
     snprintf(name, sizeof(name), "%s MMIO SHM len low", prefix);
     require_u32(name, mmio_value, UINT32_MAX);
     snprintf(name, sizeof(name), "read %s SHM len high", prefix);
-    require_int(name,
-                virtio_mmio_read(&vgpu->common, REG(SHMLenHigh), 4,
-                                 &mmio_value),
-                0);
+    require_int(
+        name, virtio_mmio_read(&vgpu->common, REG(SHMLenHigh), 4, &mmio_value),
+        0);
     snprintf(name, sizeof(name), "%s MMIO SHM len high", prefix);
     require_u32(name, mmio_value, UINT32_MAX);
     snprintf(name, sizeof(name), "read %s SHM base low", prefix);
-    require_int(name,
-                virtio_mmio_read(&vgpu->common, REG(SHMBaseLow), 4,
-                                 &mmio_value),
-                0);
+    require_int(
+        name, virtio_mmio_read(&vgpu->common, REG(SHMBaseLow), 4, &mmio_value),
+        0);
     snprintf(name, sizeof(name), "%s MMIO SHM base low", prefix);
     require_u32(name, mmio_value, UINT32_MAX);
     snprintf(name, sizeof(name), "read %s SHM base high", prefix);
-    require_int(name,
-                virtio_mmio_read(&vgpu->common, REG(SHMBaseHigh), 4,
-                                 &mmio_value),
-                0);
+    require_int(
+        name, virtio_mmio_read(&vgpu->common, REG(SHMBaseHigh), 4, &mmio_value),
+        0);
     snprintf(name, sizeof(name), "%s MMIO SHM base high", prefix);
     require_u32(name, mmio_value, UINT32_MAX);
 
@@ -5640,13 +5640,13 @@ static void test_vgpu_virgl_demo_gate_exposes_classic_3d_features(void)
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
-    require_u32("classic virgl initial capsets visible", num_capsets, 1);
+    require_u32("virgl initial capsets visible", num_capsets, 2);
 
     virtio_gpu_set_num_capsets(&vgpu, 5);
     num_capsets = vgpu.common.ops->read_config(
         vgpu.common.opaque, offsetof(struct virtio_gpu_config, num_capsets),
         sizeof(num_capsets));
-    require_u32("classic virgl capsets clamped", num_capsets, 1);
+    require_u32("virgl capsets clamped", num_capsets, 2);
 
     virtio_gpu_disable_virgl_runtime(&vgpu);
     require_u64("fallback VirGL feature hidden",
@@ -6318,8 +6318,7 @@ static void test_renderer_gl_scanout_display_unavailable_does_not_publish(void)
     require_u64("unavailable gl scanout response fence", response->fence_id,
                 fence_id);
     require_u16("unavailable gl scanout used idx", load_u16(ram, 0x302), 1);
-    require_u32("unavailable gl scanout used elem id", load_u32(ram, 0x304),
-                5);
+    require_u32("unavailable gl scanout used elem id", load_u32(ram, 0x304), 5);
     require_u32("unavailable gl scanout used elem len", load_u32(ram, 0x308),
                 sizeof(*response));
     require_u32(
@@ -6404,7 +6403,8 @@ static void test_renderer_completion_drops_stale_common_generation(void)
     destroy_vgpu_test_state(&emu, &vgpu);
 }
 
-static void test_renderer_completion_reset_boundary_releases_and_rejects_late(void)
+static void test_renderer_completion_reset_boundary_releases_and_rejects_late(
+    void)
 {
     uint32_t ram[512] = {0};
     emu_state_t emu;
@@ -6494,8 +6494,8 @@ static void test_renderer_completion_reset_boundary_releases_and_rejects_late(vo
                 renderer_release_response_count, 1);
 
     vgpu_renderer_debug_snapshot(&stats);
-    require_u32("common reset cleared completion depth",
-                stats.completion_depth, 0);
+    require_u32("common reset cleared completion depth", stats.completion_depth,
+                0);
     require_u64("common reset advanced renderer generation",
                 stats.active_generation, vgpu.common.generation);
     require_u32("reset-boundary response not written", load_u32(ram, 0x80), 0);
@@ -6512,9 +6512,9 @@ static void test_renderer_completion_reset_boundary_releases_and_rejects_late(vo
                 vgpu_renderer_pop_request(&request), true);
     require_u32("reset-boundary request type", request.type,
                 VGPU_RENDERER_REQ_RESET);
-    require_u64("reset-boundary request generation",
-                request.token.generation, vgpu.common.generation);
-    require_ptr("reset-boundary request payload", request.payload, NULL);
+    require_u64("reset-boundary request generation", request.token.generation,
+                vgpu.common.generation);
+    require_ptr("reset-boundary request payload", request.payload, &vgpu);
     require_int("reset-boundary queues only reset request",
                 vgpu_renderer_pop_request(&request), false);
 
@@ -6530,10 +6530,8 @@ static void test_renderer_completion_reset_boundary_releases_and_rejects_late(vo
     vgpu_renderer_debug_snapshot(&stats);
     require_u32("late completion leaves completion depth empty",
                 stats.completion_depth, 0);
-    require_u32("late completion response not written", load_u32(ram, 0x80),
-                0);
-    require_u16("late completion used idx unchanged", load_u16(ram, 0x302),
-                0);
+    require_u32("late completion response not written", load_u32(ram, 0x80), 0);
+    require_u16("late completion used idx unchanged", load_u16(ram, 0x302), 0);
     require_u32(
         "late completion used-ring irq not raised",
         virtio_irq_read_status(&vgpu.common.irq) & VIRTIO_INT__USED_RING, 0);
@@ -6780,7 +6778,8 @@ int main(void)
     test_vgpu_destroy_stops_started_actor_and_is_idempotent();
 #if SEMU_HAS(VIRGL)
     test_vgpu_destroy_shutdowns_renderer_queue();
-    /* Keep this last: it latches the process-wide display bridge unavailable. */
+    /* Keep this last: it latches the process-wide display bridge unavailable.
+     */
     test_renderer_gl_scanout_display_unavailable_does_not_publish();
 #endif
     return 0;

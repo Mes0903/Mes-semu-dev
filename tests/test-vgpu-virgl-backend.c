@@ -38,6 +38,8 @@ static int fake_force_ctx0_count;
 static int fake_reset_count;
 static int fake_get_cap_set_count;
 static bool fake_virgl2_supported;
+static int fake_set_num_capsets_count;
+static uint32_t fake_last_num_capsets;
 static int fake_fill_caps_count;
 static uint32_t fake_last_fill_caps_set;
 static uint32_t fake_last_fill_caps_version;
@@ -458,6 +460,13 @@ int vgpu_window_virgl_make_current(int scanout_idx,
     return fake_window_make_current_result;
 }
 
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets)
+{
+    (void) vgpu;
+    fake_set_num_capsets_count++;
+    fake_last_num_capsets = num_capsets;
+}
+
 static void wake_renderer(void)
 {
     wake_renderer_count++;
@@ -489,6 +498,8 @@ static void reset_test_state(uint64_t generation)
     fake_reset_count = 0;
     fake_get_cap_set_count = 0;
     fake_virgl2_supported = false;
+    fake_set_num_capsets_count = 0;
+    fake_last_num_capsets = 0;
     fake_fill_caps_count = 0;
     fake_last_fill_caps_set = 0;
     fake_last_fill_caps_version = 0;
@@ -954,7 +965,7 @@ static void test_ctrl_request_executes_get_capset_completion(void)
     completion.release_response(completion.response);
 }
 
-static void test_ctrl_request_restricts_to_classic_virgl_capset(void)
+static void test_ctrl_request_exposes_supported_virgl2_capset(void)
 {
     reset_test_state(132);
     fake_virgl2_supported = true;
@@ -985,11 +996,10 @@ static void test_ctrl_request_restricts_to_classic_virgl_capset(void)
     CHECK(completion.response_size ==
           sizeof(struct virtio_gpu_resp_capset_info));
     struct virtio_gpu_resp_capset_info *capset_info = completion.response;
-    CHECK(capset_info->capset_id == 0);
-    CHECK(capset_info->capset_max_version == 0);
-    CHECK(capset_info->capset_max_size == 0);
+    CHECK(capset_info->capset_id == VIRTIO_GPU_CAPSET_VIRGL2);
+    CHECK(capset_info->capset_max_version == 3);
+    CHECK(capset_info->capset_max_size == 8);
     completion.release_response(completion.response);
-    CHECK(fake_get_cap_set_count == 0);
 
     payload = (struct vgpu_renderer_ctrl_payload) {
         .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET},
@@ -997,7 +1007,7 @@ static void test_ctrl_request_restricts_to_classic_virgl_capset(void)
             {
                 .hdr = {.type = VIRTIO_GPU_CMD_GET_CAPSET},
                 .capset_id = VIRTIO_GPU_CAPSET_VIRGL2,
-                .capset_version = 1,
+                .capset_version = 3,
             },
         .response_capacity = sizeof(struct virtio_gpu_resp_capset) + 8,
         .response_type = VIRTIO_GPU_RESP_OK_CAPSET,
@@ -1008,9 +1018,13 @@ static void test_ctrl_request_restricts_to_classic_virgl_capset(void)
     vgpu_virgl_execute_renderer_request(&request);
 
     CHECK(vgpu_renderer_pop_completion(&completion));
-    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
-    CHECK(completion.response == NULL);
-    CHECK(fake_fill_caps_count == 0);
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_CAPSET);
+    CHECK(completion.response_size ==
+          sizeof(struct virtio_gpu_resp_capset) + 8);
+    CHECK(fake_fill_caps_count == 1);
+    CHECK(fake_last_fill_caps_set == VIRTIO_GPU_CAPSET_VIRGL2);
+    CHECK(fake_last_fill_caps_version == 3);
+    completion.release_response(completion.response);
 }
 
 static void test_ctrl_request_executes_context_create_destroy(void)
@@ -1123,7 +1137,7 @@ static void test_ctrl_request_executes_context_create_destroy(void)
     CHECK(fake_last_context_destroy_handle == 77);
 }
 
-static void test_ctrl_request_rejects_unsupported_context_init_capset(void)
+static void test_ctrl_request_executes_virgl2_context_init(void)
 {
     reset_test_state(233);
     fake_virgl2_supported = true;
@@ -1152,10 +1166,15 @@ static void test_ctrl_request_rejects_unsupported_context_init_capset(void)
 
     struct vgpu_renderer_completion completion = {0};
     CHECK(vgpu_renderer_pop_completion(&completion));
-    CHECK(completion.response_type == VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+    CHECK(completion.response_type == VIRTIO_GPU_RESP_OK_NODATA);
     CHECK(completion.response == NULL);
     CHECK(fake_context_create_count == 0);
-    CHECK(fake_context_create_with_flags_count == 0);
+    CHECK(fake_context_create_with_flags_count == 1);
+    CHECK(fake_last_context_create_with_flags_ctx_id == 79);
+    CHECK(fake_last_context_create_with_flags_flags ==
+          VIRTIO_GPU_CAPSET_VIRGL2);
+    CHECK(fake_last_context_create_with_flags_nlen == 4);
+    CHECK(memcmp(fake_last_context_create_with_flags_name, "ctxD", 4) == 0);
 }
 
 static void test_ctrl_request_executes_context_resource_attach_detach(void)
@@ -3002,6 +3021,23 @@ static void test_reset_drops_pending_fences_and_ignores_stale_callbacks(void)
     CHECK(stats.fences_completed == completed_before_reset);
 }
 
+static void test_reset_request_republishes_capset_count(void)
+{
+    reset_test_state(234);
+    fake_virgl2_supported = true;
+
+    struct vgpu_renderer_request request = {
+        .type = VGPU_RENDERER_REQ_RESET,
+        .payload = (void *) (uintptr_t) 0x1234,
+    };
+
+    vgpu_virgl_execute_renderer_request(&request);
+
+    CHECK(fake_reset_count == 1);
+    CHECK(fake_set_num_capsets_count == 1);
+    CHECK(fake_last_num_capsets == 2);
+}
+
 int main(void)
 {
     test_init_renderer_uses_thread_sync_and_callbacks();
@@ -3014,9 +3050,9 @@ int main(void)
     test_poll_requests_coalesce_until_executed();
     test_ctrl_request_executes_get_capset_info_completion();
     test_ctrl_request_executes_get_capset_completion();
-    test_ctrl_request_restricts_to_classic_virgl_capset();
+    test_ctrl_request_exposes_supported_virgl2_capset();
     test_ctrl_request_executes_context_create_destroy();
-    test_ctrl_request_rejects_unsupported_context_init_capset();
+    test_ctrl_request_executes_virgl2_context_init();
     test_ctrl_request_executes_context_resource_attach_detach();
     test_ctrl_request_executes_resource_create_3d_completion();
     test_ctrl_request_executes_resource_create_blob_completion();
@@ -3034,5 +3070,6 @@ int main(void)
     test_ctrl_request_executes_submit_3d_completion();
     test_callback_completes_all_matching_fences_in_order();
     test_reset_drops_pending_fences_and_ignores_stale_callbacks();
+    test_reset_request_republishes_capset_count();
     return 0;
 }
